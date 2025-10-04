@@ -1,0 +1,76 @@
+Code,Title,Type,Units,Program,YearLevel,Semester,Recommended_Slots
+GE - MM,Mathematics in the Modern World,LEC,3,BSCS,1,1,6
+FIL1,Kontekstwalisadong Komunikasyon sa Filipino,LEC,3,BSCS,1,1,6
+CC 101,Introduction to Computing,LEC,2,BSCS,1,1,4
+CC 101,Introduction to Computing,LAB,1,BSCS,1,1,2
+CC 102,Fundamentals of Programming,LEC,2,BSCS,1,1,4
+CC 102,Fundamentals of Programming,LAB,1,BSCS,1,1,2
+GE - US,Understanding the Self,LEC,3,BSCS,1,1,6
+PE 11,Movement Enhancement (ME),LEC,2,BSCS,1,1,4
+GE - PH,Readings in Philippine History,LEC,3,BSCS,1,2,6
+FIL2,Filipino sa Iba't Ibang Disiplina,LEC,3,BSCS,1,2,6
+GE - CW,The Contemporary World,LEC,3,BSCS,1,2,6
+CC 103,Intermediate Programming,LEC,2,BSCS,1,2,4
+CC 103,Intermediate Programming,LAB,1,BSCS,1,2,2
+GE - PC,Purposive Communication,LEC,3,BSCS,1,2,6
+DS 101,Discrete Structure 1,LEC,3,BSCS,1,2,6
+PE 12,Fitness Exercise (FE),LEC,2,BSCS,1,2,4
+GE - AA,Art Appreciation,LEC,3,BSCS,2,1,6
+CC 104,Data Structures & Algorithms 3,LEC,3,BSCS,2,1,6
+DS 102,Discrete Structure 2,LEC,3,BSCS,2,1,6
+GE - ST,Science, Technology & Society,LEC,3,BSCS,2,1,6
+SDF 104,Object-Oriented Programming,LAB,1,BSCS,2,1,2
+SDF 104,Object-Oriented Programming,LEC,2,BSCS,2,1,4
+PAN 1,Sinesosyedad/Pelikulang Panlipunan,LEC,3,BSCS,2,1,6
+CS Prof Elect 1,Digital Design,LAB,1,BSCS,2,1,2
+CS Prof Elect 1,Digital Design,LEC,2,BSCS,2,1,4
+PE 21,Physical Activities Towards Health & Fitness 1,LEC,2,BSCS,2,1,4
+CC 105,Information Management,LEC,2,BSCS,2,2,4
+CC 105,Information Management,LAB,1,BSCS,2,2,2
+GE - E,Ethics,LEC,3,BSCS,2,2,6
+RIZAL,Rizal's Life & Works,LEC,3,BSCS,2,2,6
+CS Prof Elect 2,Introduction to Data Science,LEC,3,BSCS,2,2,6
+Acct 1,Fundamentals of Accounting,LEC,3,BSCS,2,2,6
+CS Prof Elect 3,Web Systems & Technologies,LAB,1,BSCS,2,2,2
+CS Prof Elect 3,Web Systems & Technologies,LEC,2,BSCS,2,2,4
+AL 101,Algorithms & Complexity,LEC,3,BSCS,2,2,6
+PE 22,Physical Activities Towards Health & Fitness 2,LEC,2,BSCS,2,2,4
+CS Elect 1 - GV 101,Graphics & Visual Computing,LAB,1,BSCS,3,1,2
+CS Elect 1 - GV 101,Graphics & Visual Computing,LEC,2,BSCS,3,1,4
+AR 101,Computer Architecture & Organization,LAB,1,BSCS,3,1,2
+AR 101,Computer Architecture & Organization,LEC,2,BSCS,3,1,4
+CS Prof Elect 4,Digital Image Processing,LAB,1,BSCS,3,1,2
+CS Prof Elect 4,Digital Image Processing,LEC,2,BSCS,3,1,4
+Stat 1,Statistics in Computing,LEC,3,BSCS,3,1,6
+AL 2,Automata Theory & Formal Language,LEC,3,BSCS,3,1,6
+IAS 1,Information Assurance & Security,LEC,2,BSCS,3,1,4
+CC 106,Application Development & Emerging Technology,LAB,1,BSCS,3,1,2
+CC 106,Application Development & Emerging Technology,LEC,2,BSCS,3,1,4
+CS Prof Elect 5,Data Mining,LEC,3,BSCS,3,1,6
+SE 1,Software Engineering,LEC,2,BSCS,3,2,4
+SE 1,Software Engineering,LAB,1,BSCS,3,2,2
+Res 1,Method of Research in Computing,LEC,3,BSCS,3,2,6
+CS Elect 2 - IS 101,Intelligent System (Machine Learning),LEC,2,BSCS,3,2,4
+CS Elect 2 - IS 101,Intelligent System (Machine Learning),LAB,1,BSCS,3,2,2
+CS Prof Elect 6,Natural Language Processing,LEC,3,BSCS,3,2,6
+PL 1,Programming Languages,LEC,2,BSCS,3,2,4
+PL 1,Programming Languages,LAB,1,BSCS,3,2,2
+CS Prof Elect 7,Platform-Based Development,LEC,2,BSCS,3,2,4
+CS Prof Elect 7,Platform-Based Development,LAB,1,BSCS,3,2,2
+CS Prof Elect 8,PC Troubleshooting & Networking,LEC,2,BSCS,3,2,4
+CS Prof Elect 8,PC Troubleshooting & Networking,LAB,1,BSCS,3,2,2
+SP 1,Social Issues & Professional Practice,LEC,3,BSCS,3,2,6
+CS Elect 3-PD 101,Parallel and Distributed Computing,LEC,2,BSCS,4,1,4
+CS Elect 3-PD 101,Parallel and Distributed Computing,LAB,1,BSCS,4,1,2
+OS 101,Operating Systems,LEC,3,BSCS,4,1,6
+HCI 101,Human Computer Interaction,LEC,1,BSCS,4,1,2
+SE 2,Software Engineering 2,LEC,2,BSCS,4,1,4
+SE 2,Software Engineering 2,LAB,1,BSCS,4,1,2
+THS 101,Thesis 1,LEC,2,BSCS,4,1,4
+THS 101,Thesis 1,LAB,1,BSCS,4,1,2
+CS Prof Elect 9,Certification, Review, Training & Seminar,LEC,3,BSCS,4,1,6
+CS Prof Elect 10,Android Application Development,LEC,2,BSCS,4,1,4
+CS Prof Elect 10,Android Application Development,LAB,1,BSCS,4,1,2
+NC 101,Network and Communication,LAB,2,BSCS,4,2,4
+NC 101,Network and Communication,LEC,1,BSCS,4,2,2
+TH 102,Thesis 2,LEC,3,BSCS,4,2,6

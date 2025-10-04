@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Full Weekly Room Schedule</title>
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        margin: 20px;
+        background-color: #f0f2f5;
+    }
+
+    h1 {
+        text-align: center;
+        margin-bottom: 20px;
+    }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        background-color: #fff;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
+
+    th, td {
+        border: 1px solid #ddd;
+        text-align: center;
+        padding: 5px;
+        vertical-align: top;
+        min-width: 120px;
+    }
+
+    th {
+        background-color: #007BFF;
+        color: white;
+        position: sticky;
+        top: 0;
+        z-index: 1;
+    }
+
+    .course {
+        padding: 5px;
+        border-radius: 4px;
+        margin-bottom: 3px;
+        display: block;
+        font-size: 0.9em;
+        color: white;
+    }
+
+    .lec {
+        background-color: #17a2b8;
+    }
+
+    .lab {
+        background-color: #28a745;
+    }
+
+    .timeslot {
+        font-weight: bold;
+        background-color: #e9ecef;
+    }
+</style>
+</head>
+<body>
+
+<h1>Full Weekly Room Schedule</h1>
+
+<table>
+    <thead>
+        <tr>
+            <th>Time / Room</th>
+            <th>Monday</th>
+            <th>Tuesday</th>
+            <th>Wednesday</th>
+            <th>Thursday</th>
+            <th>Friday</th>
+        </tr>
+    </thead>
+    <tbody id="schedule-body">
+        <!-- Schedule will be rendered here -->
+    </tbody>
+</table>
+
+<script>
+const scheduleData = [
+    {
+        room: "Room A101",
+        slots: [
+            {time: "07:30-09:00", Monday: {course: "CS101", type: "LEC", instructor: "Dr. Santos"}, Tuesday: {}, Wednesday: {course: "CS101", type: "LEC", instructor: "Dr. Santos"}, Thursday: {}, Friday: {}},
+            {time: "09:00-10:30", Monday: {course: "CS101", type: "LAB", instructor: "Dr. Santos"}, Tuesday: {}, Wednesday: {}, Thursday: {course: "CC102", type: "LEC", instructor: "Dr. Ana"}, Friday: {}},
+            {time: "10:30-12:00", Monday: {}, Tuesday: {course: "CS102", type: "LAB", instructor: "Dr. Ana"}, Wednesday: {}, Thursday: {}, Friday: {}},
+            {time: "13:00-14:30", Monday: {}, Tuesday: {}, Wednesday: {}, Thursday: {}, Friday: {}}
+        ]
+    },
+    {
+        room: "Room B202",
+        slots: [
+            {time: "07:30-09:00", Monday: {course: "PE11", type: "LEC", instructor: "Prof. Cruz"}, Tuesday: {}, Wednesday: {course: "PE11", type: "LEC", instructor: "Prof. Cruz"}, Thursday: {}, Friday: {course: "CC101", type: "LAB", instructor: "Dr. Ana Santos"}},
+            {time: "09:00-10:30", Monday: {}, Tuesday: {}, Wednesday: {}, Thursday: {}, Friday: {}},
+            {time: "10:30-12:00", Monday: {}, Tuesday: {}, Wednesday: {}, Thursday: {}, Friday: {}},
+            {time: "13:00-14:30", Monday: {}, Tuesday: {}, Wednesday: {}, Thursday: {}, Friday: {}}
+        ]
+    }
+];
+
+const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+const tbody = document.getElementById("schedule-body");
+
+// Render table
+scheduleData.forEach(room => {
+    room.slots.forEach(slot => {
+        const tr = document.createElement("tr");
+
+        // Time column
+        const tdTime = document.createElement("td");
+        tdTime.textContent = `${slot.time} | ${room.room}`;
+        tdTime.classList.add("timeslot");
+        tr.appendChild(tdTime);
+
+        // Each day column
+        days.forEach(day => {
+            const td = document.createElement("td");
+
+            const cell = slot[day];
+            if (cell && cell.course) {
+                const div = document.createElement("div");
+                div.classList.add("course");
+
+                // Add LEC/LAB class dynamically
+                if (cell.type.toUpperCase() === "LEC") div.classList.add("lec");
+                else if (cell.type.toUpperCase() === "LAB") div.classList.add("lab");
+
+                div.textContent = `${cell.course} (${cell.type}) - ${cell.instructor}`;
+                td.appendChild(div);
+            }
+
+            tr.appendChild(td);
+        });
+
+        tbody.appendChild(tr);
+    });
+});
+</script>
+
+</body>
+</html>
