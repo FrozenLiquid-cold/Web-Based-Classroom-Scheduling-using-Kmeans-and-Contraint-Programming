@@ -1,7 +1,6 @@
 from scheduling.utils import clear_screen
-from scheduling.scheduler import create_schedule
+from scheduling.scheduler import create_schedule, Debugger  # use the updated version with debugger
 from globals import Globals
-
 
 
 
@@ -117,23 +116,39 @@ def SelectBlock():
             SelectBlock()
 
 def SelectSem():
-        print("=== CLASS-KCP MENU ===")
-        print("\nSelect an option: ")
-        print("1. First Semester ")
-        print("2. Second Semester ")
-        choice = input("\nSelect semester: ").strip()
-        if choice == '1':
-            Globals.semester = 1
-            clear_screen()
-            create_schedule()
-        elif choice == '2':
-            Globals.semester = 2
-            clear_screen()
-            create_schedule()
-        else:
-            print("\nnot in the options!")
-            input("")
-            SelectSem()
+    print("=== CLASS-KCP MENU ===")
+    print("\nSelect an option: ")
+    print("1. First Semester ")
+    print("2. Second Semester ")
+    choice = input("\nSelect semester: ").strip()
+
+    if choice == '1':
+        Globals.semester = 1
+    elif choice == '2':
+        Globals.semester = 2
+    else:
+        print("\nnot in the options!")
+        input("")
+        clear_screen()
+        SelectSem()
+        return
+
+    clear_screen()
+    print("Generating schedule...")
+    # initialize debugger
+    debug = Debugger(enable_console=True, filename="schedule_debug.log")
+    schedules = create_schedule()
+
+    if not schedules:
+        print("\nNo valid schedule found.")
+    else:
+        print("\n=== Generated Schedule ===")
+        for s in schedules:
+            print(f"{s['Code']} | {s['Title']} | {s['Timeslot']} | {s['Room']} | {s['Instructor']}")
+        print("\nSchedule also saved to: schedule_debug.log")
+
+    input("\nPress Enter to continue...")
+
 
 
 def show_menu():

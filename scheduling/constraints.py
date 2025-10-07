@@ -1,56 +1,71 @@
 from datetime import datetime
+from .utils import *
 
-def parse_time_range(time_str):
-    """Convert 'HH:MM' into minutes."""
-    t = datetime.strptime(time_str.strip(), "%H:%M")
-    return t.hour * 60 + t.minute
+def parse_time_range(tstr):
+    """Convert 'HH:MM-HH:MM' into (start_minutes, end_minutes)."""
+    try:
+        start, end = tstr.split("-")
+        h1, m1 = map(int, start.split(":"))
+        h2, m2 = map(int, end.split(":"))
+        return h1 * 60 + m1, h2 * 60 + m2
+    except Exception:
+        return 0, 0
+
 
 def overlap(start1, end1, start2, end2):
     """Return True if two ranges overlap."""
     return not (end1 <= start2 or end2 <= start1)
 
-def is_valid_assignment(schedule, cand, g):
+def is_valid_assignment(schedule, course, candidate):
     """
-    Validate a candidate against the current schedule.
-    cand keys: 'Day', 'Start', 'End', 'Room', 'Instructor', 'Block', 'YearLevel', 'Semester'
+    Check if assigning this candidate causes any room/instructor/time conflict.
     """
-    cand_start = parse_time_range(cand["Start"])
-    cand_end   = parse_time_range(cand["End"])
-    cand_day   = cand["Day"]
 
-    for assigned in schedule:
-        assigned_start = parse_time_range(assigned["Start"])
-        assigned_end   = parse_time_range(assigned["End"])
-        assigned_day   = assigned["Day"]
+    def parse_time_range(tstr):
+        """Convert 'HH:MM-HH:MM' into (start_minutes, end_minutes)."""
+        try:
+            start, end = tstr.split("-")
+            h1, m1 = map(int, start.split(":"))
+            h2, m2 = map(int, end.split(":"))
+            return h1 * 60 + m1, h2 * 60 + m2
+        except Exception:
+            return 0, 0
 
-        # Same day required for conflicts
-        if assigned_day != cand_day:
+    c_days = candidate.get("Days", "")
+    c_time = candidate.get("Time", "")
+    c_start, c_end = parse_time_range(c_time)
+
+    for s in schedule:
+        s_days = s.get("Days", "")
+        s_time = s.get("Time", "")
+        s_start, s_end = parse_time_range(s_time)
+
+        # --- check if any day overlaps (e.g., both have 'F' or 'MW')
+        same_day = any(day in c_days for day in s_days) if c_days and s_days else False
+        if not same_day:
             continue
 
-        # Room conflict
-        if assigned["Room"] == cand["Room"] and overlap(cand_start, cand_end, assigned_start, assigned_end):
-            print(f"❌ Room conflict: {cand['Room']} on {cand_day} "
-                  f"{cand['Start']}-{cand['End']} overlaps with "
-                  f"{assigned['Code']} {assigned['Start']}-{assigned['End']}")
+        # --- check time overlap
+        overlap = (c_start < s_end) and (s_start < c_end)
+        if not overlap:
+            continue
+
+        # --- room conflict
+        if candidate.get("Room") == s.get("Room"):
             return False
 
-        # Instructor conflict
-        if assigned["Instructor"] == cand["Instructor"] and overlap(cand_start, cand_end, assigned_start, assigned_end):
-            print(f"❌ Instructor conflict: {cand['Instructor']} on {cand_day} "
-                  f"{cand['Start']}-{cand['End']} overlaps with "
-                  f"{assigned['Code']} {assigned['Start']}-{assigned['End']}")
+        # --- instructor conflict
+        if candidate.get("Instructor") == s.get("Instructor"):
             return False
 
-        # Block/year conflict
-        if (assigned["Block"] == g.block and
-            assigned["YearLevel"] == g.yearLvl and
-            assigned["Semester"] == g.semester and
-            overlap(cand_start, cand_end, assigned_start, assigned_end)):
-            print(f"❌ Block conflict: Block {g.block}, Year {g.yearLvl}, Sem {g.semester} "
-                  f"at {cand['Start']}-{cand['End']} overlaps with {assigned['Code']}")
-            return False
+        # --- same course code LEC/LAB pairing rule
+        if course.get("Code") == s.get("Code") and course.get("Type") != s.get("Type"):
+            if candidate.get("Instructor") != s.get("Instructor"):
+                return False
 
     return True
+
+
 
 def find_instructors_for_course(course, instructors):
     course_code = course["Code"].strip().upper()
@@ -64,3 +79,162 @@ def find_instructors_for_course(course, instructors):
         names = [i["Name"] for i in matched]
         print(f"✅ {course['Code']} matched instructors: {names}")
     return matched
+
+
+def schedule_with_constraints(cluster_courses, rooms, instructors, timeslots, debug=None):
+    """
+    Pure Python constraint-based scheduler (no external libs).
+    """
+    if debug: debug.start_section("schedule_with_constraints")
+
+    schedule = []
+
+    # Convert to minutes helper
+    def time_to_min(t):
+        h, m = map(int, t.split(":"))
+        return h * 60 + m
+
+    # Check overlap between two time ranges
+    def overlap(t1, t2):
+        s1, e1 = map(time_to_min, t1.split("-"))
+        s2, e2 = map(time_to_min, t2.split("-"))
+        return not (e1 <= s2 or e2 <= s1)
+
+    # Get slots matching course units
+    def get_exact_slots(course):
+        required = int(float(course.get("Units", 1))) * 60
+        seqs = []
+        for i in range(len(timeslots)):
+            seq = [timeslots[i]]
+            total = int(timeslots[i]["Duration_Minutes"])
+            for j in range(i + 1, len(timeslots)):
+                if timeslots[j]["Days"] != timeslots[i]["Days"]:
+                    break
+                if timeslots[j]["Start_Time"] != seq[-1]["End_Time"]:
+                    break
+                total += int(timeslots[j]["Duration_Minutes"])
+                seq.append(timeslots[j])
+                if total == required:
+                    seqs.append(seq)
+                    break
+                if total > required:
+                    break
+        return seqs
+
+    def can_assign(candidate):
+        for s in schedule:
+            # Same day?
+            if s["Days"] == candidate["Days"]:
+                # Room conflict
+                if s["Room"] == candidate["Room"] and overlap(s["Time"], candidate["Time"]):
+                    return False
+                # Instructor conflict
+                if s["Instructor"] == candidate["Instructor"] and overlap(s["Time"], candidate["Time"]):
+                    return False
+        return True
+
+    # Backtracking assignment
+    def assign(idx):
+        if idx == len(cluster_courses):
+            return True
+        course = cluster_courses[idx]
+
+        possible_slots = get_exact_slots(course)
+        possible_rooms = [r for r in rooms if r["Type"].upper() == course["Type"].upper()]
+        possible_instr = [i for i in instructors if course["Code"].replace(" ", "").lower()
+                          in i["Assignable_Courses"].replace(" ", "").lower()]
+
+        for room in possible_rooms:
+            for instr in possible_instr:
+                for seq in possible_slots:
+                    start = seq[0]["Start_Time"]
+                    end = seq[-1]["End_Time"]
+                    days = seq[0]["Days"]
+
+                    cand = {
+                        "Code": course["Code"],
+                        "Title": course["Title"],
+                        "Type": course["Type"],
+                        "Room": room["Name"],
+                        "Instructor": instr["Name"],
+                        "Days": days,
+                        "Time": f"{start}-{end}"
+                    }
+
+                    if can_assign(cand):
+                        schedule.append(cand)
+                        if assign(idx + 1):
+                            return True
+                        schedule.pop()
+        return False
+
+    assign(0)
+    if debug: debug.end_section("schedule_with_constraints")
+    return schedule
+
+
+
+def get_candidate_timeslots(course, timeslots):
+    """
+    course: dict
+    timeslots: list of dicts
+    """
+    units = parse_units(course["Units"])
+    return [
+        ts for ts in timeslots
+        if units in str(ts["Allowed_Units"])
+    ]
+
+def get_candidate_rooms(course, rooms):
+    """
+    course: dict
+    rooms: list of dicts
+    """
+    expected = (
+        course["Expected_Students"]
+        if "Expected_Students" in course and course["Expected_Students"]
+        else 35
+    )
+
+    return [
+        room for room in rooms
+        if room["Capacity"] >= expected
+        and room["Type"].upper() == course["Type"].upper()
+    ]
+
+def get_candidate_instructors(course, instructors):
+    """
+    course: dict
+    instructors: list of dicts
+    """
+    course_code = normalize_code(course["Code"])
+    possible = []
+
+    for row in instructors:
+        assignable = [normalize_code(c) for c in str(row["Assignable_Courses"]).split(",")]
+        if course_code in assignable:
+            possible.append(row["Name"])
+
+    if not possible:
+        print(f"⚠️ No instructor found for {course['Code']} ({course_code})")
+        return []
+    else:
+        print(f"✅ {course['Code']} matched instructors: {possible}")
+        return [row for row in instructors if row["Name"] in possible]
+
+
+def get_courses_for_block(courses, g):
+    filtered = []
+    for c in courses:
+        year = str(c.get("YearLevel", "")).strip()
+        sem = str(c.get("Semester", "")).strip()
+        prog = str(c.get("Program", "")).strip().upper()
+
+        # Convert Globals to string for safe comparison
+        if (
+            year == str(g.yearLvl) and
+            sem == str(g.semester) and
+            prog == "BSCS"  # optional, keeps filtering by program
+        ):
+            filtered.append(c)
+    return filtered
