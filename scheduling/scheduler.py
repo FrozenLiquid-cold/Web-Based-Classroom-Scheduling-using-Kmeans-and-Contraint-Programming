@@ -2,64 +2,15 @@
 # Modified scheduler with integrated Debugger
 # Based on user's original file. See original for provenance. :contentReference[oaicite:1]{index=1}
 
-import random
 import argparse
 from datetime import datetime
 from .constraints import is_valid_assignment,schedule_with_constraints,get_courses_for_block
-from .utils import *
+from .utils import get_weighted_day
 from globals import Globals
 from data_loader import load_data
 from scheduling.formatter import generate_room_schedule
+from .clustering import *
 
-# ------------------------------
-# Debugger classes
-# ------------------------------
-class NullDebugger:
-    def log(self, *args, **kwargs): pass
-    def info(self, *args, **kwargs): pass
-    def warn(self, *args, **kwargs): pass
-    def error(self, *args, **kwargs): pass
-    def start_section(self, name): pass
-    def end_section(self, name): pass
-    def save(self): pass
-
-class Debugger:
-    def __init__(self, enable_console=True, filename=None, brief=False):
-        self.enable_console = enable_console
-        self.filename = filename
-        self.brief = brief
-        self.lines = []
-        self.start_time = datetime.now()
-
-    def _write(self, level, *parts):
-        t = datetime.now().strftime("%H:%M:%S")
-        msg = f"[{t}] [{level}] " + " ".join(str(p) for p in parts)
-        if self.enable_console:
-            print(msg)
-        if self.filename:
-            self.lines.append(msg + "\n")
-
-    def log(self, *parts): self._write("LOG", *parts)
-    def info(self, *parts): 
-        if not self.brief: 
-            self._write("INFO", *parts)
-    def warn(self, *parts): self._write("WARN", *parts)
-    def error(self, *parts): self._write("ERROR", *parts)
-
-    def start_section(self, name):
-        self._write("SECTION", f"START {name}")
-
-    def end_section(self, name):
-        self._write("SECTION", f"END {name}")
-
-    def save(self):
-        if not self.filename:
-            return
-        with open(self.filename, "a", encoding="utf-8") as f:
-            f.write(f"\n--- Debug session started at {self.start_time.isoformat()} ---\n")
-            f.writelines(self.lines)
-            f.write(f"--- End session ({datetime.now().isoformat()}) ---\n\n")
-        self.lines = []
 
 # ------------------------------
 # Candidate Builders
@@ -136,22 +87,60 @@ def build_candidates(course, rooms, instructors, timeslots, current_schedule, de
     # --- Combine instructor, room, timeslot sequence ---
     for instr in matched_instructors:
         for room in candidate_rooms:
-            for seq in valid_ts_sequences:
-                days = seq[0].get("Days")
-                start = seq[0].get("Start_Time")
-                end = seq[-1].get("End_Time")
+                preferred_day = get_weighted_day()
+                weighted_sequences = [seq for seq in valid_ts_sequences if preferred_day in seq[0].get("Days", "")]
+                if not weighted_sequences:
+                    weighted_sequences = valid_ts_sequences  # fallback
 
-                # MW/TTh balance rule (preserve your rule)
-                if days in ["MW", "TTh"]:
-                    mw_count = sum(1 for s in current_schedule if "MW" in s.get("Timeslot", ""))
-                    tth_count = sum(1 for s in current_schedule if "TTh" in s.get("Timeslot", ""))
-                    total = mw_count + tth_count + 1
-                    if days == "MW" and total > 0 and (mw_count + 1) / total > 0.6:
-                        debug.info(f"Pruned {course['Code']} on MW to keep balance (mw_count={mw_count}, tth_count={tth_count})")
-                        continue
-                    if days == "TTh" and total > 0 and (tth_count + 1) / total > 0.6:
-                        debug.info(f"Pruned {course['Code']} on TTh to keep balance (mw_count={mw_count}, tth_count={tth_count})")
-                        continue
+                for seq in weighted_sequences:
+                    days = seq[0].get("Days")
+                    start = seq[0].get("Start_Time")
+                    end = seq[-1].get("End_Time")
+
+
+                # --- Balance days: 40% MW, 40% TTh, 20% F ---
+                mw_count = sum(1 for s in current_schedule if "MW" in s.get("Timeslot", ""))
+                tth_count = sum(1 for s in current_schedule if "TTh" in s.get("Timeslot", ""))
+                f_count = sum(1 for s in current_schedule if s.get("Timeslot", "").startswith("F"))
+                total = mw_count + tth_count + f_count + 1  # +1 for this candidate
+
+                # target ratios
+                target = {"MW": 0.4, "TTh": 0.4, "F": 0.2}
+                ratios = {
+                    "MW": mw_count / total if total > 0 else 0,
+                    "TTh": tth_count / total if total > 0 else 0,
+                    "F": f_count / total if total > 0 else 0,
+                }
+
+                            # --- Balance + Weighted Bias ---
+                target = {"MW": 0.4, "TTh": 0.4, "F": 0.2}
+                ratios = {
+                    "MW": mw_count / total if total > 0 else 0,
+                    "TTh": tth_count / total if total > 0 else 0,
+                    "F": f_count / total if total > 0 else 0,
+                }
+
+                # pruning still applies when over-limit
+                if ratios.get(days, 0) > target.get(days, 0) + 0.05:
+                    debug.info(f"Pruned {course['Code']} on {days} (MW={mw_count}, TTh={tth_count}, F={f_count})")
+                    continue
+
+                # weight factor = how far below target
+                weight_factor = max(0.1, target[days] - ratios[days])  # minimum 0.1 to avoid zero
+                candidate = {
+                    "Code": course["Code"],
+                    "Title": course.get("Title"),
+                    "Type": course.get("Type"),
+                    "Instructor": instr.get("Name"),
+                    "Room": room.get("Name"),
+                    "Timeslot": f"{days} {start}-{end}",
+                    "Days": days,
+                    "Time": f"{start}-{end}",
+                    "Slot_ID": "+".join(ts.get("Slot_ID", "") for ts in seq),
+                    "Weight": weight_factor,  # ⬅️ bias toward underfilled day
+                }
+                candidates.append(candidate)
+
 
                 candidate = {
                     "Code": course["Code"],
@@ -194,6 +183,9 @@ def backtrack(courses, schedule, index, rooms, instructors, timeslots, debug=Non
     debug.info(f"Backtracking: index={index}, course={course.get('Code')}")
 
     candidates = build_candidates(course, rooms, instructors, timeslots, schedule, debug=debug)
+    # --- Prioritize candidates by day balance weight ---
+    candidates.sort(key=lambda c: c.get("Weight", 1.0), reverse=True)
+
 
     for cand in candidates:
         debug.info(f"Trying candidate for {course.get('Code')}: {cand['Timeslot']} | {cand['Room']} | {cand['Instructor']}")
@@ -216,52 +208,7 @@ def backtrack(courses, schedule, index, rooms, instructors, timeslots, debug=Non
 # ------------------------------
 # K-Means helpers (unchanged logic, with optional debug)
 # ------------------------------
-def encode_courses(courses, instructors, timeslots, debug=None):
-    if debug is None: debug = NullDebugger()
-    debug.start_section("encode_courses")
-    vectors = []
-    for c in courses:
-        units_min = int(c['Units']) * 60
-        type_val = 0 if c['Type'].upper() == 'LEC' else 1
-        instructor_count = sum(1 for i in instructors 
-                               if c['Code'].replace(" ","").lower() in i.get("Assignable_Courses","").replace(" ","").lower())
-        available_slots = [ts for ts in timeslots if int(ts.get('Duration_Minutes',0)) >= units_min]
-        mw_count = sum(1 for ts in available_slots if ts.get('Days') == 'MW')
-        tth_count = sum(1 for ts in available_slots if ts.get('Days') == 'TTh')
-        total_slots = mw_count + tth_count
-        day_pref = mw_count / total_slots if total_slots > 0 else 0.5
-        vec = [units_min, type_val, instructor_count, day_pref]
-        vectors.append(vec)
-        debug.log("Encoded course", c.get("Code"), "->", vec)
-    debug.end_section("encode_courses")
-    return vectors
 
-def kmeans(data, k=2, max_iters=100, debug=None):
-    if debug is None: debug = NullDebugger()
-    debug.start_section("kmeans")
-    if not data:
-        debug.warn("No data points passed to kmeans.")
-        return []
-    k = min(k, len(data))
-    centroids = random.sample(list(data), k)
-    debug.info("Initial centroids:", centroids)
-    clusters = [0] * len(data)
-    for it in range(max_iters):
-        new_clusters = []
-        for point in data:
-            dists = [sum((p-c)**2 for p,c in zip(point, centroid)) for centroid in centroids]
-            new_clusters.append(dists.index(min(dists)))
-        if new_clusters == clusters:
-            debug.info("KMeans converged at iteration", it)
-            break
-        clusters = new_clusters
-        for i in range(k):
-            assigned_points = [p for idx,p in enumerate(data) if clusters[idx]==i]
-            if assigned_points:
-                centroids[i] = [sum(dim)/len(dim) for dim in zip(*assigned_points)]
-        debug.log(f"Iteration {it} centroids:", centroids)
-    debug.end_section("kmeans")
-    return clusters
 
 # ------------------------------
 # Schedule Builder with K-Means
@@ -272,14 +219,14 @@ def build_schedule_with_kmeans(courses, rooms, instructors, timeslots, max_clust
 
     debug.start_section("build_schedule_with_kmeans")
 
-    vectors = encode_courses(courses, instructors, timeslots, debug=debug)
+    vectors = encode_courses(courses, instructors, timeslots)
     k = min(max_clusters, len(courses))
     if k <= 0:
         debug.warn("No clusters to build (no courses).")
         debug.end_section("build_schedule_with_kmeans")
         return []
 
-    cluster_labels = kmeans(vectors, k=k, debug=debug)
+    cluster_labels = kmeans(vectors, k=k)
     debug.info("Cluster labels:", cluster_labels)
 
     schedule = []
@@ -298,14 +245,21 @@ def build_schedule_with_kmeans(courses, rooms, instructors, timeslots, max_clust
             debug.warn(f"Cluster {cluster_id} produced no valid schedule; using fallback (per-course greedy).")
 
             # 🔸 Fallback: Greedy assignment if constraint-scheduler failed
-            for c in cluster_courses:
-                candidates = build_candidates(c, rooms, instructors, timeslots, schedule, debug=debug)
-                if candidates:
-                    for cand in candidates:
-                        if is_valid_assignment(schedule, c, cand):
-                            schedule.append(cand)
-                            debug.log(f"Placed {c['Code']} ({c['Title']}) via fallback.")
-                            break
+        for c in cluster_courses:
+            candidates = build_candidates(c, rooms, instructors, timeslots, schedule, debug=debug)
+            if not candidates:
+                debug.warn(f"No candidate slots found for {c['Code']} ({c['Title']}).")
+                continue
+
+            # 🔹 Sort candidates by weight (bias towards underfilled day)
+            candidates.sort(key=lambda x: x.get("Weight", 1.0), reverse=True)
+
+            for cand in candidates:
+                if is_valid_assignment(schedule, c, cand):
+                    schedule.append(cand)
+                    debug.log(f"Placed {c['Code']} ({c['Title']}) via weighted fallback ({cand['Days']}).")
+                    break
+
                 else:
                     debug.warn(f"No candidate slots found for {c['Code']} ({c['Title']}).")
 
@@ -395,30 +349,29 @@ if __name__ == "__main__":
 
 # ------------------------------
 # create_schedule using K-Means
-# ------------------------------
 def create_schedule():
     courses, rooms, instructors, timeslots = load_data()
     filtered = get_courses_for_block(courses, Globals)
-    
-    schedule = build_schedule_with_kmeans(filtered, rooms, instructors, timeslots, max_clusters=3)
-    
-    print("\nGenerated Schedule:")
-    
-    if not schedule:
-        print("❌ No valid schedule found!")
-        print("\n🔹 Attempting detailed debug for each course...\n")
-        for course in filtered:
-            print(f"--- Debugging {course['Code']} ({course['Title']}) ---")
-            _ = build_candidates(course, rooms, instructors, timeslots, [])
-        input("\nPress Enter to return to the menu...")
-        return
+    schedule = build_schedule_with_kmeans(filtered, rooms, instructors, timeslots)
 
-    unique_rooms = sorted(set(s['Room'] for s in schedule))
-    for room_name in unique_rooms:
-        print(f"\nRoom: {room_name}")
-        print(generate_room_schedule(schedule, room_name))
-        print("=" * 80)
-    
+    if not schedule:
+        print("No valid schedule found!")
+        return []
+
+    # Optionally print to console
     print("\nFull Schedule:")
     for s in schedule:
         print(f"{s['Code']} | {s['Title']} | {s['Time']} | {s['Room']} | {s['Instructor']}")
+    
+    return schedule
+
+def dump_course_debug(course_code, debug=None):
+    if debug is None: debug = NullDebugger()
+    courses, rooms, instructors, timeslots = load_data()
+    found = next((c for c in courses if c.get("Code")==course_code or c.get("Code").replace(" ","")==course_code.replace(" ","")), None)
+    if not found:
+        debug.error("Course not found:", course_code)
+        return
+    debug.start_section(f"dump_course_debug:{course_code}")
+    _ = build_candidates(found, rooms, instructors, timeslots, [], debug=debug)
+    debug.end_section(f"dump_course_debug:{course_code}")

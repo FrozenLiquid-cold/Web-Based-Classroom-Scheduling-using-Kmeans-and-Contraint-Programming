@@ -144,7 +144,7 @@ def SelectSem():
     else:
         print("\n=== Generated Schedule ===")
         for s in schedules:
-            print(f"{s['Code']} | {s['Title']} | {s['Timeslot']} | {s['Room']} | {s['Instructor']}")
+            print(f"{s['Code']} | {s['Title']} | {s['Time']} | {s['Room']} | {s['Instructor']}")
         print("\nSchedule also saved to: schedule_debug.log")
 
     input("\nPress Enter to continue...")

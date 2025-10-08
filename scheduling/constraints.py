@@ -84,23 +84,25 @@ def find_instructors_for_course(course, instructors):
 def schedule_with_constraints(cluster_courses, rooms, instructors, timeslots, debug=None):
     """
     Pure Python constraint-based scheduler (no external libs).
+    Includes day-balance logic: 40% MW, 40% TTh, 20% F.
     """
     if debug: debug.start_section("schedule_with_constraints")
 
+    import random
     schedule = []
 
-    # Convert to minutes helper
+    # ------------------------------
+    # Helpers
+    # ------------------------------
     def time_to_min(t):
         h, m = map(int, t.split(":"))
         return h * 60 + m
 
-    # Check overlap between two time ranges
     def overlap(t1, t2):
         s1, e1 = map(time_to_min, t1.split("-"))
         s2, e2 = map(time_to_min, t2.split("-"))
         return not (e1 <= s2 or e2 <= s1)
 
-    # Get slots matching course units
     def get_exact_slots(course):
         required = int(float(course.get("Units", 1))) * 60
         seqs = []
@@ -123,26 +125,54 @@ def schedule_with_constraints(cluster_courses, rooms, instructors, timeslots, de
 
     def can_assign(candidate):
         for s in schedule:
-            # Same day?
             if s["Days"] == candidate["Days"]:
-                # Room conflict
                 if s["Room"] == candidate["Room"] and overlap(s["Time"], candidate["Time"]):
                     return False
-                # Instructor conflict
                 if s["Instructor"] == candidate["Instructor"] and overlap(s["Time"], candidate["Time"]):
                     return False
         return True
 
-    # Backtracking assignment
+    # ------------------------------
+    # Day Balancing Bias
+    # ------------------------------
+    def get_day_balance_weights():
+        day_counts = {"MW": 0, "TTh": 0, "F": 0}
+        for s in schedule:
+            d = s.get("Days")
+            if d in day_counts:
+                day_counts[d] += 1
+        total = sum(day_counts.values()) + 1
+        ratios = {k: v / total for k, v in day_counts.items()}
+        target = {"MW": 0.4, "TTh": 0.4, "F": 0.2}
+
+        # Score lower if overfilled; higher if underfilled
+        weights = {}
+        for d in target:
+            weights[d] = max(0.1, target[d] - ratios[d])
+        return weights, ratios, target
+
+    # ------------------------------
+    # Backtracking Assignment
+    # ------------------------------
     def assign(idx):
         if idx == len(cluster_courses):
             return True
-        course = cluster_courses[idx]
 
+        course = cluster_courses[idx]
         possible_slots = get_exact_slots(course)
         possible_rooms = [r for r in rooms if r["Type"].upper() == course["Type"].upper()]
-        possible_instr = [i for i in instructors if course["Code"].replace(" ", "").lower()
-                          in i["Assignable_Courses"].replace(" ", "").lower()]
+        possible_instr = [
+            i for i in instructors
+            if course["Code"].replace(" ", "").lower() in i["Assignable_Courses"].replace(" ", "").lower()
+        ]
+
+        weights, ratios, target = get_day_balance_weights()
+
+        # Sort slots: prioritize underused days
+        possible_slots.sort(key=lambda seq: -weights.get(seq[0]["Days"], 0.1))
+
+        # Optional: small shuffle to diversify choices
+        random.shuffle(possible_slots)
 
         for room in possible_rooms:
             for instr in possible_instr:
@@ -150,6 +180,11 @@ def schedule_with_constraints(cluster_courses, rooms, instructors, timeslots, de
                     start = seq[0]["Start_Time"]
                     end = seq[-1]["End_Time"]
                     days = seq[0]["Days"]
+
+                    # Skip days over their ratio target
+                    if ratios.get(days, 0) > target.get(days, 0) + 0.05:
+                        if debug: debug.info(f"Skip {course['Code']} on {days} (over target)")
+                        continue
 
                     cand = {
                         "Code": course["Code"],
@@ -166,12 +201,12 @@ def schedule_with_constraints(cluster_courses, rooms, instructors, timeslots, de
                         if assign(idx + 1):
                             return True
                         schedule.pop()
+
         return False
 
     assign(0)
     if debug: debug.end_section("schedule_with_constraints")
     return schedule
-
 
 
 def get_candidate_timeslots(course, timeslots):
