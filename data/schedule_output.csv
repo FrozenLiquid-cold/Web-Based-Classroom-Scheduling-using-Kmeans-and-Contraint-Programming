@@ -1,0 +1,13 @@
+class_id,size,duration,cluster,groups,preferred,assigned_room,assigned_times,pref_matched
+C1,53,1,2,G6,(none),(unscheduled),,False
+C2,36,1,0,G4;G1;G5,(none),(unscheduled),,False
+C3,58,1,2,G6;G5;G4,Tue 10-12,(unscheduled),,False
+C4,82,1,1,G4;G3;G5,Mon 8-10,(unscheduled),,False
+C5,33,1,0,G4,(none),(unscheduled),,False
+C6,33,1,0,G4;G5;G1,(none),(unscheduled),,False
+C7,84,2,1,G6,Tue 10-12,(unscheduled),,False
+C8,61,1,2,G4,Mon 8-10,(unscheduled),,False
+C9,26,1,0,G6,(none),(unscheduled),,False
+C10,55,1,2,G6;G2;G5,(none),(unscheduled),,False
+C11,27,1,0,G3;G1;G2,Tue 10-12,(unscheduled),,False
+C12,26,2,0,G2,(none),(unscheduled),,False

@@ -1,0 +1,2 @@
+# Web-Based-Classroom-Scheduling-using-Kmeans-and-Contraint-Programming
+A web-based classroom scheduling system that combines K-Means clustering and Constraint Programming to efficiently allocate courses, instructors, rooms, and timeslots while handling scheduling constraints like instructor availability, room capacity, and course type (LEC/LAB). Includes a dynamic UI for visualizing weekly schedules.
