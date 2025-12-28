@@ -1,0 +1,47 @@
+:root {
+	--color-navy: #1E2567;
+	--color-royal: #2F3FA5;
+	--color-gold: #C9A54A;
+	--color-light: #F2F4F8;
+}
+
+/* Local font faces (drop the actual files into public/fonts/) */
+@font-face {
+  font-family: 'Lastica';
+  src: url('/fonts/Lastica.woff2') format('woff2');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Horizon';
+  src: url('/fonts/Horizon.woff2') format('woff2');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Arial MT Pro';
+  src: url('/fonts/ArialMTPro.woff2') format('woff2');
+  font-display: swap;
+}
+/* Archivo Black and Poppins can be provided locally as well; Google-hosted fallbacks can also work */
+@font-face {
+  font-family: 'Archivo Black';
+  src: url('/fonts/ArchivoBlack.woff2') format('woff2');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Poppins';
+  src: url('/fonts/Poppins-Regular.woff2') format('woff2');
+  font-display: swap;
+  font-weight: 400;
+}
+@font-face {
+  font-family: 'Poppins';
+  src: url('/fonts/Poppins-SemiBold.woff2') format('woff2');
+  font-display: swap;
+  font-weight: 600;
+}
+
+body {
+	background-color: var(--color-light);
+	color: #0f172a;
+}
+

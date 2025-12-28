@@ -1,0 +1,436 @@
+"""Schedule routes implemented with Flask blueprints."""
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+
+from flask import Blueprint, jsonify, request
+from pydantic import ValidationError
+
+# Ensure the project root is in the Python path
+project_root = str(Path(__file__).parent.parent.parent)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from api import models
+from api import schemas
+from api.db import SessionLocal
+from api.job_queue import queue_manager
+from api.scheduler.scheduler import load_schedule, save_schedule as persist_schedule
+from api.scheduler.course_scheduler import schedule_course_refactored
+
+schedule_bp = Blueprint("schedule", __name__)
+
+
+def _get_session() -> SessionLocal:
+    return SessionLocal()
+
+
+@schedule_bp.route("/course", methods=["POST"])
+def schedule_course_endpoint():
+    """Schedule a single course for a specific year/semester using KMeans + CP-SAT."""
+    payload = request.get_json(force=True) or {}
+
+    required_fields = ["course_id", "year", "semester", "blocks_count"]
+    missing = [field for field in required_fields if field not in payload]
+    if missing:
+        return (
+            jsonify({"detail": f"Missing required fields: {', '.join(missing)}"}),
+            422,
+        )
+
+    try:
+        course_id = int(payload["course_id"])
+        year = int(payload["year"])
+        semester = int(payload["semester"])
+        blocks_count = int(payload["blocks_count"])
+    except (TypeError, ValueError):
+        return jsonify({"detail": "course_id, year, semester, and blocks_count must be integers"}), 422
+
+    session = _get_session()
+    try:
+        result = schedule_course_refactored(
+            session=session,
+            course_id=course_id,
+            year=year,
+            semester=semester,
+            blocks_count=blocks_count,
+        )
+        status_code = 200 if result["status"] == "scheduled" else 409
+        response = jsonify(result)
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, status_code
+    except Exception as exc:
+        session.rollback()
+        response = jsonify({"status": "error", "detail": str(exc)})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 500
+    finally:
+        session.close()
+
+
+@schedule_bp.route("/generate", methods=["POST", "OPTIONS"])
+def generate_schedule():
+    """Queue (or reuse) a scheduling job and return immediately."""
+    if request.method == "OPTIONS":
+        response = jsonify({"status": "ok"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "*")
+        response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
+        return response
+
+    payload = request.get_json(force=True) or {}
+    try:
+        schedule_request = schemas.ScheduleGenerateRequest(**payload)
+    except ValidationError as exc:
+        response = jsonify({"detail": exc.errors()})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 422
+
+    wait_seconds = request.args.get("wait_seconds", type=int)
+    logger = logging.getLogger(__name__)
+    start_time = time.time()
+
+    db = _get_session()
+    try:
+        course = (
+            db.query(models.Course)
+            .filter(models.Course.id == schedule_request.course_id)
+            .first()
+        )
+        if not course:
+            response = jsonify({"detail": "Course not found"})
+            response.headers.add("Access-Control-Allow-Origin", "*")
+            return response, 404
+
+        college_id = course.college_id
+        k_clusters = (
+            schedule_request.k_clusters
+            if schedule_request.k_clusters is not None
+            else 3
+        )
+
+        if schedule_request.years:
+            years = sorted({int(y) for y in schedule_request.years if y is not None})
+        elif schedule_request.year is not None:
+            years = [int(schedule_request.year)]
+        else:
+            years = [1, 2, 3, 4]
+
+        if not years:
+            response = jsonify({"detail": "No year levels provided"})
+            response.headers.add("Access-Control-Allow-Origin", "*")
+            return response, 400
+
+        years_key = "-".join(str(y) for y in years)
+        queue_key = (
+            f"sched:{college_id}:course{schedule_request.course_id}:"
+            f"sem{schedule_request.semester}:years{years_key}:k{k_clusters}:blocks{schedule_request.blocks_count or 1}"
+        )
+
+        job_payload = {
+            "course_id": schedule_request.course_id,
+            "years": years,
+            "semester": schedule_request.semester,
+            "subject_ids": schedule_request.subject_ids,
+            "use_kmeans": schedule_request.use_kmeans
+            if schedule_request.use_kmeans is not None
+            else True,
+            "k_clusters": k_clusters,
+            "weight_slots": schedule_request.weight_slots
+            if schedule_request.weight_slots is not None
+            else 2.0,
+            "force_refit": getattr(schedule_request, "force_refit", False),
+            "block_capacities": [
+                override.model_dump()
+                for override in (schedule_request.block_capacities or [])
+            ],
+            "blocks_count": schedule_request.blocks_count,
+        }
+
+        job_id, already_queued = queue_manager.enqueue(queue_key, job_payload)
+
+        if already_queued:
+            logger.info(
+                "Scheduling job already queued/running for %s — reusing job_id=%s",
+                queue_key,
+                job_id,
+            )
+    finally:
+        db.close()
+
+    if wait_seconds and wait_seconds > 0:
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            status_obj = queue_manager.get_status(job_id)
+            if status_obj.get("status") in {"succeeded", "failed"}:
+                elapsed = time.time() - start_time
+                if status_obj["status"] == "succeeded":
+                    result = status_obj.get("result") or {}
+                    # Extract items array (result may be {"items": [...], "count": N} or just [...])
+                    if isinstance(result, dict) and "items" in result:
+                        items = result["items"]
+                    elif isinstance(result, list):
+                        items = result
+                    else:
+                        items = []
+                    
+                    response = jsonify(
+                        {
+                            "status": "success",
+                            "job_id": job_id,
+                            "course_id": schedule_request.course_id,
+                            "years": years,
+                            "semester": schedule_request.semester,
+                            "items": items,  # For backward compatibility
+                            "result": items,  # New: direct array for frontend
+                            "count": len(items),
+                            "elapsed_time": round(elapsed, 2),
+                            "already_queued": already_queued,
+                        }
+                    )
+                    response.headers.add("Access-Control-Allow-Origin", "*")
+                    return response, 200
+                response = jsonify(
+                    {
+                        "detail": status_obj.get("error")
+                        or "Scheduling job failed"
+                    }
+                )
+                response.headers.add("Access-Control-Allow-Origin", "*")
+                return response, 500
+            time.sleep(0.25)
+
+    elapsed = time.time() - start_time
+    response = jsonify(
+        {
+            "status": "queued",
+            "job_id": job_id,
+            "course_id": schedule_request.course_id,
+            "college_id": college_id,
+            "years": years,
+            "semester": schedule_request.semester,
+            "elapsed_time": round(elapsed, 2),
+            "already_queued": already_queued,
+        }
+    )
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    return response, 202
+
+
+@schedule_bp.route("/status", methods=["GET"])
+def get_schedule_status():
+    """Check status of a queued scheduling job."""
+    job_id = request.args.get("job_id")
+    if not job_id:
+        response = jsonify({"detail": "job_id query parameter is required"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 400
+    status_obj = queue_manager.get_status(job_id)
+    if status_obj.get("status") == "not_found":
+        response = jsonify({"detail": "Job not found"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 404
+    
+    # Transform response to match frontend expectations
+    # Frontend expects: {"status": "completed", "result": [scheduled_items...]}
+    if status_obj.get("status") == "succeeded":
+        result_data = status_obj.get("result", {})
+        # Extract items array from result (result may be {"items": [...], "count": N} or just [...])
+        if isinstance(result_data, dict) and "items" in result_data:
+            scheduled_items = result_data["items"]
+        elif isinstance(result_data, list):
+            scheduled_items = result_data
+        else:
+            scheduled_items = []
+        
+        response = jsonify({
+            "status": "completed",
+            "result": scheduled_items,
+            "job_id": status_obj.get("job_id"),
+            "created_at": status_obj.get("created_at"),
+            "started_at": status_obj.get("started_at"),
+            "finished_at": status_obj.get("finished_at"),
+        })
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response
+    
+    # For other statuses (pending, running, failed), return as-is
+    response = jsonify(status_obj)
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    return response
+
+
+@schedule_bp.route("/save", methods=["POST"])
+def save_schedule_route():
+    """Save schedule to database."""
+    payload = request.get_json(force=True) or {}
+    try:
+        save_request = schemas.ScheduleSaveRequest(**payload)
+    except ValidationError as exc:
+        response = jsonify({"detail": exc.errors()})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 422
+
+    db = _get_session()
+    try:
+        course = (
+            db.query(models.Course)
+            .filter(models.Course.id == save_request.course_id)
+            .first()
+        )
+        if not course:
+            return jsonify({"detail": "Course not found"}), 404
+
+        schedule_items = [item.model_dump() for item in save_request.items]
+        saved_records = persist_schedule(
+            db=db,
+            course_id=save_request.course_id,
+            year=save_request.year,
+            semester=save_request.semester,
+            schedule_items=schedule_items,
+        )
+        return jsonify(
+            {
+                "status": "success",
+                "message": "Schedule saved successfully",
+                "count": len(saved_records),
+            }
+        )
+    finally:
+        db.close()
+
+
+@schedule_bp.route("/load", methods=["GET"])
+def load_schedule_route():
+    """Load schedule from database. Aggregates all years if year is not specified."""
+    try:
+        course_id = int(request.args["course_id"])
+        semester = int(request.args["semester"])
+    except KeyError as missing:
+        return jsonify({"detail": f"Missing parameter: {missing.args[0]}"}), 400
+    except ValueError:
+        return jsonify({"detail": "course_id and semester must be integers"}), 400
+
+    year = request.args.get("year", type=int)
+    instructor_id = request.args.get("instructor_id", type=int)
+
+    # Check if there's an active job for this course/semester
+    active_job_id = queue_manager.find_active_job_for_course(course_id, semester)
+    if active_job_id:
+        return jsonify({
+            "status": "pending",
+            "message": "Schedule generation in progress",
+            "job_id": active_job_id,
+        }), 200
+
+    db = _get_session()
+    try:
+        # If year is specified, load only that year
+        if year is not None:
+            schedules = load_schedule(
+                db=db,
+                course_id=course_id,
+                year=year,
+                semester=semester,
+                instructor_id=instructor_id,
+            )
+            items = [
+                {
+                    "id": sched.id,
+                    "subject_id": sched.subject_id,
+                    "instructor_id": sched.instructor_id,
+                    "room_id": sched.room_id,
+                    "day_id": sched.day_id,
+                    "time": sched.time,
+                    "course_id": sched.course_id,
+                    "year": sched.year,
+                    "semester": sched.semester,
+                    "block": getattr(sched, "block", None),
+                }
+                for sched in schedules
+            ]
+        else:
+            # Aggregate all years for this course/semester
+            # Use stored procedure for optimized query (year=None returns all years)
+            import db_procedures
+            schedules_list = db_procedures.get_schedules_for_course(
+                db=db,
+                course_id=course_id,
+                semester=semester,
+                year=None,  # None means all years
+                instructor_id=instructor_id
+            )
+            
+            # Deduplicate by subject_id (keep first occurrence)
+            seen_subjects = set()
+            unique_schedules = []
+            for sched in schedules_list:
+                if sched.subject_id not in seen_subjects:
+                    seen_subjects.add(sched.subject_id)
+                    unique_schedules.append(sched)
+            
+            items = [
+                {
+                    "id": sched.id,
+                    "subject_id": sched.subject_id,
+                    "instructor_id": sched.instructor_id,
+                    "room_id": sched.room_id,
+                    "day_id": sched.day_id,
+                    "time": sched.time,
+                    "course_id": sched.course_id,
+                    "year": sched.year,
+                    "semester": sched.semester,
+                    "block": getattr(sched, "block", None),
+                }
+                for sched in unique_schedules
+            ]
+        
+        return jsonify(
+            {
+                "status": "success",
+                "course_id": course_id,
+                "year": year,
+                "semester": semester,
+                "items": items,
+                "count": len(items),
+            }
+        )
+    finally:
+        db.close()
+
+
+@schedule_bp.route("/delete", methods=["DELETE"])
+def delete_schedule():
+    """Delete schedule from database."""
+    try:
+        course_id = int(request.args["course_id"])
+        year = int(request.args["year"])
+        semester = int(request.args["semester"])
+    except KeyError as missing:
+        return jsonify({"detail": f"Missing parameter: {missing.args[0]}"}), 400
+    except ValueError:
+        return jsonify({"detail": "course_id, year, and semester must be integers"}), 400
+
+    db = _get_session()
+    try:
+        deleted = (
+            db.query(models.Schedule)
+            .filter(
+                models.Schedule.course_id == course_id,
+                models.Schedule.year == year,
+                models.Schedule.semester == semester,
+            )
+            .delete()
+        )
+        db.commit()
+        return jsonify(
+            {
+                "status": "success",
+                "message": f"Deleted {deleted} schedule entries",
+            }
+        )
+    finally:
+        db.close()
+

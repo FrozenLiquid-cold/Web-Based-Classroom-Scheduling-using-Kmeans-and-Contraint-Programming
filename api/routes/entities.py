@@ -1,0 +1,583 @@
+"""CRUD routes for entities implemented with Flask blueprints."""
+from typing import Iterable, List, Type
+import logging
+import hashlib
+
+from flask import Blueprint, jsonify, request
+from pydantic import BaseModel, ValidationError
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+
+from .. import models
+from .. import schemas
+from ..db import SessionLocal
+
+entities_bp = Blueprint("entities", __name__)
+logger = logging.getLogger(__name__)
+
+
+from contextlib import contextmanager
+
+@contextmanager
+def _get_session():
+    """Provide a transactional scope around a series of operations."""
+    db = SessionLocal()
+    try:
+        yield db
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _safe_db_operation(func):
+    """Decorator for safe database operations with automatic rollback on error."""
+    def wrapper(*args, **kwargs):
+        db = None
+        try:
+            return func(*args, **kwargs)
+        except SQLAlchemyError as e:
+            if db:
+                db.rollback()
+            logger.error(f"Database error in {func.__name__}: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            if db:
+                db.rollback()
+            logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
+            raise
+    return wrapper
+
+
+def _serialize(instance, schema: Type[BaseModel]) -> dict:
+    return schema.model_validate(instance).model_dump()
+
+
+def _serialize_list(instances: Iterable, schema: Type[BaseModel]) -> List[dict]:
+    return [schema.model_validate(obj).model_dump() for obj in instances]
+
+
+# ---------------------------------------------------------------------------
+# College routes
+# ---------------------------------------------------------------------------
+@entities_bp.route("/colleges", methods=["GET"])
+def list_colleges():
+    with _get_session() as db:
+        colleges = db.query(models.College).all()
+        return jsonify(_serialize_list(colleges, schemas.CollegeResponse))
+
+
+@entities_bp.route("/colleges", methods=["POST"])
+def create_college():
+    payload = request.get_json(force=True) or {}
+    try:
+        college = schemas.CollegeCreate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        db_college = models.College(**college.model_dump())
+        db.add(db_college)
+        db.commit()
+        db.refresh(db_college)
+        return jsonify(_serialize(db_college, schemas.CollegeResponse)), 201
+
+
+@entities_bp.route("/colleges/<int:college_id>", methods=["GET"])
+def get_college(college_id: int):
+    with _get_session() as db:
+        college = db.query(models.College).filter(models.College.id == college_id).first()
+        if not college:
+            return jsonify({"detail": "College not found"}), 404
+        return jsonify(_serialize(college, schemas.CollegeResponse))
+
+
+@entities_bp.route("/colleges/<int:college_id>", methods=["PUT"])
+def update_college(college_id: int):
+    payload = request.get_json(force=True) or {}
+    try:
+        update_data = schemas.CollegeUpdate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        college = db.query(models.College).filter(models.College.id == college_id).first()
+        if not college:
+            return jsonify({"detail": "College not found"}), 404
+
+        for key, value in update_data.model_dump(exclude_unset=True).items():
+            setattr(college, key, value)
+
+        db.commit()
+        db.refresh(college)
+        return jsonify(_serialize(college, schemas.CollegeResponse))
+
+
+@entities_bp.route("/colleges/<int:college_id>", methods=["DELETE"])
+def delete_college(college_id: int):
+    with _get_session() as db:
+        college = db.query(models.College).filter(models.College.id == college_id).first()
+        if not college:
+            return jsonify({"detail": "College not found"}), 404
+        db.delete(college)
+        db.commit()
+        return "", 204
+
+
+# ---------------------------------------------------------------------------
+# Course routes
+# ---------------------------------------------------------------------------
+@entities_bp.route("/courses", methods=["GET"])
+def list_courses():
+    with _get_session() as db:
+        courses = db.query(models.Course).all()
+        return jsonify(_serialize_list(courses, schemas.CourseResponse))
+
+
+@entities_bp.route("/courses", methods=["POST"])
+def create_course():
+    payload = request.get_json(force=True) or {}
+    try:
+        course = schemas.CourseCreate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        db_course = models.Course(**course.model_dump())
+        db.add(db_course)
+        db.commit()
+        db.refresh(db_course)
+        return jsonify(_serialize(db_course, schemas.CourseResponse)), 201
+
+
+@entities_bp.route("/courses/<int:course_id>", methods=["GET"])
+def get_course(course_id: int):
+    with _get_session() as db:
+        course = db.query(models.Course).filter(models.Course.id == course_id).first()
+        if not course:
+            return jsonify({"detail": "Course not found"}), 404
+        return jsonify(_serialize(course, schemas.CourseResponse))
+
+
+@entities_bp.route("/courses/<int:course_id>", methods=["PUT"])
+def update_course(course_id: int):
+    payload = request.get_json(force=True) or {}
+    try:
+        course_update = schemas.CourseUpdate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        course = db.query(models.Course).filter(models.Course.id == course_id).first()
+        if not course:
+            return jsonify({"detail": "Course not found"}), 404
+
+        for key, value in course_update.model_dump(exclude_unset=True).items():
+            setattr(course, key, value)
+
+        db.commit()
+        db.refresh(course)
+        return jsonify(_serialize(course, schemas.CourseResponse))
+
+
+@entities_bp.route("/courses/<int:course_id>", methods=["DELETE"])
+def delete_course(course_id: int):
+    with _get_session() as db:
+        course = db.query(models.Course).filter(models.Course.id == course_id).first()
+        if not course:
+            return jsonify({"detail": "Course not found"}), 404
+        db.delete(course)
+        db.commit()
+        return "", 204
+
+
+# ---------------------------------------------------------------------------
+# Instructor routes
+# ---------------------------------------------------------------------------
+@entities_bp.route("/instructors", methods=["GET"])
+def list_instructors():
+    """List all instructors."""
+    logger.info("Fetching all instructors")
+    try:
+        with _get_session() as db:
+            instructors = db.query(models.Instructor).all()
+            logger.info(f"Found {len(instructors)} instructors")
+            return jsonify(_serialize_list(instructors, schemas.InstructorResponse))
+    except Exception as e:
+        logger.error(f"Error listing instructors: {str(e)}", exc_info=True)
+        return jsonify({"error": "Failed to retrieve instructors", "details": str(e)}), 500
+
+
+@entities_bp.route("/instructors", methods=["POST"])
+def create_instructor():
+    """Create a new instructor."""
+    logger.info("Creating new instructor")
+    data = request.get_json()
+    if not data:
+        logger.warning("No input data provided")
+        return jsonify({"error": "No input data provided"}), 400
+    
+    try:
+        # Validate input data
+        instructor_data = schemas.InstructorCreate(**data)
+    except ValidationError as err:
+        logger.warning(f"Validation error: {err.errors()}")
+        return jsonify({"error": "Validation error", "details": err.errors()}), 400
+
+    try:
+        with _get_session() as db:
+            # Derive a base username from first and last name if none is provided.
+            first = (instructor_data.first_name or "").strip()
+            last = (instructor_data.last_name or "").strip()
+            # Optional override from payload, otherwise use "firstname.lastname" style.
+            base_username = (instructor_data.username or f"{first} {last}").strip()
+            # Normalize: lowercase and replace spaces with dots
+            base_username = base_username.lower().replace(" ", ".")
+
+            # Ensure username is unique across users; add numeric suffix if needed.
+            candidate = base_username or "instructor"
+            suffix = 1
+            while (
+                db.query(models.User)
+                .filter(models.User.username == candidate)
+                .first()
+            ) is not None:
+                suffix += 1
+                candidate = f"{base_username}{suffix}"
+
+            # Prepare instructor payload (exclude password, which belongs to User)
+            instructor_payload = instructor_data.model_dump(exclude={"password", "username"})
+            instructor_payload["username"] = candidate
+
+            # Create new instructor
+            db_instructor = models.Instructor(**instructor_payload)
+            db.add(db_instructor)
+            db.flush()  # Assign ID without committing yet
+
+            # Always create a linked User account with default credentials.
+            # Default username: derived candidate above
+            # Default password: instructor's last name (as provided)
+            default_password = last or first or candidate
+            password_hash = hashlib.sha256(default_password.encode()).hexdigest()
+
+            db_user = models.User(
+                username=candidate,
+                password_hash=password_hash,
+                role="instructor",
+                instructor_id=db_instructor.id,
+            )
+            db.add(db_user)
+
+            db.commit()
+            db.refresh(db_instructor)
+            logger.info(
+                "Created instructor with ID: %s and default login username=%s password=<last_name>",
+                db_instructor.id,
+                candidate,
+            )
+            return jsonify(_serialize(db_instructor, schemas.InstructorResponse)), 201
+    except Exception as e:
+        logger.error(f"Error creating instructor: {e}", exc_info=True)
+
+@entities_bp.route("/instructors/<int:instructor_id>", methods=["GET"])
+def get_instructor(instructor_id: int):
+    """Get a specific instructor by ID."""
+    logger.info(f"Fetching instructor with ID: {instructor_id}")
+    try:
+        with _get_session() as db:
+            instructor = db.query(models.Instructor).get(instructor_id)
+            if not instructor:
+                logger.warning(f"Instructor with ID {instructor_id} not found")
+                return jsonify({"error": "Instructor not found"}), 404
+            return jsonify(_serialize(instructor, schemas.InstructorResponse))
+    except Exception as e:
+        logger.error(f"Error fetching instructor {instructor_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Failed to retrieve instructor", "details": str(e)}), 500
+
+
+@entities_bp.route("/instructors/<int:instructor_id>", methods=["PUT"])
+def update_instructor(instructor_id: int):
+    payload = request.get_json(force=True) or {}
+    try:
+        instructor_update = schemas.InstructorUpdate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        instructor = (
+            db.query(models.Instructor)
+            .filter(models.Instructor.id == instructor_id)
+            .first()
+        )
+        if not instructor:
+            return jsonify({"detail": "Instructor not found"}), 404
+
+        data = instructor_update.model_dump(exclude_unset=True)
+        for key, value in data.items():
+            setattr(instructor, key, value)
+
+        # If the client did NOT explicitly provide assignable_courses,
+        # keep the existing behavior of auto-populating specialization
+        # from the instructor's college. When assignable_courses is
+        # present, we respect it as a manual specialization list.
+        has_assignable_courses = "assignable_courses" in data
+        if not has_assignable_courses:
+            college_id = data.get("college_id", instructor.college_id)
+            if college_id:
+                courses = (
+                    db.query(models.Course)
+                    .filter(models.Course.college_id == college_id)
+                    .all()
+                )
+                codes = [course.code for course in courses]
+                instructor.assignable_courses = ",".join(codes) if codes else None
+            elif "college_id" in data and college_id is None:
+                instructor.assignable_courses = None
+
+        db.commit()
+        db.refresh(instructor)
+        return jsonify(_serialize(instructor, schemas.InstructorResponse))
+
+
+@entities_bp.route("/instructors/<int:instructor_id>", methods=["DELETE"])
+def delete_instructor(instructor_id: int):
+	try:
+		with _get_session() as db:
+			instructor = (
+				db.query(models.Instructor)
+				.filter(models.Instructor.id == instructor_id)
+				.first()
+			)
+			if not instructor:
+				return jsonify({"detail": "Instructor not found"}), 404
+
+			# Prevent deleting instructors that still have schedules to
+			# avoid orphaning schedule records.
+			if instructor.schedules:
+				return (
+					jsonify({"detail": "Cannot delete instructor with existing schedules"}),
+					400,
+				)
+
+			# Delete linked User account, if any, so credentials are also removed.
+			user = (
+				db.query(models.User)
+				.filter(models.User.instructor_id == instructor_id)
+				.first()
+			)
+			if user:
+				db.delete(user)
+
+			db.delete(instructor)
+			db.commit()
+			return "", 204
+	except SQLAlchemyError as e:
+		logger.error(
+			f"Database error deleting instructor {instructor_id}: {e}", exc_info=True
+		)
+		return jsonify({"detail": "Database error occurred"}), 500
+	except Exception as e:
+		logger.error(
+			f"Error deleting instructor {instructor_id}: {e}", exc_info=True
+		)
+		return jsonify({"detail": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Day routes
+# ---------------------------------------------------------------------------
+@entities_bp.route("/days", methods=["GET"])
+def list_days():
+    with _get_session() as db:
+        days = db.query(models.Day).all()
+        return jsonify(_serialize_list(days, schemas.DayResponse))
+
+
+@entities_bp.route("/days", methods=["POST"])
+def create_day():
+    payload = request.get_json(force=True) or {}
+    try:
+        day = schemas.DayCreate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        db_day = models.Day(**day.model_dump())
+        db.add(db_day)
+        db.commit()
+        db.refresh(db_day)
+        return jsonify(_serialize(db_day, schemas.DayResponse)), 201
+
+
+@entities_bp.route("/days/<int:day_id>", methods=["GET"])
+def get_day(day_id: int):
+    with _get_session() as db:
+        day = db.query(models.Day).filter(models.Day.id == day_id).first()
+        if not day:
+            return jsonify({"detail": "Day not found"}), 404
+        return jsonify(_serialize(day, schemas.DayResponse))
+
+
+@entities_bp.route("/days/<int:day_id>", methods=["DELETE"])
+def delete_day(day_id: int):
+    with _get_session() as db:
+        day = db.query(models.Day).filter(models.Day.id == day_id).first()
+        if not day:
+            return jsonify({"detail": "Day not found"}), 404
+        db.delete(day)
+        db.commit()
+        return "", 204
+
+
+# ---------------------------------------------------------------------------
+# Subject routes
+# ---------------------------------------------------------------------------
+@entities_bp.route("/subjects", methods=["GET"])
+def list_subjects():
+    with _get_session() as db:
+        subjects = db.query(models.Subject).all()
+        return jsonify(_serialize_list(subjects, schemas.SubjectResponse))
+
+
+@entities_bp.route("/subjects", methods=["POST"])
+def create_subject():
+    payload = request.get_json(force=True) or {}
+    try:
+        subject = schemas.SubjectCreate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    if subject.type not in {"LEC", "LAB"}:
+        return jsonify({"detail": "Type must be 'LEC' or 'LAB'"}), 400
+
+    with _get_session() as db:
+        db_subject = models.Subject(**subject.model_dump())
+        db.add(db_subject)
+        db.commit()
+        db.refresh(db_subject)
+        return jsonify(_serialize(db_subject, schemas.SubjectResponse)), 201
+
+
+@entities_bp.route("/subjects/<int:subject_id>", methods=["GET"])
+def get_subject(subject_id: int):
+    with _get_session() as db:
+        subject = db.query(models.Subject).filter(models.Subject.id == subject_id).first()
+        if not subject:
+            return jsonify({"detail": "Subject not found"}), 404
+        return jsonify(_serialize(subject, schemas.SubjectResponse))
+
+
+@entities_bp.route("/subjects/<int:subject_id>", methods=["PUT"])
+def update_subject(subject_id: int):
+    payload = request.get_json(force=True) or {}
+    try:
+        subject_update = schemas.SubjectUpdate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        subject = (
+            db.query(models.Subject)
+            .filter(models.Subject.id == subject_id)
+            .first()
+        )
+        if not subject:
+            return jsonify({"detail": "Subject not found"}), 404
+
+        for key, value in subject_update.model_dump(exclude_unset=True).items():
+            if key == "type" and value not in {"LEC", "LAB"}:
+                return jsonify({"detail": "Type must be 'LEC' or 'LAB'"}), 400
+            setattr(subject, key, value)
+
+        db.commit()
+        db.refresh(subject)
+        return jsonify(_serialize(subject, schemas.SubjectResponse))
+
+
+@entities_bp.route("/subjects/<int:subject_id>", methods=["DELETE"])
+def delete_subject(subject_id: int):
+    with _get_session() as db:
+        subject = (
+            db.query(models.Subject)
+            .filter(models.Subject.id == subject_id)
+            .first()
+        )
+        if not subject:
+            return jsonify({"detail": "Subject not found"}), 404
+        db.delete(subject)
+        db.commit()
+        return "", 204
+
+
+# ---------------------------------------------------------------------------
+# Room routes
+# ---------------------------------------------------------------------------
+@entities_bp.route("/rooms", methods=["GET"])
+def list_rooms():
+    with _get_session() as db:
+        rooms = db.query(models.Room).all()
+        return jsonify(_serialize_list(rooms, schemas.RoomResponse))
+
+
+@entities_bp.route("/rooms", methods=["POST"])
+def create_room():
+    payload = request.get_json(force=True) or {}
+    try:
+        room = schemas.RoomCreate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    if room.type not in {"LEC", "LAB"}:
+        return jsonify({"detail": "Type must be 'LEC' or 'LAB'"}), 400
+
+    with _get_session() as db:
+        db_room = models.Room(**room.model_dump())
+        db.add(db_room)
+        db.commit()
+        db.refresh(db_room)
+        return jsonify(_serialize(db_room, schemas.RoomResponse)), 201
+
+
+@entities_bp.route("/rooms/<int:room_id>", methods=["GET"])
+def get_room(room_id: int):
+    with _get_session() as db:
+        room = db.query(models.Room).filter(models.Room.id == room_id).first()
+        if not room:
+            return jsonify({"detail": "Room not found"}), 404
+        return jsonify(_serialize(room, schemas.RoomResponse))
+
+
+@entities_bp.route("/rooms/<int:room_id>", methods=["PUT"])
+def update_room(room_id: int):
+    payload = request.get_json(force=True) or {}
+    try:
+        room_update = schemas.RoomUpdate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        room = db.query(models.Room).filter(models.Room.id == room_id).first()
+        if not room:
+            return jsonify({"detail": "Room not found"}), 404
+
+        for key, value in room_update.model_dump(exclude_unset=True).items():
+            if key == "type" and value not in {"LEC", "LAB"}:
+                return jsonify({"detail": "Type must be 'LEC' or 'LAB'"}), 400
+            setattr(room, key, value)
+
+        db.commit()
+        db.refresh(room)
+        return jsonify(_serialize(room, schemas.RoomResponse))
+
+
+@entities_bp.route("/rooms/<int:room_id>", methods=["DELETE"])
+def delete_room(room_id: int):
+    with _get_session() as db:
+        room = db.query(models.Room).filter(models.Room.id == room_id).first()
+        if not room:
+            return jsonify({"detail": "Room not found"}), 404
+        db.delete(room)
+        db.commit()
+        return "", 204
+
