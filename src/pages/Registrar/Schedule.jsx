@@ -3,6 +3,7 @@ import { list } from "../../store/db";
 import {
   generateSchedule as generateScheduleApi,
   getScheduleStatus,
+  loadSchedule as loadScheduleApi,
   saveSchedule,
 } from "../../services/api";
 
@@ -30,6 +31,9 @@ export default function RegistrarSchedule() {
   const [progress, setProgress] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
+  const [isLoadingSavedSchedule, setIsLoadingSavedSchedule] = useState(false);
+  const [savedScheduleMessage, setSavedScheduleMessage] = useState("");
+  const [hasCheckedSavedSchedule, setHasCheckedSavedSchedule] = useState(false);
 
   useEffect(() => {
     async function loadData() {
@@ -67,6 +71,72 @@ export default function RegistrarSchedule() {
     const { name, value } = event.target;
     setForm((prev) => ({ ...prev, [name]: value }));
   };
+
+  useEffect(() => {
+    const courseId = Number(form.course_id);
+    const year = Number(form.year);
+    const semester = Number(form.semester);
+
+    if (!courseId || !year || !semester) {
+      setSavedScheduleMessage("");
+      setHasCheckedSavedSchedule(false);
+      return;
+    }
+
+    if (isSubmitting || jobId) {
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoadingSavedSchedule(true);
+    setSavedScheduleMessage("");
+    setHasCheckedSavedSchedule(false);
+
+    async function loadSavedSchedule() {
+      try {
+        const resp = await loadScheduleApi(courseId, semester, year);
+        if (cancelled) return;
+
+        if (resp && resp.status === "success") {
+          const items = Array.isArray(resp.items) ? resp.items : [];
+          setSchedule(items);
+          setHasCheckedSavedSchedule(true);
+          if (items.length > 0) {
+            setSavedScheduleMessage(`Loaded saved schedule (${items.length} entries).`);
+          } else {
+            setSavedScheduleMessage("No saved schedule found for the selected course, year, and semester.");
+          }
+          return;
+        }
+
+        if (resp && resp.status === "pending") {
+          setSchedule([]);
+          setHasCheckedSavedSchedule(true);
+          setSavedScheduleMessage("Schedule generation is in progress for this selection.");
+          return;
+        }
+
+        setSchedule([]);
+        setHasCheckedSavedSchedule(true);
+        setSavedScheduleMessage("No saved schedule found for the selected course, year, and semester.");
+      } catch (err) {
+        if (cancelled) return;
+        setSchedule([]);
+        setHasCheckedSavedSchedule(true);
+        setSavedScheduleMessage("");
+        setError(err.message || "Failed to load saved schedule");
+      } finally {
+        if (!cancelled) {
+          setIsLoadingSavedSchedule(false);
+        }
+      }
+    }
+
+    loadSavedSchedule();
+    return () => {
+      cancelled = true;
+    };
+  }, [form.course_id, form.year, form.semester]);
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -722,6 +792,18 @@ export default function RegistrarSchedule() {
         </p>
       )}
 
+      {isLoadingSavedSchedule && !error && (
+        <p className="mt-4 text-sm text-gray-600 bg-gray-50 border border-gray-100 rounded px-3 py-2">
+          Loading saved schedule...
+        </p>
+      )}
+
+      {!isLoadingSavedSchedule && savedScheduleMessage && !error && (
+        <p className="mt-4 text-sm text-gray-600 bg-gray-50 border border-gray-100 rounded px-3 py-2">
+          {savedScheduleMessage}
+        </p>
+      )}
+
       {Object.keys(expandedSchedule).length > 0 && (
         <div className="mt-6">
           <div className="flex justify-between items-center mb-3">
@@ -801,7 +883,11 @@ export default function RegistrarSchedule() {
       )}
 
       {!isSubmitting && Object.keys(expandedSchedule).length === 0 && !error && (
-        <p className="mt-6 text-sm text-gray-500">Run the scheduler to see results.</p>
+        <p className="mt-6 text-sm text-gray-500">
+          {hasCheckedSavedSchedule
+            ? "No schedule to display for the current selection."
+            : "Run the scheduler to see results."}
+        </p>
       )}
 
       {jobStatus && (

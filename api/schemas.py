@@ -139,6 +139,9 @@ class SubjectCreate(BaseModel):
     description: str
     type: str  # 'LEC' or 'LAB'
     unit: int
+    year_level: int
+    semester: int
+    is_major: Optional[bool] = None
     course_id: Optional[int] = None
     # Note: block_id is no longer a subject property - it's selected during CP scheduling from time_blocks table
 
@@ -148,6 +151,9 @@ class SubjectUpdate(BaseModel):
     description: Optional[str] = None
     type: Optional[str] = None
     unit: Optional[int] = None
+    year_level: Optional[int] = None
+    semester: Optional[int] = None
+    is_major: Optional[bool] = None
     course_id: Optional[int] = None
     # Note: block_id is no longer a subject property
 
@@ -158,6 +164,9 @@ class SubjectResponse(BaseModel):
     description: str
     type: str
     unit: int
+    year_level: Optional[int] = None
+    semester: Optional[int] = None
+    is_major: Optional[bool] = None
     course_id: Optional[int] = None
     # Note: block_id is no longer a subject property - it's selected during CP scheduling
 

@@ -11,7 +11,10 @@ export default function Subject() {
 	const [description, setDescription] = useState('')
 	const [type, setType] = useState('LEC')
 	const [unit, setUnit] = useState('3')
+	const [yearLevel, setYearLevel] = useState('')
+	const [semester, setSemester] = useState('')
 	const [courseId, setCourseId] = useState('')
+	const [priority, setPriority] = useState('unmarked')
 	const [error, setError] = useState('')
 	const [entries, setEntries] = useState(10)
 	const [processing, setProcessing] = useState(false)
@@ -44,7 +47,20 @@ export default function Subject() {
 	useEffect(()=>{ load() },[])
 
 	const filtered = useMemo(()=>{
-		return items.filter(i=> (i.code+' '+i.description).toLowerCase().includes(q.toLowerCase()))
+		const query = q.toLowerCase()
+		const result = items.filter(i=> (i.code+' '+i.description).toLowerCase().includes(query))
+		const rank = (it) => {
+			const v = (it.is_major ?? it.isMajor)
+			if (v === null || v === undefined) return 0
+			if (v === true) return 1
+			return 2
+		}
+		return [...result].sort((a, b) => {
+			const ra = rank(a)
+			const rb = rank(b)
+			if (ra !== rb) return ra - rb
+			return String(a.code || '').localeCompare(String(b.code || ''))
+		})
 	},[items,q])
 
 	const shown = useMemo(()=>{
@@ -58,7 +74,10 @@ export default function Subject() {
 		setDescription('')
 		setType('LEC')
 		setUnit('3')
+		setYearLevel('')
+		setSemester('')
 		setCourseId('')
+		setPriority('')
 		setError('')
 		setShow(true)
 	}
@@ -69,7 +88,15 @@ export default function Subject() {
 		setDescription(it.description)
 		setType(it.type||'LEC')
 		setUnit(String(it.unit||'3'))
+		setYearLevel(String((it.year_level ?? it.yearLevel) ?? ''))
+		setSemester(String((it.semester ?? it.semesterValue ?? it.sem) ?? ''))
 		setCourseId(it.course_id || it.courseId || '')
+		{
+			const v = (it.is_major ?? it.isMajor)
+			if (v === true) setPriority('major')
+			else if (v === false) setPriority('minor')
+			else setPriority('unmarked')
+		}
 		setError('')
 		setShow(true)
 	}
@@ -78,8 +105,30 @@ export default function Subject() {
 		e.preventDefault()
 		if (processing) return
 		if (!code.trim() || !description.trim() || !unit) { setError('All fields are required'); return }
-		const duplicate = items.find(i=> i.code.toLowerCase() === code.trim().toLowerCase() && i.id !== (editing?.id))
-		if (duplicate) { setError('Code must be unique'); return }
+		if (!yearLevel || !semester) { setError('Year level and semester are required'); return }
+		if (!['1','2','3','4'].includes(String(yearLevel))) { setError('Year level must be 1, 2, 3, or 4'); return }
+		if (!['1','2'].includes(String(semester))) { setError('Semester must be 1 or 2'); return }
+		if (!editing && priority !== 'major' && priority !== 'minor') { setError('Priority (Major/Minor) is required'); return }
+		const currentCourseId = courseId ? parseInt(courseId) : null
+		const duplicate = items.find(i=> {
+			const existingCode = String(i.code || '').trim().toLowerCase()
+			const existingType = String(i.type || '').trim().toUpperCase()
+			const existingYear = Number.isFinite(Number(i.year_level ?? i.yearLevel)) ? Number(i.year_level ?? i.yearLevel) : null
+			const existingSem = Number.isFinite(Number(i.semester ?? i.semesterValue ?? i.sem)) ? Number(i.semester ?? i.semesterValue ?? i.sem) : null
+			const rawExistingCourseId = (i.course_id ?? i.courseId) ?? null
+			const existingCourseId = (rawExistingCourseId === null || rawExistingCourseId === undefined)
+				? null
+				: (Number.isFinite(Number(rawExistingCourseId)) ? Number(rawExistingCourseId) : null)
+			return (
+				existingCode === code.trim().toLowerCase() &&
+				existingType === String(type || '').trim().toUpperCase() &&
+				existingCourseId === currentCourseId &&
+				existingYear === Number(yearLevel) &&
+				existingSem === Number(semester) &&
+				i.id !== (editing?.id)
+			)
+		})
+		if (duplicate) { setError('Code must be unique within the same course, type, year level, and semester'); return }
 		try {
 			setProcessing(true)
 			await upsert('subject', { 
@@ -88,7 +137,10 @@ export default function Subject() {
 				description: description.trim(), 
 				type, 
 				unit: Number(unit),
-				course_id: courseId ? parseInt(courseId) : null
+				year_level: Number(yearLevel),
+				semester: Number(semester),
+				course_id: courseId ? parseInt(courseId) : null,
+				is_major: priority === 'major' ? true : priority === 'minor' ? false : null
 			})
 			setShow(false)
 			await load(true)
@@ -152,6 +204,9 @@ export default function Subject() {
 							<th className="text-left px-3 py-2 border-r border-gray-300">No.</th>
 							<th className="text-left px-3 py-2 border-r border-gray-300">Code</th>
 							<th className="text-left px-3 py-2 border-r border-gray-300">Description</th>
+							<th className="text-left px-3 py-2 border-r border-gray-300">Priority</th>
+							<th className="text-left px-3 py-2 border-r border-gray-300">Year</th>
+							<th className="text-left px-3 py-2 border-r border-gray-300">Sem</th>
 							<th className="text-left px-3 py-2 border-r border-gray-300">Course</th>
 							<th className="text-left px-3 py-2 border-r border-gray-300">Type</th>
 							<th className="text-left px-3 py-2 border-r border-gray-300">Unit</th>
@@ -160,10 +215,26 @@ export default function Subject() {
 					</thead>
 					<tbody className="divide-y divide-gray-300">
 					{shown.map((it, idx)=> (
-							<tr key={it.id} className={idx%2? 'bg-gray-50':''}>
+							<tr
+								key={it.id}
+								className={(((it.is_major ?? it.isMajor) === null) || ((it.is_major ?? it.isMajor) === undefined)) ? 'bg-yellow-100' : (idx%2? 'bg-gray-50':'')}
+							>
 								<td className="px-3 py-2 border-r border-gray-300">{idx+1}</td>
 								<td className="px-3 py-2 border-r border-gray-300">{it.code}</td>
 								<td className="px-3 py-2 border-r border-gray-300">{it.description}</td>
+								<td className="px-3 py-2 border-r border-gray-300">
+									{((it.is_major ?? it.isMajor) === true) && (
+										<span className="inline-flex px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">MAJOR</span>
+									)}
+									{((it.is_major ?? it.isMajor) === false) && (
+										<span className="inline-flex px-2 py-1 rounded-full text-xs font-semibold bg-gray-200 text-gray-800">MINOR</span>
+									)}
+									{(((it.is_major ?? it.isMajor) === null) || ((it.is_major ?? it.isMajor) === undefined)) && (
+										<span className="inline-flex px-2 py-1 rounded-full text-xs font-semibold bg-red-100 text-red-800">UNMARKED</span>
+									)}
+								</td>
+								<td className="px-3 py-2 border-r border-gray-300">{(it.year_level ?? it.yearLevel) ?? '-'}</td>
+								<td className="px-3 py-2 border-r border-gray-300">{(it.semester ?? it.semesterValue ?? it.sem) ?? '-'}</td>
 								<td className="px-3 py-2 border-r border-gray-300">{courseName(it.course_id || it.courseId) || '-'}</td>
 								<td className="px-3 py-2 border-r border-gray-300">{it.type}</td>
 								<td className="px-3 py-2 border-r border-gray-300">{it.unit}</td>
@@ -178,7 +249,7 @@ export default function Subject() {
 							</tr>
 						))}
 						{filtered.length===0 && (
-							<tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={7}>No records</td></tr>
+							<tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={10}>No records</td></tr>
 						)}
 					</tbody>
 				</table>
@@ -191,6 +262,24 @@ export default function Subject() {
 						<div className="text-lg font-semibold text-navy">{editing? 'Edit Subject':'Add Subject'}</div>
 						<input className="w-full px-3 py-2 rounded border" placeholder="Code" value={code} onChange={e=>setCode(e.target.value)} />
 						<input className="w-full px-3 py-2 rounded border" placeholder="Description" value={description} onChange={e=>setDescription(e.target.value)} />
+						<select className="w-full px-3 py-2 rounded border" value={priority} onChange={e=>setPriority(e.target.value)}>
+							{!editing && <option value="">Select Priority</option>}
+							{editing && <option value="unmarked">Unmarked</option>}
+							<option value="major">Major</option>
+							<option value="minor">Minor</option>
+						</select>
+						<select className="w-full px-3 py-2 rounded border" value={yearLevel} onChange={e=>setYearLevel(e.target.value)}>
+							<option value="">Select Year Level</option>
+							<option value="1">1</option>
+							<option value="2">2</option>
+							<option value="3">3</option>
+							<option value="4">4</option>
+						</select>
+						<select className="w-full px-3 py-2 rounded border" value={semester} onChange={e=>setSemester(e.target.value)}>
+							<option value="">Select Semester</option>
+							<option value="1">1</option>
+							<option value="2">2</option>
+						</select>
 						<select className="w-full px-3 py-2 rounded border" value={courseId} onChange={e=>setCourseId(e.target.value)}>
 							<option value="">Select Course (optional)</option>
 							{courses.map(c=> <option key={c.id} value={c.id}>{c.code} — {c.description}</option>)}

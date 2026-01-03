@@ -83,6 +83,7 @@ class Subject(Base):
     description = Column(Text, nullable=False)
     type = Column(String(10), nullable=False)  # 'LEC' or 'LAB'
     unit = Column(Integer, nullable=False, default=0)
+    is_major = Column(Boolean, nullable=True)
     course_id = Column(Integer, ForeignKey("courses.id"), nullable=True)
     # Note: block_id is no longer a subject property - it's selected during CP scheduling from time_blocks table
     recommended_slots = Column(Integer, nullable=True, default=1)  # How many consecutive time slots needed

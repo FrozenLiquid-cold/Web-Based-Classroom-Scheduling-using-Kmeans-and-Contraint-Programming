@@ -4460,6 +4460,23 @@ def run_cp_scheduler(
         # Primary objective: maximize the number of scheduled subjects with penalties for imbalance
         scheduled_sum = sum(selected.values())
 
+        major_ids = []
+        unmarked_ids = []
+        minor_ids = []
+        for sid in subject_ids_list:
+            subj = subject_lookup.get(sid)
+            v = getattr(subj, "is_major", None) if subj is not None else None
+            if v is True:
+                major_ids.append(sid)
+            elif v is False:
+                minor_ids.append(sid)
+            else:
+                unmarked_ids.append(sid)
+
+        major_sum = sum(selected[sid] for sid in major_ids) if major_ids else 0
+        unmarked_sum = sum(selected[sid] for sid in unmarked_ids) if unmarked_ids else 0
+        minor_sum = sum(selected[sid] for sid in minor_ids) if minor_ids else 0
+
         # Build objective combining subject count with soft penalties. The
         # SCHEDULE_REWARD_WEIGHT is intentionally large so that, when a
         # feasible assignment exists, the solver prefers scheduling as many
@@ -4507,13 +4524,23 @@ def run_cp_scheduler(
         if overload_penalty_terms:
             penalty_exprs.append(overload_penalty_weight * sum(overload_penalty_terms))
 
-        objective_expr = scheduled_sum * SCHEDULE_REWARD_WEIGHT - EARLY_PENALTY_WEIGHT * early_penalty_var
+        major_reward = int(SCHEDULE_REWARD_WEIGHT) * 100000
+        minor_reward = int(SCHEDULE_REWARD_WEIGHT) * 100
+        unmarked_reward = int(SCHEDULE_REWARD_WEIGHT)
+        max_reward = max(major_reward, unmarked_reward, minor_reward)
+
+        objective_expr = (
+            major_sum * major_reward
+            + minor_sum * minor_reward
+            + unmarked_sum * unmarked_reward
+            - EARLY_PENALTY_WEIGHT * early_penalty_var
+        )
         if penalty_exprs:
             objective_expr -= sum(penalty_exprs)
         # Bounds are deliberately wide to accommodate the large reward weight.
         objective_var = model.NewIntVar(
-            -len(subject_ids_list) * SCHEDULE_REWARD_WEIGHT * 10,
-            len(subject_ids_list) * SCHEDULE_REWARD_WEIGHT * 10,
+            -len(subject_ids_list) * max_reward * 10,
+            len(subject_ids_list) * max_reward * 10,
             f"cluster_{cluster_id}_objective"
         )
         model.Add(objective_var == objective_expr)

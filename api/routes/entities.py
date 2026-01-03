@@ -613,6 +613,15 @@ def create_subject():
     if subject.type not in {"LEC", "LAB"}:
         return jsonify({"detail": "Type must be 'LEC' or 'LAB'"}), 400
 
+    if subject.is_major is None:
+        return jsonify({"detail": "Subject priority is required (set is_major to true for Major or false for Minor)"}), 400
+
+    if subject.year_level not in {1, 2, 3, 4}:
+        return jsonify({"detail": "year_level must be 1, 2, 3, or 4"}), 400
+
+    if subject.semester not in {1, 2}:
+        return jsonify({"detail": "semester must be 1 or 2"}), 400
+
     with _get_session() as db:
         db_subject = models.Subject(**subject.model_dump())
         db.add(db_subject)
@@ -650,6 +659,10 @@ def update_subject(subject_id: int):
         for key, value in subject_update.model_dump(exclude_unset=True).items():
             if key == "type" and value not in {"LEC", "LAB"}:
                 return jsonify({"detail": "Type must be 'LEC' or 'LAB'"}), 400
+            if key == "year_level" and value is not None and value not in {1, 2, 3, 4}:
+                return jsonify({"detail": "year_level must be 1, 2, 3, or 4"}), 400
+            if key == "semester" and value is not None and value not in {1, 2}:
+                return jsonify({"detail": "semester must be 1 or 2"}), 400
             setattr(subject, key, value)
 
         db.commit()

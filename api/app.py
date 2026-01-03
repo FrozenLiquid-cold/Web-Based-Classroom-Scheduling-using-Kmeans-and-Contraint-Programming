@@ -13,6 +13,8 @@ from .migrate_restore_room_capacity import (
 )
 from .migrate_instructor_load_fields import ensure_instructor_load_fields
 from .migrate_schedule_details_view import ensure_schedule_details_view
+from .migrate_subject_major_flag import ensure_subject_major_flag
+from .migrate_subject_year_sem_fields import ensure_subject_year_sem_fields
 from .routes.auth import auth_bp
 from .routes.entities import entities_bp
 from .routes.schedule import schedule_bp
@@ -51,6 +53,8 @@ ensure_capacity_column()
 ensure_schedule_subject_nullable()
 ensure_instructor_load_fields()
 ensure_schedule_details_view()
+ensure_subject_major_flag()
+ensure_subject_year_sem_fields()
 
 # Request timing middleware
 @app.before_request
