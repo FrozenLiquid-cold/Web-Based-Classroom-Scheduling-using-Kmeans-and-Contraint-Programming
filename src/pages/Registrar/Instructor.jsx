@@ -13,6 +13,8 @@ export default function Instructor() {
 	const [lastName, setLastName] = useState('')
 	const [collegeId, setCollegeId] = useState('')
 	const [username, setUsername] = useState('')
+	const [employmentType, setEmploymentType] = useState('regular')
+	const [designation, setDesignation] = useState('')
 	const [specialization, setSpecialization] = useState([])
 	const [specializationSearch, setSpecializationSearch] = useState('')
 	const [error, setError] = useState('')
@@ -69,6 +71,8 @@ export default function Instructor() {
 		setLastName('')
 		setCollegeId('')
 		setUsername('')
+		setEmploymentType('regular')
+		setDesignation('')
 		setSpecialization([])
 		setSpecializationSearch('')
 		setError('')
@@ -82,6 +86,8 @@ export default function Instructor() {
 		setLastName(it.last_name || it.lastName || '')
 		setCollegeId(it.college_id || it.collegeId || '')
 		setUsername(it.username || '')
+		setEmploymentType(it.employment_type || it.employmentType || 'regular')
+		setDesignation(it.designation || '')
 		{
 			const raw = it.assignable_courses || it.assignableCourses || ''
 			const parsed = raw
@@ -107,7 +113,9 @@ export default function Instructor() {
 				middle_name: middleName.trim() || null,
 				last_name: lastName.trim(),
 				college_id: collegeId ? parseInt(collegeId) : null,
-				username: firstName.trim().toLowerCase(),
+				username: username.trim() || null,
+				employment_type: employmentType || null,
+				designation: designation.trim() || null,
 				assignable_courses: specialization && specialization.length
 					? specialization.join(',')
 					: null,
@@ -253,6 +261,18 @@ export default function Instructor() {
 							<input className="w-full px-3 py-2 rounded border" placeholder="Middle Name (optional)" value={middleName} onChange={e=>setMiddleName(e.target.value)} />
 							<input className="w-full px-3 py-2 rounded border" placeholder="Last Name" value={lastName} onChange={e=>setLastName(e.target.value)} />
 							<input className="w-full px-3 py-2 rounded border" placeholder="Username (optional, defaults to Firstname Lastname)" value={username} onChange={e=>setUsername(e.target.value)} />
+							<select className="w-full px-3 py-2 rounded border" value={employmentType} onChange={e=>setEmploymentType(e.target.value)}>
+								<option value="regular">Regular</option>
+								<option value="visiting">Visiting Lecturer</option>
+							</select>
+							<select className="w-full px-3 py-2 rounded border" value={designation} onChange={e=>setDesignation(e.target.value)}>
+								<option value="">No designation</option>
+								<option value="Program Chair">Program Chair</option>
+								<option value="College Secretary">College Secretary</option>
+								<option value="Dean">Dean</option>
+								<option value="Associate Dean">Associate Dean</option>
+								<option value="Director">Director</option>
+							</select>
 							<select className="w-full px-3 py-2 rounded border" value={collegeId} onChange={e=>setCollegeId(e.target.value)}>
 								<option value="">Select College (optional)</option>
 								{colleges.map(c=> <option key={c.id} value={c.id}>{c.code} — {c.description}</option>)}

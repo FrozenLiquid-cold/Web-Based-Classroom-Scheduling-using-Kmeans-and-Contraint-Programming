@@ -11,6 +11,8 @@ from .migrate_restore_room_capacity import (
     ensure_capacity_column,
     ensure_schedule_subject_nullable,
 )
+from .migrate_instructor_load_fields import ensure_instructor_load_fields
+from .migrate_schedule_details_view import ensure_schedule_details_view
 from .routes.auth import auth_bp
 from .routes.entities import entities_bp
 from .routes.schedule import schedule_bp
@@ -47,6 +49,8 @@ init_db()
 # Ensure required schema migrations are applied after database is initialized
 ensure_capacity_column()
 ensure_schedule_subject_nullable()
+ensure_instructor_load_fields()
+ensure_schedule_details_view()
 
 # Request timing middleware
 @app.before_request

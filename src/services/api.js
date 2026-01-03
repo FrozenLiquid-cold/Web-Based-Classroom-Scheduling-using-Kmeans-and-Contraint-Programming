@@ -228,6 +228,12 @@ export async function loadSchedule(courseId, semester, year = null, instructorId
   return apiCall(`/schedule/load?${params.toString()}`)
 }
 
+export async function getInstructorWorkload(instructorId, semester) {
+  if (!instructorId) throw new Error('Missing instructorId')
+  const params = new URLSearchParams({ semester })
+  return apiCall(`/instructors/${encodeURIComponent(instructorId)}/workload?${params.toString()}`)
+}
+
 export async function deleteSchedule(courseId, year, semester) {
   const params = new URLSearchParams({ course_id: courseId, year, semester })
   return apiCall(`/schedule/delete?${params.toString()}`, { method: 'DELETE' })

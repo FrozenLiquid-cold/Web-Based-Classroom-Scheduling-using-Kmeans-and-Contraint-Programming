@@ -422,9 +422,13 @@ export default function RegistrarSchedule() {
       const subjectKey = item.subject_id || item.subjectId || "";
       const instructorKey = item.instructor_id || item.instructorId || "";
       const roomKey = item.room_id || item.roomId || "";
-      const timeKey = item.time || item.time_label || item.start_time || "";
+      const rawTimeKey = item.time || item.time_label || item.start_time || "";
+      const timeKey = typeof rawTimeKey === "string"
+        ? rawTimeKey.replace(/^(M|T|W|TH|F)\s+/, "")
+        : rawTimeKey;
 
-      const groupKey = `${subjectKey}|${instructorKey}|${roomKey}|${timeKey}`;
+      const blockKey = item.block || item._blockLabel || "";
+      const groupKey = `${subjectKey}|${instructorKey}|${roomKey}|${timeKey}|${blockKey}`;
 
       if (!grouped[groupKey]) {
         grouped[groupKey] = {
@@ -454,17 +458,17 @@ export default function RegistrarSchedule() {
       if (labels.length === 2) {
         const [d1, d2] = labels;
         if ((d1 === "M" && d2 === "W") || (d1 === "W" && d2 === "M")) {
-          combinedDays = "MW";
+          combinedDays = "M-W";
         } else if (
           (d1 === "T" && d2 === "TH") ||
           (d1 === "TH" && d2 === "T")
         ) {
-          combinedDays = "TTH";
+          combinedDays = "T-TH";
         } else {
-          combinedDays = labels.join("");
+          combinedDays = labels.join("-");
         }
       } else {
-        combinedDays = labels.join("");
+        combinedDays = labels.join("-");
       }
 
       const { _dayIds, ...rest } = group;
@@ -512,6 +516,34 @@ export default function RegistrarSchedule() {
 
     return byBlock;
   }, [filteredSchedule, form.blocks_count, days]);
+
+  const plannedSubjectCount = useMemo(() => {
+    const courseId = Number(form.course_id);
+    const selectedYear = Number(form.year);
+    const selectedSemester = Number(form.semester);
+
+    if (!courseId || !selectedYear || !selectedSemester) {
+      return 0;
+    }
+
+    const matches = (subjects || []).filter((s) => {
+      const subjCourse = Number(s.course_id);
+      const subjYear = Number(s.year_level);
+      const subjSem = Number(s.semester);
+      return subjCourse === courseId && subjYear === selectedYear && subjSem === selectedSemester;
+    });
+
+    if (matches.length > 0) {
+      return matches.length;
+    }
+
+    const ids = new Set(
+      (filteredSchedule || [])
+        .map((item) => item.subject_id || item.subjectId)
+        .filter(Boolean)
+    );
+    return ids.size;
+  }, [subjects, filteredSchedule, form.course_id, form.year, form.semester]);
 
   // Format time from start_min and end_min to show start-to-end range
   const formatTimeRange = (slot) => {
@@ -720,9 +752,14 @@ export default function RegistrarSchedule() {
             .sort() // Sort blocks alphabetically (Block A, Block B, etc.)
             .map((blockLabel) => (
               <div key={blockLabel} className="mb-6">
-                <h3 className="text-md font-semibold mb-2 text-gray-700">
-                  {blockLabel}
-                </h3>
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-md font-semibold text-gray-700">
+                    {blockLabel}
+                  </h3>
+                  <span className="text-sm text-gray-500">
+                    scheduled {expandedSchedule[blockLabel].length}/{plannedSubjectCount || expandedSchedule[blockLabel].length}
+                  </span>
+                </div>
                 <div className="overflow-x-auto border border-gray-200 rounded">
                   <table className="min-w-full divide-y divide-gray-200">
                     <thead className="bg-gray-50">

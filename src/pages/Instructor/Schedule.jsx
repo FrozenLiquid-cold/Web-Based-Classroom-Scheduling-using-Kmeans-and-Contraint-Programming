@@ -97,7 +97,57 @@ export default function Schedule() {
 					const filtered = currentInstructorId 
 						? saved.filter(s => (s.instructorId === currentInstructorId || s.instructor_id === currentInstructorId))
 						: saved
-					setRows(filtered)
+
+					const dayLabelById = {}
+					for (const d of (days || [])) {
+						if (d && d.id != null) dayLabelById[d.id] = d.label
+					}
+					const dayOrder = { M: 0, T: 1, W: 2, TH: 3, F: 4, S: 5 }
+
+					const grouped = {}
+					for (const item of filtered) {
+						const subjectKey = item.subject_id || item.subjectId || ''
+						const instructorKey = item.instructor_id || item.instructorId || ''
+						const roomKey = item.room_id || item.roomId || ''
+						const rawTimeKey = item.time || ''
+						const timeKey = typeof rawTimeKey === 'string'
+							? rawTimeKey.replace(/^(M|T|W|TH|F)\s+/, '')
+							: rawTimeKey
+						const blockKey = item.block || ''
+						const groupKey = `${subjectKey}|${instructorKey}|${roomKey}|${timeKey}|${blockKey}`
+						if (!grouped[groupKey]) {
+							grouped[groupKey] = { ...item, _dayIds: [] }
+						}
+						const dayId = item.day_id || item.dayId
+						if (dayId != null && !grouped[groupKey]._dayIds.includes(dayId)) {
+							grouped[groupKey]._dayIds.push(dayId)
+						}
+					}
+
+					const merged = Object.values(grouped).map(g => {
+						const dayIds = g._dayIds || []
+						const labels = dayIds
+							.map(id => dayLabelById[id])
+							.filter(Boolean)
+							.sort((a, b) => (dayOrder[a] ?? 99) - (dayOrder[b] ?? 99))
+						let combinedDays = ''
+						if (labels.length === 2) {
+							const [d1, d2] = labels
+							if ((d1 === 'M' && d2 === 'W') || (d1 === 'W' && d2 === 'M')) combinedDays = 'M-W'
+							else if ((d1 === 'T' && d2 === 'TH') || (d1 === 'TH' && d2 === 'T')) combinedDays = 'T-TH'
+							else combinedDays = labels.join('-')
+						} else {
+							combinedDays = labels.join('-')
+						}
+						const { _dayIds, ...rest } = g
+						return {
+							...rest,
+							day_id: dayIds[0] ?? g.day_id ?? g.dayId ?? null,
+							_combinedDaysLabel: combinedDays || (labels[0] || ''),
+						}
+					})
+
+					setRows(merged)
 				} else {
 					setRows([])
 				}
@@ -107,10 +157,15 @@ export default function Schedule() {
 			}
 		}
 		loadSchedule()
-	}, [key, courseId, currentInstructorId])
+	}, [key, courseId, currentInstructorId, days])
 
 	const getSubject = (id)=> subjects.find(s=>s.id===id)
-	const getDay = (id)=> days.find(d=>d.id===id)?.label || ''
+	const getDay = (r)=> {
+		const combined = r?._combinedDaysLabel
+		if (combined) return combined
+		const id = r?.dayId || r?.day_id
+		return days.find(d=>d.id===id)?.label || ''
+	}
 	const getRoom = (id)=> rooms.find(r=>r.id===id)?.name || ''
 	const getInst = (id)=> {
 		const i = instructors.find(x=>x.id===id)
@@ -197,7 +252,7 @@ export default function Schedule() {
 													<td className="px-3 py-2 border-r border-gray-300">{s.description}</td>
 													<td className="px-3 py-2 border-r border-gray-300">{s.type}</td>
 													<td className="px-3 py-2 border-r border-gray-300">{s.unit}</td>
-													<td className="px-3 py-2 border-r border-gray-300">{getDay(r.dayId || r.day_id)}</td>
+													<td className="px-3 py-2 border-r border-gray-300">{getDay(r)}</td>
 													<td className="px-3 py-2 border-r border-gray-300">{getRoom(r.roomId || r.room_id)}</td>
 													<td className="px-3 py-2 border-r border-gray-300">{r.time || ''}</td>
 													<td className="px-3 py-2">{getInst(r.instructorId || r.instructor_id)}</td>

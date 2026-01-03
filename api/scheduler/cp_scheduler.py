@@ -1,6 +1,7 @@
 """OR-Tools Constraint Programming Scheduler with Cluster-based Processing"""
 import logging
 import os
+import re
 from typing import List, Dict, Optional, Set, Tuple, Any
 from collections import defaultdict
 from sqlalchemy.orm import Session
@@ -29,6 +30,55 @@ class _SubjectBlockClone:
     """
 
     pass
+
+
+def _time_str_to_minutes(value: str) -> Optional[int]:
+    value = (value or "").strip()
+    if not value:
+        return None
+    match = re.match(r"^(\d{1,2}):(\d{2})$", value)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _parse_time_range_minutes(time_label: str):
+    label = (time_label or "").strip()
+    if not label:
+        return None
+
+    label = re.sub(r"^(M|T|W|TH|F)\s+", "", label, flags=re.IGNORECASE)
+    normalized = (
+        label.replace("—", "-")
+        .replace("–", "-")
+        .replace("−", "-")
+    )
+
+    match = re.match(r"^(\d+)\s*-\s*(\d+)$", normalized)
+    if match:
+        try:
+            start_min = int(match.group(1))
+            end_min = int(match.group(2))
+        except Exception:
+            return None
+        if end_min <= start_min:
+            return None
+        return start_min, end_min
+
+    parts = [p.strip() for p in normalized.split("-") if p.strip()]
+    if len(parts) != 2:
+        return None
+    start_min = _time_str_to_minutes(parts[0])
+    end_min = _time_str_to_minutes(parts[1])
+    if start_min is None or end_min is None:
+        return None
+    if end_min <= start_min:
+        return None
+    return start_min, end_min
 
 
 def _block_index_to_label(block_index: int) -> Optional[str]:
@@ -108,6 +158,23 @@ def log_once(msg: str, _logged=set()):
     if msg not in _logged:
         logger.warning(msg)
         _logged.add(msg)
+
+
+def _ranges_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    return not (a_end <= b_start or b_end <= a_start)
+
+
+def _range_conflicts(booked_ranges: Dict[Tuple[Any, int], List[Tuple[int, int]]], resource_key: Any, day_id: int, start_min: int, end_min: int) -> bool:
+    try:
+        day_id_int = int(day_id)
+        start_i = int(start_min)
+        end_i = int(end_min)
+    except Exception:
+        return False
+    for bs, be in booked_ranges.get((resource_key, day_id_int), []):
+        if _ranges_overlap(start_i, end_i, bs, be):
+            return True
+    return False
 
 
 # --- BEGIN REWRITE: robust start-option generation and safe CP var creation ---
@@ -652,7 +719,7 @@ def generate_subject_start_options(
                     "num_slots": len(all_slot_indexes),
                 })
 
-        # Pattern F (single-day LAB)
+        # Pattern F (single-day LAB) - single-day is allowed only on Friday.
         if fri_day and FRI in slots_by_day:
             debug_log("Generating F LAB patterns")
             for fri_slot in slots_by_day[FRI]:
@@ -812,7 +879,7 @@ def generate_subject_start_options(
 
         # Pattern F
         # NOTE: Disabled for LEC subjects to enforce MW/TTh-only lecture patterns.
-        if False and fri_day and FRI in slots_by_day:
+        if fri_day and FRI in slots_by_day:
             for fri_slot in slots_by_day[FRI]:
                 slot_indexes = fri_slot.get("index", [])
                 if isinstance(slot_indexes, int):
@@ -1087,6 +1154,8 @@ def get_existing_bookings(
     for booking in room_bookings:
         day_id = booking["day_id"]
         time_label = booking["time_label"]
+        if isinstance(time_label, str) and " - " in time_label:
+            time_label = time_label.split(" - ", 1)[0].strip()
         
         # Convert time_label to block_index if mapping available
         if time_label_to_block_index:
@@ -1101,6 +1170,8 @@ def get_existing_bookings(
     for booking in instructor_bookings:
         day_id = booking["day_id"]
         time_label = booking["time_label"]
+        if isinstance(time_label, str) and " - " in time_label:
+            time_label = time_label.split(" - ", 1)[0].strip()
         
         # Convert time_label to block_index if mapping available
         if time_label_to_block_index:
@@ -1131,6 +1202,8 @@ def _retry_unscheduled_subjects(
     focus_subject_ids_set: Optional[Set[int]],
     global_instr_map: Optional[Dict[Tuple[str, int, int], int]] = None,
     scheduled_rows: Optional[List[Dict]] = None,  # CP-scheduled subjects for student conflict checking
+    booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
+    booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
 ) -> Dict[int, Dict]:
     """
     Retry pass: attempt to schedule subjects that weren't scheduled in initial cluster runs.
@@ -1233,6 +1306,8 @@ def _retry_unscheduled_subjects(
         lec_instructor_by_key=lec_instructor_by_key,
         student_time_ranges=student_time_ranges,
         global_instr_map=global_instr_map,
+        booked_room_ranges_global=booked_room_ranges_global,
+        booked_instr_ranges_global=booked_instr_ranges_global,
     )
 
     # Use greedy approach for retry - simpler and faster than full CP model
@@ -1314,6 +1389,11 @@ def _retry_unscheduled_subjects(
                 subj_block_label = _block_index_to_label(subj_block_index) or "DEFAULT"
                 proposed_start_min = first_slot["start_min"]
                 proposed_end_min = last_slot["end_min"]
+
+                # Range-based conflicts (handles overlapping TIME_BLOCK definitions)
+                if booked_room_ranges_global is not None or booked_instr_ranges_global is not None:
+                    # We only know the day here; room/instructor are checked in their loops below.
+                    pass
                 
                 # Check if this time slot would conflict with any already-scheduled subject for same students
                 has_student_conflict = False
@@ -1341,6 +1421,12 @@ def _retry_unscheduled_subjects(
                     room_name = room_id_to_name.get(room_id)
                     if not room_name:
                         continue
+
+                    # Range-based room conflict check (cross-block safety)
+                    if booked_room_ranges_global is not None and _range_conflicts(
+                        booked_room_ranges_global, room_name, day.id, proposed_start_min, proposed_end_min
+                    ):
+                        continue
                     
                     # Check if room is booked for any slot in block (using block_index)
                     room_available = True
@@ -1357,6 +1443,12 @@ def _retry_unscheduled_subjects(
                     for instructor_id in eligible_instrs:
                         if scheduled:
                             break
+
+                        # Range-based instructor conflict check (cross-block safety)
+                        if booked_instr_ranges_global is not None and _range_conflicts(
+                            booked_instr_ranges_global, instructor_id, day.id, proposed_start_min, proposed_end_min
+                        ):
+                            continue
                         instr_available = True
                         for slot in block:
                             block_index = slot["index"]
@@ -1410,6 +1502,11 @@ def _retry_unscheduled_subjects(
                                 booked_room_slots_global.add((room_name, day.id, block_index))
                                 booked_instr_slots_global.add((instructor_id, day.id, block_index))
 
+                            if booked_room_ranges_global is not None:
+                                booked_room_ranges_global[(room_name, int(day.id))].append((int(proposed_start_min), int(proposed_end_min)))
+                            if booked_instr_ranges_global is not None:
+                                booked_instr_ranges_global[(int(instructor_id), int(day.id))].append((int(proposed_start_min), int(proposed_end_min)))
+
                             student_time_ranges[(subj_course_id, subj_year, subj_block_label, day.id)].append((proposed_start_min, proposed_end_min))
 
                             scheduled = True
@@ -1437,6 +1534,8 @@ def _cp_retry_mini_model(
     lec_instructor_by_key: Dict[Tuple[str, int, int], int],
     student_time_ranges: Dict[Tuple[int, int, str, int], List[Tuple[int, int]]],
     global_instr_map: Optional[Dict[Tuple[str, int, int], int]] = None,
+    booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
+    booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
 ) -> Dict[int, Dict]:
     retry_results: Dict[int, Dict] = {}
 
@@ -1602,6 +1701,8 @@ def _cp_retry_mini_model(
             min_slots = 1
 
         for day in days:
+            if day.label != "F":
+                continue
             day_slots = slots_by_day.get(day.label, [])
             max_start = len(day_slots) - min_slots
             if max_start < 0:
@@ -2143,19 +2244,76 @@ def _generate_fallback_time_windows(
     
     # For LAB subjects, generate single-day patterns on any available day
     else:
-        for day_label in [MON, TUE, WED, THU, FRI]:
-            if day_label in slots_by_day:
-                day = day_label_to_day.get(day_label)
-                if not day:
+        if MON in slots_by_day and WED in slots_by_day:
+            for mon_slot in slots_by_day[MON][:3]:
+                wed_slot = _find_matching_slot(slots_by_day[WED], mon_slot)
+                if wed_slot is None:
                     continue
-                    
-                for slot in slots_by_day[day_label][:2]:  # Limit to first 2 slots
+
+                mon_day = day_label_to_day.get(MON)
+                wed_day = day_label_to_day.get(WED)
+                if not mon_day or not wed_day:
+                    continue
+
+                start_min = mon_slot.get("start_min")
+                end_min = mon_slot.get("end_min")
+                duration_min = end_min - start_min
+
+                options.append({
+                    "days": [MON, WED],
+                    "day_ids": [mon_day.id, wed_day.id],
+                    "day_id": mon_day.id,
+                    "start_min": start_min,
+                    "end_min": end_min,
+                    "duration_min": duration_min,
+                    "block_indices": {mon_slot.get("index", 0), wed_slot.get("index", 0)},
+                    "blocks_by_day": {mon_day.id: {mon_slot.get("index", 0)}, wed_day.id: {wed_slot.get("index", 0)}},
+                    "slot_indexes": [mon_slot.get("index", 0), wed_slot.get("index", 0)],
+                    "blocks_spanned": set(),
+                    "slot_labels": [mon_slot.get("label", ""), wed_slot.get("label", "")],
+                    "num_slots": 2,
+                })
+
+        if TUE in slots_by_day and THU in slots_by_day:
+            for tue_slot in slots_by_day[TUE][:3]:
+                thu_slot = _find_matching_slot(slots_by_day[THU], tue_slot)
+                if thu_slot is None:
+                    continue
+
+                tue_day = day_label_to_day.get(TUE)
+                thu_day = day_label_to_day.get(THU)
+                if not tue_day or not thu_day:
+                    continue
+
+                start_min = tue_slot.get("start_min")
+                end_min = tue_slot.get("end_min")
+                duration_min = end_min - start_min
+
+                options.append({
+                    "days": [TUE, THU],
+                    "day_ids": [tue_day.id, thu_day.id],
+                    "day_id": tue_day.id,
+                    "start_min": start_min,
+                    "end_min": end_min,
+                    "duration_min": duration_min,
+                    "block_indices": {tue_slot.get("index", 0), thu_slot.get("index", 0)},
+                    "blocks_by_day": {tue_day.id: {tue_slot.get("index", 0)}, thu_day.id: {thu_slot.get("index", 0)}},
+                    "slot_indexes": [tue_slot.get("index", 0), thu_slot.get("index", 0)],
+                    "blocks_spanned": set(),
+                    "slot_labels": [tue_slot.get("label", ""), thu_slot.get("label", "")],
+                    "num_slots": 2,
+                })
+
+        if FRI in slots_by_day:
+            day = day_label_to_day.get(FRI)
+            if day:
+                for slot in slots_by_day[FRI][:2]:
                     start_min = slot.get("start_min")
                     end_min = slot.get("end_min")
                     duration_min = end_min - start_min
-                    
+
                     options.append({
-                        "days": [day_label],
+                        "days": [FRI],
                         "day_ids": [day.id],
                         "day_id": day.id,
                         "start_min": start_min,
@@ -2436,6 +2594,83 @@ def run_cp_scheduler(
     # Load all instructors (no is_active filter as it doesn't exist in the model)
     instructors = db.query(models.Instructor).all()
     logger.info(f"Loaded {len(instructors)} instructors")
+
+    deductions = {
+        "program chair": 3,
+        "college secretary": 3,
+        "dean": 12,
+        "associate dean": 12,
+        "director": 12,
+    }
+
+    instructor_limit_minutes: Dict[int, int] = {}
+    for inst in instructors:
+        try:
+            inst_id = int(getattr(inst, "id"))
+        except Exception:
+            continue
+        employment_type = (getattr(inst, "employment_type", None) or "regular").strip().lower()
+        designation = (getattr(inst, "designation", None) or "").strip().lower()
+        if employment_type == "visiting":
+            limit_hours = 30
+        else:
+            deduction = deductions.get(designation, 0) if designation else 0
+            limit_hours = max(0, 24 - deduction)
+        instructor_limit_minutes[inst_id] = int(limit_hours) * 60
+
+    instructor_current_minutes: Dict[int, int] = defaultdict(int)
+    try:
+        all_timeslots = db.query(models.Timeslot).all()
+    except Exception:
+        all_timeslots = []
+    timeslot_minutes_map = {}
+    for ts in all_timeslots:
+        try:
+            timeslot_minutes_map[(str(getattr(ts, "label", "") or ""), int(getattr(ts, "day")))] = (
+                int(getattr(ts, "start_min")),
+                int(getattr(ts, "end_min")),
+            )
+        except Exception:
+            continue
+
+    try:
+        existing_scheds = (
+            db.query(models.Schedule)
+            .filter(models.Schedule.semester == semester, models.Schedule.instructor_id.isnot(None))
+            .all()
+        )
+    except Exception:
+        existing_scheds = []
+
+    for sched in existing_scheds:
+        instr_id = getattr(sched, "instructor_id", None)
+        if instr_id is None:
+            continue
+        try:
+            instr_id_int = int(instr_id)
+        except Exception:
+            continue
+        raw_time = (getattr(sched, "time", None) or "").strip()
+        if not raw_time:
+            continue
+        time_label = re.sub(r"^(M|T|W|TH|F)\s+", "", raw_time, flags=re.IGNORECASE)
+        parsed = _parse_time_range_minutes(time_label)
+        if parsed:
+            start_min, end_min = parsed
+            instructor_current_minutes[instr_id_int] += max(0, int(end_min) - int(start_min))
+            continue
+        day_id_val = getattr(sched, "day_id", None)
+        if day_id_val is None:
+            continue
+        try:
+            day_id_int = int(day_id_val)
+        except Exception:
+            continue
+        ts_key = (time_label, day_id_int)
+        rng = timeslot_minutes_map.get(ts_key)
+        if rng:
+            start_min, end_min = rng
+            instructor_current_minutes[instr_id_int] += max(0, int(end_min) - int(start_min))
     
     # Load all rooms ordered by capacity
     rooms = db.query(models.Room).order_by(models.Room.capacity).all()
@@ -2770,6 +3005,43 @@ def run_cp_scheduler(
     # Global booking maps (inter-cluster propagation) - using block_index
     booked_room_slots_global = set(booked_room_slots)  # (room_name, day_id, block_index)
     booked_instr_slots_global = set(booked_instr_slots)  # (instr_id, day_id, block_index)
+
+    # Additional global booking maps using real minute ranges.
+    # This is necessary because TIME_BLOCKS contains overlapping windows (e.g., 7:00–8:30 and 7:30–8:30),
+    # so a conflict cannot be represented reliably by (day_id, block_index) alone.
+    booked_room_ranges_global = defaultdict(list)  # (room_name, day_id) -> [(start_min, end_min), ...]
+    booked_instr_ranges_global = defaultdict(list)  # (instr_id, day_id) -> [(start_min, end_min), ...]
+
+    # Seed range-based bookings from existing bookings (DB + other courses).
+    # We map (day_id, block_index) -> (start_min, end_min) from the logical slot grid.
+    slot_range_by_day_and_index = {}
+    for d in days:
+        for s in slots_by_day.get(d.label, []):
+            try:
+                slot_range_by_day_and_index[(int(d.id), int(s["index"]))] = (int(s["start_min"]), int(s["end_min"]))
+            except Exception:
+                continue
+
+    for room_name, day_id, block_index in booked_room_slots_global:
+        try:
+            day_id_i = int(day_id)
+            block_i = int(block_index)
+        except Exception:
+            continue
+        rng = slot_range_by_day_and_index.get((day_id_i, block_i))
+        if rng is not None:
+            booked_room_ranges_global[(room_name, day_id_i)].append(rng)
+
+    for instr_id, day_id, block_index in booked_instr_slots_global:
+        try:
+            day_id_i = int(day_id)
+            block_i = int(block_index)
+            instr_id_i = int(instr_id)
+        except Exception:
+            continue
+        rng = slot_range_by_day_and_index.get((day_id_i, block_i))
+        if rng is not None:
+            booked_instr_ranges_global[(instr_id_i, day_id_i)].append(rng)
     
     all_scheduled_items = []
     subject_lookup = {s.id: s for s in subjects}
@@ -2790,17 +3062,42 @@ def run_cp_scheduler(
             continue
 
     # CRITICAL: Track scheduled results from previous clusters for cross-cluster constraints
-    # Format: (year_level, day_id) -> [(start_min, end_min), ...] from already-scheduled subjects
-    cross_cluster_scheduled_ranges = defaultdict(list)  # (year_level, day_id) -> [(start_min, end_min), ...]
+    # Format: (year_level, student_block_index, day_id) -> [(start_min, end_min), ...] from already-scheduled subjects
+    cross_cluster_scheduled_ranges = defaultdict(list)  # (year_level, student_block_index, day_id) -> [(start_min, end_min), ...]
 
     # NEW: Global map to enforce LEC/LAB instructor consistency across clusters.
-    # Key: (subject_code_upper, course_id, year_level) -> instructor_id
-    global_lec_instr_by_key: Dict[Tuple[str, int, int], int] = {}
+    # Key: (subject_code_upper, course_id, year_level, student_block_index) -> instructor_id
+    global_lec_instr_by_key: Dict[Tuple[str, int, int, int], int] = {}
 
     day_distribution_tracker = defaultdict(set)  # day_id -> set(subject_id)
 
     # Main cluster loop
-    for cluster_id, cluster_subjects in cluster_items:
+    current_student_block_index = None
+    block_cluster_plan = []
+    if block_count >= 2:
+        for student_block_index in range(1, block_count + 1):
+            for cid, subjs in cluster_items:
+                filtered = []
+                for s in subjs:
+                    try:
+                        sb = int(getattr(s, "student_block", 1) or 1)
+                    except Exception:
+                        sb = 1
+                    if sb == student_block_index:
+                        filtered.append(s)
+                if filtered:
+                    block_cluster_plan.append((student_block_index, cid, filtered))
+    else:
+        for cid, subjs in cluster_items:
+            if subjs:
+                block_cluster_plan.append((1, cid, subjs))
+
+    for student_block_index, cluster_id, cluster_subjects in block_cluster_plan:
+        if current_student_block_index != student_block_index:
+            current_student_block_index = student_block_index
+            cross_cluster_scheduled_ranges = defaultdict(list)
+            day_distribution_tracker = defaultdict(set)
+
         logger.info("=== Solving cluster %s (%d subjects) ===", cluster_id, len(cluster_subjects))
         
         # Log subject IDs in this cluster for debugging
@@ -2851,6 +3148,13 @@ def run_cp_scheduler(
         
         # PRECOMPUTE: Subject lookup dict (no linear search)
         subject_lookup_cluster = {s.id: s for s in cluster_subjects}
+
+        # Ensure the global lookup includes any per-block clone subjects used in this cluster.
+        # Otherwise, extraction may not be able to map clone_subject_id -> original_subject_id.
+        try:
+            subject_lookup.update(subject_lookup_cluster)
+        except Exception:
+            pass
         
         # PRECOMPUTE: Instructor availability per time slot for faster pruning
         # Using block_index for efficient numeric conflict checking
@@ -2933,6 +3237,8 @@ def run_cp_scheduler(
         start_metadata = {}  # (subject_id, day_id, start_min, opt_idx) -> metadata
         start_vars = {}  # Keep for backward compatibility: (subject_id, room_id, global_start, instructor_id, num_slots) -> var
         start_covers = {}  # Keep for backward compatibility
+        presence_weekly_minutes = {}
+        instructor_presence_terms = defaultdict(list)  # instructor_id -> [(presence_var, weekly_minutes), ...]
         
         # Global limit: maximum variables per subject to prevent memory explosion
         MAX_VARIABLES_PER_SUBJECT = 5000  # Reasonable limit: ~5000 vars per subject
@@ -3049,6 +3355,10 @@ def run_cp_scheduler(
             subject_var_count = 0
             options_processed = 0
             
+            skipped_student_conflict = 0
+            skipped_no_rooms = 0
+            skipped_no_instructors = 0
+            
             # Track if we've logged filtering for this subject (log once per subject on first window)
             logged_filtering_for_subject = False
             
@@ -3088,6 +3398,33 @@ def run_cp_scheduler(
                 end_min = opt["end_min"]
                 duration_min = opt["duration_min"]
                 block_indices = set(opt.get("block_indices", opt.get("slot_indexes", [])))  # Use block_indices if available
+
+                # Cross-cluster student conflict prevention (minute-range based).
+                # If another cluster already scheduled something for the same cohort (year + student_block)
+                # on this day, we must not allow overlapping intervals.
+                try:
+                    subj_year_val = getattr(subject, "year_level", None) or default_year
+                    subj_year_int = int(subj_year_val) if subj_year_val is not None else int(default_year)
+                except Exception:
+                    subj_year_int = int(default_year) if default_year is not None else 0
+
+                try:
+                    subj_block_idx = int(getattr(subject, "student_block", 1) or 1)
+                except Exception:
+                    subj_block_idx = 1
+
+                option_conflicts_students = False
+                for d_id in day_ids:
+                    for existing_start, existing_end in cross_cluster_scheduled_ranges.get((subj_year_int, subj_block_idx, int(d_id)), []):
+                        if _ranges_overlap(int(start_min), int(end_min), int(existing_start), int(existing_end)):
+                            option_conflicts_students = True
+                            break
+                    if option_conflicts_students:
+                        break
+
+                if option_conflicts_students:
+                    skipped_student_conflict += 1
+                    continue
                 
                 # Detailed debug logging for first subject in cluster 0, first window
                 if is_first_window_detailed:
@@ -3129,6 +3466,10 @@ def run_cp_scheduler(
                     # Check availability for every day in the option
                     room_ok = True
                     for d_id in day_ids:
+                        # Range-based conflict check (handles overlapping TIME_BLOCK definitions)
+                        if _range_conflicts(booked_room_ranges_global, room_name, d_id, start_min, end_min):
+                            room_ok = False
+                            break
                         available_blocks = room_available_blocks.get(room_id, {}).get(d_id, set())
                         required_blocks = blocks_by_day.get(d_id, block_indices)  # Fallback to union if missing
                         # Ensure *all* required blocks for that day are available
@@ -3158,6 +3499,7 @@ def run_cp_scheduler(
                     # Safety assert to catch any bypass logic that might create instructor-only variables
                     # If this assert fails, it means compatible_rooms was modified or bypassed elsewhere
                     assert len(compatible_rooms) == 0, "BUG: Window passed room filtering without rooms - check for instructor-only variable creation"
+                    skipped_no_rooms += 1
                     continue
                 
                 # Pre-filter instructors: use precomputed available blocks with per-day checks
@@ -3167,6 +3509,10 @@ def run_cp_scheduler(
                     # Check availability for every day in the option
                     instr_ok = True
                     for d_id in day_ids:
+                        # Range-based conflict check (handles overlapping TIME_BLOCK definitions)
+                        if _range_conflicts(booked_instr_ranges_global, instructor_id, d_id, start_min, end_min):
+                            instr_ok = False
+                            break
                         available_blocks = instructor_available_blocks.get(instructor_id, {}).get(d_id, set())
                         required_blocks = blocks_by_day.get(d_id, block_indices)  # Fallback to union if missing
                         # Ensure *all* required blocks for that day are available
@@ -3195,6 +3541,7 @@ def run_cp_scheduler(
                     day_compatibility[d_id]["instructors"] = max(day_compatibility[d_id]["instructors"], len(compatible_instructors))
                 
                 if not compatible_instructors:
+                    skipped_no_instructors += 1
                     continue
                 
                 # OPTIMIZED: Aggressively cap large sets to prevent variable explosion
@@ -3245,6 +3592,14 @@ def run_cp_scheduler(
                         start_var_key = (subject_id, day_id, start_min, opt_idx, room_id, instructor_id)
                         presence = model.NewBoolVar(f"opt_s{subject_id}_d{day_id}_t{start_min}_n{opt_idx}_r{room_id}_i{instructor_id}")
                         start_presence_map[start_var_key] = presence
+                        try:
+                            presence_weekly_minutes[start_var_key] = int(duration_min) * int(len(day_ids) or 1)
+                        except Exception:
+                            presence_weekly_minutes[start_var_key] = 0
+
+                        instructor_presence_terms[instructor_id].append(
+                            (presence, int(presence_weekly_minutes.get(start_var_key, 0)))
+                        )
                         
                         # CRITICAL: Create separate interval for EACH day in day_ids
                         # MW options create 2 intervals (Monday + Wednesday)
@@ -3328,6 +3683,20 @@ def run_cp_scheduler(
                     subject_id, code, subject_var_count, MAX_VARIABLES_PER_SUBJECT,
                     options_processed, len(subj_opts)
                 )
+            else:
+                logger.warning(
+                    "Subject %d (%s): Created 0 CP variables. options=%d processed=%d "
+                    "eligible_rooms=%d eligible_instrs=%d skipped_student_conflict=%d skipped_no_rooms=%d skipped_no_instructors=%d",
+                    subject_id,
+                    code,
+                    len(subj_opts),
+                    options_processed,
+                    len(eligible_rooms),
+                    len(eligible_instrs),
+                    skipped_student_conflict,
+                    skipped_no_rooms,
+                    skipped_no_instructors,
+                )
             
             # VERIFICATION: Ensure eligible lists were not modified during filtering
             if eligible_rooms != original_eligible_rooms_for_verification:
@@ -3390,7 +3759,11 @@ def run_cp_scheduler(
                         key_year = int(subj_year) if subj_year is not None else int(default_year)
                     except (TypeError, ValueError):
                         key_year = int(default_year) if default_year is not None else 0
-                    gkey = (subj_code, int(subj_course_id), key_year)
+                    try:
+                        key_block = int(getattr(subject_obj, "student_block", 1) or 1)
+                    except Exception:
+                        key_block = 1
+                    gkey = (subj_code, int(subj_course_id), key_year, key_block)
                     if gkey in global_lec_instr_by_key:
                         global_instr = global_lec_instr_by_key[gkey]
                         if global_instr in instr_list:
@@ -3471,9 +3844,8 @@ def run_cp_scheduler(
                 if k[0] == subject_id
             ]
             if all_presences:
-                # Enforce exactly one assignment per subject
-                model.AddExactlyOne(all_presences)
-                # Link to selected variable
+                # Allow subject to be unscheduled (selected=0) OR scheduled with exactly one option (selected=1).
+                # This avoids making an entire cluster infeasible when two subjects cannot both be placed.
                 model.Add(sum(all_presences) == selected[subject_id])
             else:
                 model.Add(selected[subject_id] == 0)
@@ -3550,11 +3922,11 @@ def run_cp_scheduler(
         
         # FIXED: Group variables by subject first, then by cohort
         # This ensures we create one interval per subject, not one per CP variable
-        subject_vars_by_cohort = defaultdict(lambda: defaultdict(list))  # (course_id, year_level, day_id) -> subject_id -> [(var, start_min, duration_min, end_min), ...]
+        subject_vars_by_cohort = defaultdict(lambda: defaultdict(list))  # (course_id, year_level, student_block_index, day_id) -> subject_id -> [(var, start_min, duration_min, end_min), ...]
         
-        # CRITICAL: Also build cross-cluster grouping by (year_level, day_id) only
-        # This groups subjects across ALL clusters that share the same year_level and day
-        cross_cluster_vars_by_group = defaultdict(lambda: defaultdict(list))  # (year_level, day_id) -> subject_id -> [(var, start_min, duration_min, end_min), ...]
+        # CRITICAL: Also build cross-cluster grouping by (year_level, student_block_index, day_id)
+        # This groups subjects across ALL clusters that share the same year_level, student block, and day
+        cross_cluster_vars_by_group = defaultdict(lambda: defaultdict(list))  # (year_level, student_block_index, day_id) -> subject_id -> [(var, start_min, duration_min, end_min), ...]
         
         # IMPORTANT: start_vars/start_covers can be lossy due to key collisions.
         # Build hard constraints from authoritative start_metadata + start_presence_map.
@@ -3621,8 +3993,8 @@ def run_cp_scheduler(
             cohort_key = (subj_course_id, year_level, student_block_index, day_id_int)
             subject_vars_by_cohort[cohort_key][sid].append((var, start_min, duration_min, end_min))
 
-            # Cross-cluster student conflicts depend ONLY on (year_level, day_id)
-            cross_cluster_key = (subj_year, day_id_int)
+            # Cross-cluster student conflicts depend ONLY on (year_level, student_block_index, day_id)
+            cross_cluster_key = (subj_year, student_block_index, day_id_int)
             cross_cluster_vars_by_group[cross_cluster_key][sid].append((var, start_min, duration_min, end_min))
         
         # OPTIMIZED: Only create intervals when needed (2+ variables for NoOverlap)
@@ -3816,10 +4188,10 @@ def run_cp_scheduler(
         #       regardless of which cluster or course the subjects belong to
         # ====================================================================
 
-        cross_cluster_intervals_by_group = defaultdict(list)  # (year_level, day_id) -> [interval_vars]
+        cross_cluster_intervals_by_group = defaultdict(list)  # (year_level, student_block_index, day_id) -> [interval_vars]
 
         # Add intervals from THIS cluster's variables
-        for (year_level_key, day_id), subjects_dict in cross_cluster_vars_by_group.items():
+        for (year_level_key, student_block_key, day_id), subjects_dict in cross_cluster_vars_by_group.items():
             if len(subjects_dict) <= 1:
                 continue
 
@@ -3858,19 +4230,23 @@ def run_cp_scheduler(
                     intervals.append(interval)
 
             if intervals:
-                cross_cluster_intervals_by_group[(year_level_key, day_id)].extend(intervals)
+                cross_cluster_intervals_by_group[(year_level_key, student_block_key, day_id)].extend(intervals)
                 logger.debug(
-                    f"[CROSS-CLUSTER] Group (year={year_level_key}, day={day_id}): "
+                    f"[CROSS-CLUSTER] Group (year={year_level_key}, block={student_block_key}, day={day_id}): "
                     f"{len(subjects_dict)} subjects ({', '.join(subject_codes[:5])}{'...' if len(subject_codes) > 5 else ''}), "
                     f"{len(intervals)} intervals (deduplicated from room×instructor combinations)"
                 )
 
         # Add fixed intervals from previously scheduled clusters
-        for (year_level_key_raw, day_id_raw), scheduled_ranges in cross_cluster_scheduled_ranges.items():
+        for (year_level_key_raw, student_block_key_raw, day_id_raw), scheduled_ranges in cross_cluster_scheduled_ranges.items():
             try:
                 year_level_key = int(year_level_key_raw)
             except (TypeError, ValueError):
                 year_level_key = int(default_year)
+            try:
+                student_block_key = int(student_block_key_raw)
+            except (TypeError, ValueError):
+                student_block_key = 1
             try:
                 day_id_key = int(day_id_raw)
             except (TypeError, ValueError):
@@ -3882,11 +4258,11 @@ def run_cp_scheduler(
                 model.Add(fixed_var == 1)
                 interval_name = f"cross_cluster_fixed_intv_{year_level_key}_{day_id_key}_{start_min}"
                 interval = model.NewOptionalIntervalVar(start_min, duration_min, end_min, fixed_var, interval_name)
-                cross_cluster_intervals_by_group[(year_level_key, day_id_key)].append(interval)
+                cross_cluster_intervals_by_group[(year_level_key, student_block_key, day_id_key)].append(interval)
 
         # Apply NoOverlap constraints for cross-cluster groups
         cross_cluster_no_overlap_count = 0
-        for (year_level_key, day_id), intervals in cross_cluster_intervals_by_group.items():
+        for (year_level_key, student_block_key, day_id), intervals in cross_cluster_intervals_by_group.items():
             if len(intervals) <= 1:
                 continue
             model.AddNoOverlap(intervals)
@@ -3903,10 +4279,10 @@ def run_cp_scheduler(
                         pass
             subject_codes_in_group = [id_to_code.get(sid, f"ID_{sid}") for sid in sorted(subject_ids_in_group)[:5]]
             logger.info(
-                f"[CROSS-CLUSTER] Added NoOverlap for (year={year_level_key}, day={day_id}): "
+                f"[CROSS-CLUSTER] Added NoOverlap for (year={year_level_key}, block={student_block_key}, day={day_id}): "
                 f"{len(intervals)} intervals covering {len(subject_ids_in_group)} subjects "
                 f"({', '.join(subject_codes_in_group)}{'...' if len(subject_codes_in_group) > 5 else ''}) "
-                f"(includes {len(cross_cluster_scheduled_ranges.get((year_level_key, day_id), []))} fixed from previous clusters)"
+                f"(includes {len(cross_cluster_scheduled_ranges.get((year_level_key, student_block_key, day_id), []))} fixed from previous clusters)"
             )
 
         if cross_cluster_no_overlap_count > 0:
@@ -3946,6 +4322,7 @@ def run_cp_scheduler(
         if subject_day_vars:
             day_ids_list = [d.id for d in days]
             cluster_day_counts = []
+            max_day_count = max(1, len(subject_ids_list))
             for day_id in day_ids_list:
                 day_vars = []
                 for sid in subject_ids_list:
@@ -3959,25 +4336,27 @@ def run_cp_scheduler(
                 # penalties (DAY_LOAD_TARGET_MIN/MAX) in the objective.
                 cluster_day_counts.append(count_var)
 
-                lower_delta = model.NewIntVar(-DAY_LOAD_HARD_MAX, DAY_LOAD_HARD_MIN, f"day_{day_id}_lower_delta")
-                upper_delta = model.NewIntVar(-DAY_LOAD_HARD_MAX, DAY_LOAD_HARD_MAX, f"day_{day_id}_upper_delta")
+                # Soft penalty deltas: allow any feasible count_var value (including 0)
+                # without constraining the schedule.
+                lower_delta = model.NewIntVar(-max_day_count, DAY_LOAD_TARGET_MIN, f"day_{day_id}_lower_delta")
+                upper_delta = model.NewIntVar(-DAY_LOAD_TARGET_MAX, max_day_count, f"day_{day_id}_upper_delta")
                 model.Add(lower_delta == DAY_LOAD_TARGET_MIN - count_var)
                 model.Add(upper_delta == count_var - DAY_LOAD_TARGET_MAX)
-                under_pen = model.NewIntVar(0, DAY_LOAD_HARD_MAX, f"day_{day_id}_under_pen")
-                over_pen = model.NewIntVar(0, DAY_LOAD_HARD_MAX, f"day_{day_id}_over_pen")
+                under_pen = model.NewIntVar(0, DAY_LOAD_TARGET_MIN, f"day_{day_id}_under_pen")
+                over_pen = model.NewIntVar(0, max_day_count, f"day_{day_id}_over_pen")
                 model.AddMaxEquality(under_pen, [model.NewConstant(0), lower_delta])
                 model.AddMaxEquality(over_pen, [model.NewConstant(0), upper_delta])
-                target_pen = model.NewIntVar(0, DAY_LOAD_HARD_MAX * 2, f"day_{day_id}_target_pen")
+                target_pen = model.NewIntVar(0, DAY_LOAD_TARGET_MIN + max_day_count, f"day_{day_id}_target_pen")
                 model.Add(target_pen == under_pen + over_pen)
                 day_target_penalties.append(target_pen)
 
             if cluster_day_counts:
-                max_cluster_day = model.NewIntVar(0, len(cluster_day_counts), f"cluster_{cluster_id}_max_day")
-                min_cluster_day = model.NewIntVar(0, len(cluster_day_counts), f"cluster_{cluster_id}_min_day")
+                max_cluster_day = model.NewIntVar(0, max_day_count, f"cluster_{cluster_id}_max_day")
+                min_cluster_day = model.NewIntVar(0, max_day_count, f"cluster_{cluster_id}_min_day")
                 for count_var in cluster_day_counts:
                     model.Add(max_cluster_day >= count_var)
                     model.Add(min_cluster_day <= count_var)
-                cluster_day_balance_penalty = model.NewIntVar(0, len(cluster_day_counts), f"cluster_{cluster_id}_day_penalty")
+                cluster_day_balance_penalty = model.NewIntVar(0, max_day_count, f"cluster_{cluster_id}_day_penalty")
                 model.Add(cluster_day_balance_penalty == max_cluster_day - min_cluster_day)
                 distribution_penalty = cluster_day_balance_penalty
 
@@ -3991,7 +4370,11 @@ def run_cp_scheduler(
                 early_penalty_terms.append(penalty_value * var)
 
         band_penalty_terms = []
-        time_band_total_penalty = model.NewIntVar(0, len(TIME_BANDS) * DAY_LOAD_HARD_MAX * 2, f"cluster_{cluster_id}_time_band_penalty")
+        time_band_total_penalty = model.NewIntVar(
+            0,
+            len(TIME_BANDS) * DAY_LOAD_HARD_MAX * max(1, len(subject_ids_list)) * 2,
+            f"cluster_{cluster_id}_time_band_penalty",
+        )
         for band in TIME_BANDS:
             band_label = band["label"]
             band_vars = [var for vars_by_day in band_day_vars.get(band_label, {}).values() for var in vars_by_day]
@@ -4002,15 +4385,24 @@ def run_cp_scheduler(
                 model.Add(band_count == 0)
             min_req = band.get("min_count", 0)
             max_req = band.get("max_count", DAY_LOAD_HARD_MAX * len(subject_ids_list))
-            lower_delta = model.NewIntVar(-DAY_LOAD_HARD_MAX * len(subject_ids_list), DAY_LOAD_HARD_MAX * len(subject_ids_list), f"band_{band_label}_lower_delta")
-            upper_delta = model.NewIntVar(-DAY_LOAD_HARD_MAX * len(subject_ids_list), DAY_LOAD_HARD_MAX * len(subject_ids_list), f"band_{band_label}_upper_delta")
+
+            # IMPORTANT: These are soft constraints only. The helper variable domains must
+            # be wide enough to represent any feasible band_count value, otherwise they
+            # accidentally become hard constraints for small clusters.
+            band_scale = max(
+                DAY_LOAD_HARD_MAX * max(1, len(subject_ids_list)),
+                int(min_req) if min_req is not None else 0,
+                int(max_req) if max_req is not None else 0,
+            )
+            lower_delta = model.NewIntVar(-band_scale, band_scale, f"band_{band_label}_lower_delta")
+            upper_delta = model.NewIntVar(-band_scale, band_scale, f"band_{band_label}_upper_delta")
             model.Add(lower_delta == min_req - band_count)
             model.Add(upper_delta == band_count - max_req)
-            under_pen = model.NewIntVar(0, DAY_LOAD_HARD_MAX * len(subject_ids_list), f"band_{band_label}_under_pen")
-            over_pen = model.NewIntVar(0, DAY_LOAD_HARD_MAX * len(subject_ids_list), f"band_{band_label}_over_pen")
+            under_pen = model.NewIntVar(0, band_scale, f"band_{band_label}_under_pen")
+            over_pen = model.NewIntVar(0, band_scale, f"band_{band_label}_over_pen")
             model.AddMaxEquality(under_pen, [model.NewConstant(0), lower_delta])
             model.AddMaxEquality(over_pen, [model.NewConstant(0), upper_delta])
-            band_pen = model.NewIntVar(0, DAY_LOAD_HARD_MAX * len(subject_ids_list) * 2, f"band_{band_label}_pen")
+            band_pen = model.NewIntVar(0, band_scale * 2, f"band_{band_label}_pen")
             model.Add(band_pen == under_pen + over_pen)
             band_penalty_terms.append(band_pen)
         if band_penalty_terms:
@@ -4077,7 +4469,7 @@ def run_cp_scheduler(
         if day_target_penalties:
             total_day_target_penalty = model.NewIntVar(
                 0,
-                len(day_target_penalties) * DAY_LOAD_HARD_MAX * 2,
+                len(day_target_penalties) * (DAY_LOAD_TARGET_MIN + max(1, len(subject_ids_list))),
                 f"cluster_{cluster_id}_day_target_total"
             )
             model.Add(total_day_target_penalty == sum(day_target_penalties))
@@ -4086,6 +4478,34 @@ def run_cp_scheduler(
         penalty_exprs.append(DAY_PREF_PENALTY_WEIGHT * day_pref_total_penalty)
         if distribution_penalty is not None:
             penalty_exprs.append(DAY_TARGET_PENALTY_WEIGHT * distribution_penalty)
+
+        overload_penalty_terms = []
+        zero_var = model.NewIntVar(0, 0, f"cluster_{cluster_id}_zero")
+        for inst_id in instructor_ids:
+            inst_terms = []
+            inst_coeff_sum = 0
+            for var, coeff in instructor_presence_terms.get(inst_id, []):
+                if coeff:
+                    inst_terms.append(int(coeff) * var)
+                    inst_coeff_sum += int(coeff)
+            if not inst_terms:
+                continue
+            current_min = int(instructor_current_minutes.get(inst_id, 0))
+            limit_min = int(instructor_limit_minutes.get(inst_id, 24 * 60))
+            assigned_min_var = model.NewIntVar(0, max(0, inst_coeff_sum), f"cluster_{cluster_id}_inst_{inst_id}_assigned_min")
+            model.Add(assigned_min_var == sum(inst_terms))
+            total_min_var = model.NewIntVar(0, max(0, current_min + inst_coeff_sum), f"cluster_{cluster_id}_inst_{inst_id}_total_min")
+            model.Add(total_min_var == assigned_min_var + current_min)
+            diff_min_var = model.NewIntVar(-max(0, limit_min), max(0, current_min + inst_coeff_sum), f"cluster_{cluster_id}_inst_{inst_id}_diff_min")
+            model.Add(diff_min_var == total_min_var - limit_min)
+            over_min_ub = max(0, current_min + inst_coeff_sum - limit_min)
+            over_min_var = model.NewIntVar(0, over_min_ub, f"cluster_{cluster_id}_inst_{inst_id}_over_min")
+            model.AddMaxEquality(over_min_var, [zero_var, diff_min_var])
+            overload_penalty_terms.append(over_min_var)
+
+        overload_penalty_weight = 5
+        if overload_penalty_terms:
+            penalty_exprs.append(overload_penalty_weight * sum(overload_penalty_terms))
 
         objective_expr = scheduled_sum * SCHEDULE_REWARD_WEIGHT - EARLY_PENALTY_WEIGHT * early_penalty_var
         if penalty_exprs:
@@ -4315,8 +4735,9 @@ def run_cp_scheduler(
                 cp_model.SELECT_MAX_VALUE  # Select max value (1 for boolean = active)
             )
         
-        # Return quickly with a feasible solution if found
-        solver.parameters.stop_after_first_solution = True
+        # Allow optimization: stopping after the first feasible solution can leave
+        # subjects unscheduled even when a better (higher objective) solution exists.
+        solver.parameters.stop_after_first_solution = False
         
         import time
         solve_start = time.time()
@@ -4387,23 +4808,21 @@ def run_cp_scheduler(
                 original_subject_id = clone_subject_id
                 student_block_index = 1
                 if subject is not None:
-                    # CRITICAL: Get the original subject ID from the clone
-                    # For original subjects (not clones), original_subject_id might not exist
+                    # Prefer original_subject_id when present (per-block clones). For normal
+                    # subjects, original_subject_id will typically be None.
                     orig_id = getattr(subject, "original_subject_id", None)
                     if orig_id is not None:
-                        original_subject_id = int(orig_id)
-                    # If this is a clone, the clone_subject_id is the synthetic ID
-                    # and we need the original_subject_id for output
-                    if hasattr(subject, "student_block"):
-                        # This is a clone
-                        original_subject_id = int(getattr(subject, "original_subject_id", clone_subject_id))
                         try:
-                            student_block_index = int(getattr(subject, "student_block", 1))
+                            original_subject_id = int(orig_id)
                         except Exception:
-                            student_block_index = 1
+                            original_subject_id = clone_subject_id
                     else:
-                        # This is an original subject
                         original_subject_id = int(clone_subject_id)
+
+                    try:
+                        student_block_index = int(getattr(subject, "student_block", 1) or 1)
+                    except Exception:
+                        student_block_index = 1
                 block_label = _block_index_to_label(student_block_index)
 
                 # ---- NEW SAFE LOGIC (for rewritten start options) ----
@@ -4535,27 +4954,34 @@ def run_cp_scheduler(
                         logger.error("[EXTRACTION BUG] Missing room id for subject %s (room_id=%r, room_name=%r)", subject_id, room_id, room_name)
                         continue
 
-                    # Ensure time_label and start_min/end_min exist
+                    # Ensure start_min/end_min exist for this day (solver-driven)
                     start_min_day = meta.get("start_min")
                     end_min_day = meta.get("end_min")
-                    duration_min_day = meta.get("duration_min")
-                    slot_labels_day = meta.get("slot_labels")
-
                     if start_min_day is None or end_min_day is None:
-                        logger.error("[EXTRACTION BUG] Missing start_min/end_min for subject %s (meta=%r)", subject_id, meta)
+                        logger.error(
+                            "[EXTRACTION BUG] Missing start_min/end_min for subject %s (meta=%r)",
+                            subject_id,
+                            meta,
+                        )
                         continue
 
-                    # Derive a human-readable time label per day.
-                    if slot_labels_day:
-                        time_label = f"{slot_labels_day[0]} - {slot_labels_day[-1].split('–')[-1]}"
-                    else:
+                    # Canonical time label: prefer the registrar grid label from slots_by_day
+                    time_label = None
+                    day_label = day_id_to_label.get(day_id_int)
+                    if day_label:
+                        for slot in slots_by_day.get(day_label, []):
+                            try:
+                                if int(slot.get("start_min")) == int(start_min_day) and int(slot.get("end_min")) == int(end_min_day):
+                                    time_label = slot.get("label")
+                                    break
+                            except Exception:
+                                continue
+
+                    if not time_label:
                         from_minutes = lambda m: f"{m//60}:{str(m%60).zfill(2)}"
-                        time_label = f"{from_minutes(int(start_min_day))}–{from_minutes(int(end_min_day))}"
+                        span_label = f"{from_minutes(int(start_min_day))}–{from_minutes(int(end_min_day))}"
+                        time_label = f"{day_label} {span_label}" if day_label else span_label
 
-                    # Ensure start_block_id finally exists (we don't let it null silently)
-                    if start_block_id is None:
-                        logger.error("[EXTRACTION BUG] Could not determine start_block for subject %s (start_min=%s)", subject_id, start_min)
-                        continue
 
                     # If end_block_id still None, set it equal to start_block_id (single-block subject)
                     if end_block_id is None:
@@ -4625,10 +5051,20 @@ def run_cp_scheduler(
 
                     scheduled_rows.append(row)
 
+                    try:
+                        instr_for_load = int(row.get("instructor_id"))
+                        instructor_current_minutes[instr_for_load] += max(0, int(row.get("end_min")) - int(row.get("start_min")))
+                    except Exception:
+                        pass
+
                     # Update global bookings
                     for block_index in slot_indexes:
                         booked_room_slots_global.add((room_name, day_id_int, block_index))
                         booked_instr_slots_global.add((instr_id_int, day_id_int, block_index))
+
+                    # Update range-based global bookings
+                    booked_room_ranges_global[(room_name, day_id_int)].append((int(start_min_day), int(end_min_day)))
+                    booked_instr_ranges_global[(instr_id_int, day_id_int)].append((int(start_min_day), int(end_min_day)))
 
                     # Update cross-cluster scheduled ranges (normalized)
                     subj_year = subject.year_level if subject and getattr(subject, "year_level", None) else default_year
@@ -4636,7 +5072,7 @@ def run_cp_scheduler(
                         subj_year = int(subj_year)
                     except (TypeError, ValueError):
                         subj_year = int(default_year)
-                    cross_cluster_scheduled_ranges[(subj_year, day_id_int)].append((int(start_min_day), int(end_min_day)))
+                    cross_cluster_scheduled_ranges[(subj_year, student_block_index, day_id_int)].append((int(start_min_day), int(end_min_day)))
         
         # Validate: Check for conflicts in extracted results
         conflicts_found = []
@@ -4680,12 +5116,10 @@ def run_cp_scheduler(
         actually_unscheduled = []
         for s in unscheduled_subjects:
             # Get the effective subject ID (original for clones, self for originals)
-            if hasattr(s, "student_block"):
-                # This is a clone
-                eff_id = getattr(s, "original_subject_id", s.id)
-            else:
-                # This is an original subject
-                eff_id = s.id
+            # Do NOT use hasattr(student_block) as a clone detector because student_block
+            # may exist as a real DB column on all Subject rows.
+            eff_id_val = getattr(s, "original_subject_id", None)
+            eff_id = eff_id_val if eff_id_val is not None else s.id
             
             if eff_id is not None and int(eff_id) not in scheduled_original_ids:
                 actually_unscheduled.append(s)
@@ -4725,6 +5159,8 @@ def run_cp_scheduler(
             focus_subject_ids_set,
             global_instr_map=global_lec_instr_by_key,
             scheduled_rows=scheduled_rows_for_retry,  # Pass CP-scheduled subjects for student conflict checking
+            booked_room_ranges_global=booked_room_ranges_global,
+            booked_instr_ranges_global=booked_instr_ranges_global,
         )
         
         # BUG FIX 3: Validate retry doesn't overwrite CP results for the same subject
@@ -4810,12 +5246,16 @@ def run_cp_scheduler(
                 key_year = int(subj_year) if subj_year is not None else int(default_year)
             except (TypeError, ValueError):
                 key_year = int(default_year) if default_year is not None else 0
-            gkey = (subj_code, int(subj_course_id), key_year)
+            try:
+                key_block = int(getattr(subj, "student_block", 1) or 1)
+            except Exception:
+                key_block = 1
+            gkey = (subj_code, int(subj_course_id), key_year, key_block)
             if gkey in global_lec_instr_by_key and global_lec_instr_by_key[gkey] != instr_id:
                 logger.error(
-                    "[GLOBAL LEC/LAB INSTR CONFLICT] Subject code %s (course=%s, year=%s) has "
+                    "[GLOBAL LEC/LAB INSTR CONFLICT] Subject code %s (course=%s, year=%s, block=%s) has "
                     "conflicting instructors across clusters: %s vs %s",
-                    subj_code, subj_course_id, key_year,
+                    subj_code, subj_course_id, key_year, key_block,
                     global_lec_instr_by_key[gkey], instr_id,
                 )
             else:
@@ -5008,6 +5448,8 @@ def run_cp_scheduler(
                     focus_subject_ids_set,
                     global_instr_map=global_lec_instr_by_key,
                     scheduled_rows=scheduled_rows_for_retry,
+                    booked_room_ranges_global=booked_room_ranges_global,
+                    booked_instr_ranges_global=booked_instr_ranges_global,
                 )
 
                 logger.info(
@@ -5089,6 +5531,23 @@ def run_cp_scheduler(
     if unscheduled_ids:
         logger.warning("FINAL SUMMARY: Scheduled %d/%d subjects. Unscheduled IDs: %s", 
                      len(scheduled_subject_ids), len(all_requested_ids), sorted(list(unscheduled_ids)))
+        try:
+            missing_subjects = db.query(models.Subject).filter(models.Subject.id.in_(sorted(list(unscheduled_ids)))).all()
+        except Exception:
+            missing_subjects = []
+        if missing_subjects:
+            for subj in missing_subjects:
+                try:
+                    logger.warning(
+                        "UNSCHEDULED DETAIL: id=%s code=%s type=%s year=%s semester=%s",
+                        getattr(subj, "id", None),
+                        getattr(subj, "code", None),
+                        getattr(subj, "type", None) or getattr(subj, "subject_type", None),
+                        getattr(subj, "year_level", None),
+                        getattr(subj, "semester", None),
+                    )
+                except Exception:
+                    continue
     else:
         logger.info("FINAL SUMMARY: All %d requested subjects were scheduled!", len(scheduled_subject_ids))
 

@@ -89,6 +89,8 @@ class InstructorCreate(BaseModel):
     college_id: Optional[int] = None
     username: Optional[str] = None
     assignable_courses: Optional[str] = None
+    employment_type: Optional[str] = None
+    designation: Optional[str] = None
     password: Optional[str] = None
 
 
@@ -99,6 +101,8 @@ class InstructorUpdate(BaseModel):
     college_id: Optional[int] = None
     username: Optional[str] = None
     assignable_courses: Optional[str] = None
+    employment_type: Optional[str] = None
+    designation: Optional[str] = None
 
 
 class InstructorResponse(BaseModel):
@@ -109,6 +113,8 @@ class InstructorResponse(BaseModel):
     college_id: Optional[int] = None
     username: Optional[str] = None
     assignable_courses: Optional[str] = None
+    employment_type: Optional[str] = None
+    designation: Optional[str] = None
 
     class Config:
         from_attributes = True

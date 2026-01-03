@@ -2,6 +2,7 @@
 from typing import Iterable, List, Type
 import logging
 import hashlib
+import re
 
 from flask import Blueprint, jsonify, request
 from pydantic import BaseModel, ValidationError
@@ -56,6 +57,60 @@ def _serialize(instance, schema: Type[BaseModel]) -> dict:
 
 def _serialize_list(instances: Iterable, schema: Type[BaseModel]) -> List[dict]:
     return [schema.model_validate(obj).model_dump() for obj in instances]
+
+
+def _time_str_to_minutes(value: str) -> int:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("empty")
+
+    match = re.match(r"^(\d{1,2}):(\d{2})$", value)
+    if not match:
+        raise ValueError("invalid")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError("invalid")
+    return hour * 60 + minute
+
+
+def _parse_time_range_minutes(time_label: str):
+    label = (time_label or "").strip()
+    if not label:
+        return None
+
+    label = re.sub(r"^(M|T|W|TH|F)\s+", "", label, flags=re.IGNORECASE)
+
+    normalized = (
+        label.replace("—", "-")
+        .replace("–", "-")
+        .replace("−", "-")
+    )
+
+    match = re.match(r"^(\d+)\s*-\s*(\d+)$", normalized)
+    if match:
+        try:
+            start_min = int(match.group(1))
+            end_min = int(match.group(2))
+        except Exception:
+            return None
+        if end_min <= start_min:
+            return None
+        return start_min, end_min
+
+    parts = [p.strip() for p in normalized.split("-") if p.strip()]
+    if len(parts) != 2:
+        return None
+
+    try:
+        start_min = _time_str_to_minutes(parts[0])
+        end_min = _time_str_to_minutes(parts[1])
+    except Exception:
+        return None
+
+    if end_min <= start_min:
+        return None
+    return start_min, end_min
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +393,113 @@ def update_instructor(instructor_id: int):
         db.commit()
         db.refresh(instructor)
         return jsonify(_serialize(instructor, schemas.InstructorResponse))
+
+
+@entities_bp.route("/instructors/<int:instructor_id>/workload", methods=["GET"])
+def get_instructor_workload(instructor_id: int):
+    semester = request.args.get("semester", type=int)
+    if semester not in {1, 2}:
+        return jsonify({"detail": "semester query parameter must be 1 or 2"}), 400
+
+    with _get_session() as db:
+        instructor = db.query(models.Instructor).get(instructor_id)
+        if not instructor:
+            return jsonify({"detail": "Instructor not found"}), 404
+
+        schedules = (
+            db.query(models.Schedule)
+            .filter(
+                models.Schedule.instructor_id == instructor_id,
+                models.Schedule.semester == semester,
+            )
+            .all()
+        )
+
+        total_minutes = 0
+        subject_ids = set()
+        for sched in schedules:
+            if sched.subject_id:
+                subject_ids.add(sched.subject_id)
+
+            if not sched.time:
+                continue
+
+            time_label = re.sub(
+                r"^(M|T|W|TH|F)\s+",
+                "",
+                str(sched.time).strip(),
+                flags=re.IGNORECASE,
+            )
+
+            parsed = _parse_time_range_minutes(time_label)
+            if parsed:
+                start_min, end_min = parsed
+                total_minutes += max(0, end_min - start_min)
+                continue
+
+            ts = (
+                db.query(models.Timeslot)
+                .filter(
+                    models.Timeslot.label == time_label,
+                    models.Timeslot.day == sched.day_id,
+                )
+                .first()
+            )
+            if ts is not None:
+                total_minutes += max(0, int(ts.end_min) - int(ts.start_min))
+
+        weekly_hours = round(total_minutes / 60.0, 2)
+
+        units_total = 0
+        if subject_ids:
+            subjects = db.query(models.Subject).filter(models.Subject.id.in_(sorted(subject_ids))).all()
+            units_total = int(sum(int(s.unit or 0) for s in subjects))
+
+        employment_type = (getattr(instructor, "employment_type", None) or "regular").strip().lower()
+        designation = (getattr(instructor, "designation", None) or "").strip()
+
+        deductions = {
+            "program chair": 3,
+            "college secretary": 3,
+            "dean": 12,
+            "associate dean": 12,
+            "director": 12,
+        }
+
+        if employment_type == "visiting":
+            limit_hours = 30
+        else:
+            deduction = deductions.get(designation.strip().lower(), 0) if designation else 0
+            limit_hours = max(0, 24 - deduction)
+
+        overload_hours = round(max(0.0, weekly_hours - float(limit_hours)), 2)
+        overload_pay_hours = round(max(0.0, weekly_hours - 30.0), 2)
+
+        warnings = []
+        if designation and weekly_hours > float(limit_hours):
+            warnings.append(
+                "CHED guidance: faculty with a designation should not take overload; if unavoidable, a letter to the VPAA may be required."
+            )
+        if employment_type == "visiting" and weekly_hours > 30:
+            warnings.append("Visiting lecturer load exceeds 30 hours/week.")
+        if employment_type != "visiting" and not designation and weekly_hours > 30:
+            warnings.append("Overload pay threshold reached: hours beyond 30 may be eligible for overload pay.")
+
+        return jsonify(
+            {
+                "instructor_id": instructor_id,
+                "semester": semester,
+                "employment_type": employment_type,
+                "designation": designation or None,
+                "weekly_hours": weekly_hours,
+                "limit_hours": limit_hours,
+                "overload_hours": overload_hours,
+                "overload_pay_hours": overload_pay_hours,
+                "units_total": units_total,
+                "schedule_count": len(schedules),
+                "warnings": warnings,
+            }
+        )
 
 
 @entities_bp.route("/instructors/<int:instructor_id>", methods=["DELETE"])

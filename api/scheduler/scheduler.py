@@ -316,6 +316,7 @@ def run_scheduler(
             for item in filtered_results:
                 key = (
                     item.get("subject_id"),
+                    item.get("block"),
                     item.get("day_id"),
                     item.get("start_min"),
                     item.get("end_min"),
@@ -334,12 +335,41 @@ def run_scheduler(
                     len(deduped_results),
                 )
 
-            scheduled_subject_ids = {row.get("subject_id") for row in deduped_results if row.get("subject_id") is not None}
-            missing_subjects = allowed_subject_ids - scheduled_subject_ids
-            if missing_subjects:
+            try:
+                blocks_count_int = int(blocks_count) if blocks_count is not None else 1
+            except (TypeError, ValueError):
+                blocks_count_int = 1
+            if blocks_count_int < 1:
+                blocks_count_int = 1
+
+            scheduled_pairs = set()
+            for row in deduped_results:
+                sid = row.get("subject_id")
+                if sid is None:
+                    continue
+                block_val = row.get("block")
+                block_key = str(block_val).strip() if block_val is not None else "A"
+                scheduled_pairs.add((sid, block_key))
+
+            expected_pairs = set()
+            if blocks_count_int >= 2:
+                for sid in allowed_subject_ids:
+                    for idx in range(1, blocks_count_int + 1):
+                        if idx > 26:
+                            label = f"BLOCK-{idx}"
+                        else:
+                            label = chr(ord("A") + idx - 1)
+                        expected_pairs.add((sid, label))
+            else:
+                for sid in allowed_subject_ids:
+                    expected_pairs.add((sid, "A"))
+
+            missing_pairs = expected_pairs - scheduled_pairs
+            if missing_pairs:
+                missing_subjects = {sid for (sid, _) in missing_pairs}
                 logger.warning(
                     "CP+retry scheduled %d/%d requested subjects. Unscheduled subject_ids: %s",
-                    len(scheduled_subject_ids),
+                    len(allowed_subject_ids) - len(missing_subjects),
                     len(allowed_subject_ids),
                     sorted(missing_subjects),
                 )
@@ -348,7 +378,7 @@ def run_scheduler(
                 # frontend can display them (with empty schedule fields) for the selected
                 # course/year/semester. This mirrors the greedy fallback behaviour and
                 # ensures the user always sees all requested subjects.
-                for sid in sorted(missing_subjects):
+                for sid, block_label in sorted(missing_pairs, key=lambda x: (x[0], str(x[1]))):
                     subj = course_subject_lookup.get(sid)
                     deduped_results.append({
                         "subject_id": sid,
@@ -359,6 +389,7 @@ def run_scheduler(
                         "time": None,
                         "room_id": None,
                         "instructor_id": None,
+                        "block": block_label,
                     })
 
             return deduped_results

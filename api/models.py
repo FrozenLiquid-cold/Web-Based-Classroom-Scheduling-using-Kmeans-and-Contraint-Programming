@@ -58,6 +58,8 @@ class Instructor(Base):
     college_id = Column(Integer, ForeignKey("colleges.id"), nullable=True)
     username = Column(String(100), unique=True, nullable=True)
     assignable_courses = Column(Text, nullable=True)  # Comma-separated list of course codes
+    employment_type = Column(String(20), nullable=True)
+    designation = Column(String(100), nullable=True)
     
     college = relationship("College")
     user = relationship("User", back_populates="instructor", uselist=False)
