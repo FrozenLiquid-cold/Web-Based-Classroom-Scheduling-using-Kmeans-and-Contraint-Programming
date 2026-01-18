@@ -16,6 +16,7 @@ class JobRecord:
         self.key = key
         self.payload = payload
         self.status = "pending"  # pending | running | succeeded | failed
+        self.status_message = "Queued, waiting to start..."  # Detailed progress message
         self.result: Optional[Any] = None
         self.error: Optional[str] = None
         self.created_at = time.time()
@@ -62,12 +63,19 @@ class QueueManager:
         return {
             "job_id": job.id,
             "status": job.status,
+            "status_message": job.status_message,
             "error": job.error,
             "result": job.result,
             "created_at": job.created_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
         }
+    
+    def update_status_message(self, job_id: str, message: str) -> None:
+        """Update the detailed status message for a running job."""
+        job = self.jobs.get(job_id)
+        if job:
+            job.status_message = message
     
     def find_active_job_for_course(self, course_id: int, semester: int) -> Optional[str]:
         """
@@ -110,6 +118,7 @@ class QueueManager:
                 job: JobRecord = self.queues[key].popleft()
 
             job.status = "running"
+            job.status_message = "Initializing scheduler..."
             job.started_at = time.time()
 
             try:
@@ -120,6 +129,10 @@ class QueueManager:
                         year_value = int(requested_year) if requested_year is not None else 1
                     except (TypeError, ValueError):
                         year_value = 1
+
+                    # Create a progress callback that updates the job's status message
+                    def progress_callback(message: str) -> None:
+                        job.status_message = message
 
                     result = run_scheduler(
                         db=db,
@@ -136,8 +149,10 @@ class QueueManager:
                         force_refit=job.payload.get("force_refit", False),
                         block_capacity_overrides=job.payload.get("block_capacities"),
                         blocks_count=job.payload.get("blocks_count"),
+                        progress_callback=progress_callback,
                     )
                     job.result = {"items": result, "count": len(result)}
+                    job.status_message = f"Completed! Scheduled {len(result)} items."
                     
                     # Note: Schedule is NOT automatically saved - user must click "Save" button
                     # to persist it to the database. This allows users to regenerate if needed.
@@ -147,6 +162,7 @@ class QueueManager:
                     db.close()
             except Exception as exc:  # noqa: BLE001
                 job.error = str(exc)
+                job.status_message = f"Failed: {str(exc)[:100]}"
                 job.status = "failed"
             finally:
                 job.finished_at = time.time()

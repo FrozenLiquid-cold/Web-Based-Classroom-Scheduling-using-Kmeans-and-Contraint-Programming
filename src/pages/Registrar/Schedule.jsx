@@ -28,12 +28,17 @@ export default function RegistrarSchedule() {
   const [schedule, setSchedule] = useState([]);
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
   const [progress, setProgress] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
   const [isLoadingSavedSchedule, setIsLoadingSavedSchedule] = useState(false);
   const [savedScheduleMessage, setSavedScheduleMessage] = useState("");
   const [hasCheckedSavedSchedule, setHasCheckedSavedSchedule] = useState(false);
+
+  // Animation states for progressive subject reveal
+  const [revealedCount, setRevealedCount] = useState(0);
+  const [isRevealing, setIsRevealing] = useState(false);
 
   useEffect(() => {
     async function loadData() {
@@ -144,6 +149,7 @@ export default function RegistrarSchedule() {
     setError("");
     setSchedule([]);
     setJobStatus("initializing");
+    setStatusMessage("Initializing scheduler...");
     setProgress(10);
     setJobId(null);
 
@@ -207,8 +213,8 @@ export default function RegistrarSchedule() {
         if (status.status === "succeeded" || status.status === "completed") {
           // Use status.result directly (array of scheduled items) - NOT subjects
           // Backend returns: {"status": "completed", "result": [scheduled_items...]}
-          const scheduledItems = Array.isArray(status.result) 
-            ? status.result 
+          const scheduledItems = Array.isArray(status.result)
+            ? status.result
             : (status.result?.items || []);
           setSchedule(scheduledItems);
           setJobStatus("succeeded");
@@ -237,6 +243,10 @@ export default function RegistrarSchedule() {
         }
 
         setJobStatus(status.status);
+        // Update detailed status message from backend
+        if (status.status_message) {
+          setStatusMessage(status.status_message);
+        }
       } catch (err) {
         if (!cancelled) {
           setError(err.message || "Failed to poll scheduler status.");
@@ -290,6 +300,37 @@ export default function RegistrarSchedule() {
       setProgress(0);
     }
   }, [jobStatus, isSubmitting]);
+
+  // Progressive reveal animation - subjects appear one by one
+  useEffect(() => {
+    if (schedule.length === 0) {
+      setRevealedCount(0);
+      setIsRevealing(false);
+      return;
+    }
+
+    // Start revealing animation when new schedule arrives
+    if (jobStatus === "succeeded" || jobStatus === "completed") {
+      setIsRevealing(true);
+      setRevealedCount(0);
+
+      // Reveal subjects one by one with staggered timing
+      const totalItems = schedule.length;
+      const intervalTime = Math.max(30, Math.min(80, 2000 / totalItems)); // 30-80ms per item
+      let currentCount = 0;
+
+      const revealInterval = setInterval(() => {
+        currentCount += 1;
+        setRevealedCount(currentCount);
+        if (currentCount >= totalItems) {
+          clearInterval(revealInterval);
+          setIsRevealing(false);
+        }
+      }, intervalTime);
+
+      return () => clearInterval(revealInterval);
+    }
+  }, [schedule.length, jobStatus]);
 
   const handleSave = async () => {
     if (schedule.length === 0) {
@@ -400,7 +441,7 @@ export default function RegistrarSchedule() {
   const formatTime12Hour = (timeStrRaw) => {
     if (!timeStrRaw) return "—";
     const timeStr = normalizeTimeRangeString(timeStrRaw);
-    
+
     // Handle format like "450-570" (minutes from midnight)
     if (timeStr.includes("-") && /^\d+-\d+$/.test(timeStr)) {
       const [startMin, endMin] = timeStr.split("-").map(Number);
@@ -408,12 +449,12 @@ export default function RegistrarSchedule() {
       const startMinute = startMin % 60;
       const endHour = Math.floor(endMin / 60);
       const endMinute = endMin % 60;
-      
+
       const start12 = formatTo12Hour(startHour, startMinute);
       const end12 = formatTo12Hour(endHour, endMinute);
       return `${start12} - ${end12}`;
     }
-    
+
     // Handle format like "7:30-9:00" or "07:30-09:00" (24-hour format)
     if (timeStr.includes("-") && timeStr.includes(":")) {
       const [start, end] = timeStr.split("-");
@@ -421,12 +462,12 @@ export default function RegistrarSchedule() {
       const end12 = convert24To12(end.trim());
       return `${start12} - ${end12}`;
     }
-    
+
     // Handle single time like "7:30" or "07:30"
     if (timeStr.includes(":")) {
       return convert24To12(timeStr.trim());
     }
-    
+
     // If it's already in a readable format, return as is
     return timeStr;
   };
@@ -443,7 +484,7 @@ export default function RegistrarSchedule() {
     if (!time24) return "—";
     const match = time24.match(/^(\d{1,2}):(\d{2})/);
     if (!match) return time24;
-    
+
     const hour24 = parseInt(match[1], 10);
     const minute = parseInt(match[2], 10);
     return formatTo12Hour(hour24, minute);
@@ -461,7 +502,7 @@ export default function RegistrarSchedule() {
     if (!schedule || schedule.length === 0) return [];
     const selectedSemester = Number(form.semester);
     const selectedYear = Number(form.year);
-    
+
     return schedule.filter(item => {
       const itemSemester = Number(item.semester);
       const itemYear = Number(item.year);
@@ -623,19 +664,19 @@ export default function RegistrarSchedule() {
       const startMinute = slot.start_min % 60;
       const endHour = Math.floor(slot.end_min / 60);
       const endMinute = slot.end_min % 60;
-      
+
       const start12 = formatTo12Hour(startHour, startMinute);
       const end12 = formatTo12Hour(endHour, endMinute);
       return `${start12} - ${end12}`;
     }
-    
+
     // Priority 2: Use time string if it contains a range
     const timeStrRaw = slot.time || slot.time_label || slot.start_time;
     const timeStr = normalizeTimeRangeString(timeStrRaw);
     if (timeStr) {
       return formatTime12Hour(timeStr);
     }
-    
+
     return "—";
   };
 
@@ -645,16 +686,16 @@ export default function RegistrarSchedule() {
     const subjectDescription = getSubjectDescription(subjectId);
     const subjectType = getSubjectType(subjectId);
     const subjectUnit = getSubjectUnit(subjectId);
-    
+
     const dayId = slot.day_id || slot.dayId;
     const dayLabel = slot._combinedDaysLabel || getDayName(dayId);
-    
+
     // Format time as start-to-end range
     const timeLabel = formatTimeRange(slot);
-    
+
     const roomId = slot.room_id || slot.roomId;
     const roomLabel = getRoomName(roomId);
-    
+
     const instructorId = slot.instructor_id || slot.instructorId;
     const instructorLabel = getInstructorName(instructorId);
 
@@ -665,8 +706,22 @@ export default function RegistrarSchedule() {
     const blockNum = slot._blockNumber || 1;
     const uniqueKey = `${slot.subject_id || slot.room_id || idx}-${idx}-${blockNum}`;
 
+    // Animation: determine if this row should be visible yet
+    const isVisible = !isRevealing || idx < revealedCount;
+    const animationDelay = isRevealing ? `${idx * 30}ms` : '0ms';
+
     return (
-      <tr key={uniqueKey}>
+      <tr
+        key={uniqueKey}
+        className={`transition-all duration-300 ease-out ${isVisible
+          ? 'opacity-100 translate-y-0'
+          : 'opacity-0 translate-y-2'
+          }`}
+        style={{
+          transitionDelay: animationDelay,
+          transform: isVisible ? 'translateY(0)' : 'translateY(8px)'
+        }}
+      >
         <td className="px-4 py-2 text-sm text-gray-700">{subjectCode}</td>
         <td className="px-4 py-2 text-sm text-gray-700">{subjectDescription}</td>
         <td className="px-4 py-2 text-sm text-gray-700">{subjectType}</td>
@@ -756,35 +811,114 @@ export default function RegistrarSchedule() {
           <button
             type="submit"
             disabled={isSubmitting}
-            className={`px-4 py-2 text-white rounded ${
-              isSubmitting ? "bg-gray-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
-            }`}
+            className={`px-4 py-2 text-white rounded ${isSubmitting ? "bg-gray-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
+              }`}
           >
             {isSubmitting ? "Scheduling..." : "Generate Schedule"}
           </button>
         </div>
       </form>
 
-      {/* Progress bar for schedule generation */}
+      {/* Enhanced Progress Bar with Skeleton Timetable */}
       {(isSubmitting ||
         ["initializing", "queued", "running"].includes(jobStatus)) && (
-        <div className="mt-4">
-          <div className="flex justify-between items-center mb-1">
-            <span className="text-xs font-medium text-gray-600">
-              Generating schedule...
-            </span>
-            <span className="text-xs text-gray-500">
-              {Math.round(progress)}%
-            </span>
+          <div className="mt-6">
+            {/* Modern gradient progress bar with shimmer effect */}
+            <div className="relative mb-6">
+              <div className="flex justify-between items-center mb-2">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse" />
+                  <span className="text-sm font-medium text-gray-700">
+                    {statusMessage || (
+                      jobStatus === "running" ? "Scheduling subjects..." :
+                        jobStatus === "queued" ? "Preparing scheduler..." :
+                          "Initializing..."
+                    )}
+                  </span>
+                </div>
+                <span className="text-sm font-semibold text-blue-600">
+                  {Math.round(progress)}%
+                </span>
+              </div>
+              <div className="w-full h-3 bg-gray-200 rounded-full overflow-hidden shadow-inner">
+                <div
+                  className="h-full rounded-full transition-all duration-300 ease-out relative"
+                  style={{
+                    width: `${Math.min(Math.max(progress, 0), 100)}%`,
+                    background: 'linear-gradient(90deg, #3b82f6 0%, #8b5cf6 50%, #3b82f6 100%)',
+                    backgroundSize: '200% 100%',
+                    animation: 'shimmer 1.5s infinite linear'
+                  }}
+                >
+                  <div
+                    className="absolute inset-0 rounded-full"
+                    style={{
+                      background: 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.4) 50%, transparent 100%)',
+                      animation: 'shimmer-glow 1.5s infinite linear'
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Skeleton timetable preview with blur effect */}
+            <div className="relative rounded-lg overflow-hidden border border-gray-200 shadow-sm">
+              <div
+                className="absolute inset-0 backdrop-blur-sm bg-white/60 z-10 flex items-center justify-center"
+                style={{ backdropFilter: 'blur(4px)' }}
+              >
+                <div className="text-center">
+                  <div className="inline-flex items-center gap-2 px-4 py-2 bg-white/90 rounded-full shadow-lg">
+                    <svg className="w-5 h-5 text-blue-500 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                    <span className="text-sm font-medium text-gray-700">Generating timetable...</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Skeleton table structure */}
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    {["Code", "Description", "Type", "Unit", "Days", "Time", "Room", "Instructor"].map((header) => (
+                      <th key={header} className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                        {header}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-100">
+                  {[...Array(6)].map((_, idx) => (
+                    <tr key={idx} className="animate-pulse">
+                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-16" /></td>
+                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-32" /></td>
+                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-12" /></td>
+                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-8" /></td>
+                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-12" /></td>
+                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-24" /></td>
+                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-16" /></td>
+                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-28" /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* CSS for shimmer animation */}
+            <style>{`
+            @keyframes shimmer {
+              0% { background-position: 200% 0; }
+              100% { background-position: -200% 0; }
+            }
+            @keyframes shimmer-glow {
+              0% { transform: translateX(-100%); }
+              100% { transform: translateX(200%); }
+            }
+          `}</style>
           </div>
-          <div className="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
-            <div
-              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-              style={{ width: `${Math.min(Math.max(progress, 0), 100)}%` }}
-            />
-          </div>
-        </div>
-      )}
+        )}
 
       {error && (
         <p className="mt-4 text-sm text-red-600 bg-red-50 border border-red-100 rounded px-3 py-2">
@@ -818,17 +952,16 @@ export default function RegistrarSchedule() {
                 type="button"
                 onClick={handleSave}
                 disabled={isSaving}
-                className={`px-4 py-2 text-white rounded ${
-                  isSaving
-                    ? "bg-gray-400 cursor-not-allowed"
-                    : "bg-green-600 hover:bg-green-700"
-                }`}
+                className={`px-4 py-2 text-white rounded ${isSaving
+                  ? "bg-gray-400 cursor-not-allowed"
+                  : "bg-green-600 hover:bg-green-700"
+                  }`}
               >
                 {isSaving ? "Saving..." : "Save to Database"}
               </button>
             </div>
           </div>
-          
+
           {/* Render separate table for each block */}
           {Object.keys(expandedSchedule)
             .sort() // Sort blocks alphabetically (Block A, Block B, etc.)

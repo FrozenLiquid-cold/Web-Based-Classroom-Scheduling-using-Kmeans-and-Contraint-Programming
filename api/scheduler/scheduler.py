@@ -38,6 +38,7 @@ def run_scheduler(
     force_refit: bool = False,
     block_capacity_overrides: Optional[List[Dict[str, Any]]] = None,
     blocks_count: Optional[int] = None,
+    progress_callback: Optional[Any] = None,
 ) -> List[Dict]:
     """
     Generate schedules for one or more year levels using K-Means clustering
@@ -57,11 +58,22 @@ def run_scheduler(
         weight_slots: Weight multiplier for recommended slots in clustering
         force_refit: Force re-run of clustering even if cache exists
         block_capacity_overrides: Optional list of per-block capacity overrides (course_id, year, block_id, capacity)
+        progress_callback: Optional callback function to report progress (accepts message string)
     
     Returns:
         Aggregated list of scheduled items covering all requested years.
     """
     import time
+    
+    # Helper function for progress reporting
+    def report_progress(message: str) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(message)
+            except Exception:
+                pass  # Ignore callback errors
+    
+    report_progress("Loading course and subject data...")
     
     # Normalise years list
     if years:
@@ -203,6 +215,9 @@ def run_scheduler(
 
             cluster_start = time.time()
             run_label = "force refit" if force_refit else "full recompute"
+            
+            report_progress(f"🔬 Running K-Means clustering (k={k_clusters}) for {len(course_subjects)} subjects...")
+            
             logger.info(
                 "Running K-Means clustering (%s, k=%s) for college %s...",
                 run_label,
@@ -263,6 +278,9 @@ def run_scheduler(
         try:
             from .cp_scheduler import run_cp_scheduler
             cp_start = time.time()
+            
+            report_progress(f"⚙️ Solving constraints for {len(requested_subject_ids)} subjects (max {max_time_seconds}s)...")
+            
             logger.info(
                 "Using OR-Tools CP solver (max_time=%.1fs) for %d subjects across years %s",
                 max_time_seconds,
@@ -283,6 +301,7 @@ def run_scheduler(
                 focus_subject_ids=requested_subject_ids,
                 block_capacity_overrides=block_capacity_map,
                 block_count=int(blocks_count) if blocks_count is not None else 1,
+                progress_callback=report_progress,
             )
             
             cp_elapsed = time.time() - cp_start

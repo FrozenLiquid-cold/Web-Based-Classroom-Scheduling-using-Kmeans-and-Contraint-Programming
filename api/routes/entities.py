@@ -414,6 +414,9 @@ def get_instructor_workload(instructor_id: int):
             )
             .all()
         )
+        
+        # Debug logging
+        logger.info(f"Workload query: instructor_id={instructor_id}, semester={semester}, found {len(schedules)} schedules")
 
         total_minutes = 0
         subject_ids = set()
@@ -425,7 +428,7 @@ def get_instructor_workload(instructor_id: int):
                 continue
 
             time_label = re.sub(
-                r"^(M|T|W|TH|F)\s+",
+                r"^(M|T|W|TH|F|SAT|SUN|TTH)\s+",
                 "",
                 str(sched.time).strip(),
                 flags=re.IGNORECASE,
@@ -451,9 +454,17 @@ def get_instructor_workload(instructor_id: int):
         weekly_hours = round(total_minutes / 60.0, 2)
 
         units_total = 0
+        # Build a mapping of subject_id -> units for quick lookup
         if subject_ids:
             subjects = db.query(models.Subject).filter(models.Subject.id.in_(sorted(subject_ids))).all()
-            units_total = int(sum(int(s.unit or 0) for s in subjects))
+            subject_units_map = {s.id: int(s.unit or 0) for s in subjects}
+            
+            # Count units for each schedule entry (each class/block counts its units)
+            for sched in schedules:
+                if sched.subject_id and sched.subject_id in subject_units_map:
+                    units_total += subject_units_map[sched.subject_id]
+            
+            logger.info(f"Units calculation: {len(schedules)} schedule entries, {len(subjects)} unique subjects, total={units_total}")
 
         employment_type = (getattr(instructor, "employment_type", None) or "regular").strip().lower()
         designation = (getattr(instructor, "designation", None) or "").strip()
