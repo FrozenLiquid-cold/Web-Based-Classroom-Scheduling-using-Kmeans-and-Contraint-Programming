@@ -142,6 +142,17 @@ def update_profile():
             if instr is not None:
                 instr.assignable_courses = update_data.assignable_courses or None
 
+        # Update instructor teaching preferences if provided
+        if user.instructor_id:
+            instr = db.query(models.Instructor).get(user.instructor_id)
+            if instr is not None:
+                if update_data.preferred_start_time is not None:
+                    instr.preferred_start_time = update_data.preferred_start_time or None
+                if update_data.preferred_end_time is not None:
+                    instr.preferred_end_time = update_data.preferred_end_time or None
+                if update_data.max_units is not None:
+                    instr.max_units = update_data.max_units
+
         db.commit()
 
         # Build response similar to login_by_role

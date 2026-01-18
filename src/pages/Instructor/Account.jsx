@@ -51,7 +51,10 @@ export default function InstructorAccount() {
         username: session?.username || 'User',
         email: session?.email || '',
         password: '',
-        confirmPassword: ''
+        confirmPassword: '',
+        preferredStartTime: '',
+        preferredEndTime: '',
+        maxUnits: ''
     })
 
     useEffect(() => {
@@ -61,7 +64,10 @@ export default function InstructorAccount() {
                 username: session?.username || (instructorData.username || `${instructorData.first_name || instructorData.firstName || ''} ${instructorData.last_name || instructorData.lastName || ''}`),
                 email: session?.email || '',
                 password: '',
-                confirmPassword: ''
+                confirmPassword: '',
+                preferredStartTime: instructorData.preferred_start_time || instructorData.preferredStartTime || '',
+                preferredEndTime: instructorData.preferred_end_time || instructorData.preferredEndTime || '',
+                maxUnits: instructorData.max_units !== null && instructorData.max_units !== undefined ? String(instructorData.max_units) : (instructorData.maxUnits !== null && instructorData.maxUnits !== undefined ? String(instructorData.maxUnits) : '')
             })
         }
     }, [instructorData])
@@ -78,6 +84,9 @@ export default function InstructorAccount() {
                 assignable_courses: specialization && specialization.length
                     ? specialization.join(',')
                     : undefined,
+                preferred_start_time: formData.preferredStartTime || undefined,
+                preferred_end_time: formData.preferredEndTime || undefined,
+                max_units: formData.maxUnits ? parseInt(formData.maxUnits, 10) : undefined,
             }
 
             const result = await updateProfile(payload)
@@ -348,6 +357,55 @@ export default function InstructorAccount() {
                             )}
                         </div>
                     )}
+                </div>
+
+                {/* Teaching Preferences */}
+                <div className={`rounded-lg border ${theme.card} p-6 mb-6`}>
+                    <h3 className={`text-sm font-medium ${theme.textMuted} uppercase tracking-wide mb-4`}>Teaching Preferences</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                        <div>
+                            <label className={`block text-xs font-medium ${theme.textMuted} uppercase tracking-wide mb-1`}>Preferred Start Time</label>
+                            {isEditing ? (
+                                <input
+                                    type="time"
+                                    className={`w-full px-3 py-2 rounded-lg border ${theme.input} ${theme.inputFocus} text-sm outline-none`}
+                                    value={formData.preferredStartTime}
+                                    onChange={(e) => setFormData({ ...formData, preferredStartTime: e.target.value })}
+                                />
+                            ) : (
+                                <div className={`text-sm ${theme.text}`}>{formData.preferredStartTime || '—'}</div>
+                            )}
+                        </div>
+                        <div>
+                            <label className={`block text-xs font-medium ${theme.textMuted} uppercase tracking-wide mb-1`}>Preferred End Time</label>
+                            {isEditing ? (
+                                <input
+                                    type="time"
+                                    className={`w-full px-3 py-2 rounded-lg border ${theme.input} ${theme.inputFocus} text-sm outline-none`}
+                                    value={formData.preferredEndTime}
+                                    onChange={(e) => setFormData({ ...formData, preferredEndTime: e.target.value })}
+                                />
+                            ) : (
+                                <div className={`text-sm ${theme.text}`}>{formData.preferredEndTime || '—'}</div>
+                            )}
+                        </div>
+                        <div>
+                            <label className={`block text-xs font-medium ${theme.textMuted} uppercase tracking-wide mb-1`}>Max Units</label>
+                            {isEditing ? (
+                                <input
+                                    type="number"
+                                    min="0"
+                                    max="50"
+                                    className={`w-full px-3 py-2 rounded-lg border ${theme.input} ${theme.inputFocus} text-sm outline-none`}
+                                    value={formData.maxUnits}
+                                    onChange={(e) => setFormData({ ...formData, maxUnits: e.target.value })}
+                                    placeholder="e.g., 21"
+                                />
+                            ) : (
+                                <div className={`text-sm ${theme.text}`}>{formData.maxUnits || '—'}</div>
+                            )}
+                        </div>
+                    </div>
                 </div>
 
                 {/* Action Buttons */}

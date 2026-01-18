@@ -24,12 +24,16 @@ class UserProfileUpdate(BaseModel):
     """Schema for authenticated user profile updates.
 
     Currently used by instructors to update their own username,
-    password, and eligible subject codes (assignable_courses).
+    password, eligible subject codes, and teaching preferences.
     """
 
     username: Optional[str] = None
     password: Optional[str] = None
     assignable_courses: Optional[str] = None
+    # Teaching preferences
+    preferred_start_time: Optional[str] = None  # e.g., "08:00"
+    preferred_end_time: Optional[str] = None  # e.g., "17:00"
+    max_units: Optional[int] = None  # Maximum units per semester
 
 
 class SessionResponse(BaseModel):
@@ -115,6 +119,9 @@ class InstructorResponse(BaseModel):
     assignable_courses: Optional[str] = None
     employment_type: Optional[str] = None
     designation: Optional[str] = None
+    preferred_start_time: Optional[str] = None
+    preferred_end_time: Optional[str] = None
+    max_units: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -178,17 +185,67 @@ class SubjectResponse(BaseModel):
 class RoomCreate(BaseModel):
     name: str
     type: str  # 'LEC' or 'LAB'
+    description: Optional[str] = None
+    building_id: Optional[int] = None
 
 
 class RoomUpdate(BaseModel):
     name: Optional[str] = None
     type: Optional[str] = None
+    description: Optional[str] = None
+    building_id: Optional[int] = None
 
 
 class RoomResponse(BaseModel):
     id: int
     name: str
     type: str
+    description: Optional[str] = None
+    building_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+# Building schemas
+class BuildingCreate(BaseModel):
+    name: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+
+
+class BuildingUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    description: Optional[str] = None
+
+
+class BuildingResponse(BaseModel):
+    id: int
+    name: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# Building Distance schemas
+class BuildingDistanceCreate(BaseModel):
+    from_building_id: int
+    to_building_id: int
+    travel_time_minutes: int
+
+
+class BuildingDistanceUpdate(BaseModel):
+    travel_time_minutes: int
+
+
+class BuildingDistanceResponse(BaseModel):
+    id: int
+    from_building_id: int
+    to_building_id: int
+    travel_time_minutes: int
 
     class Config:
         from_attributes = True

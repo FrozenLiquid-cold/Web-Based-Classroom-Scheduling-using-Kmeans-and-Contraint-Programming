@@ -216,7 +216,7 @@ def run_scheduler(
             cluster_start = time.time()
             run_label = "force refit" if force_refit else "full recompute"
             
-            report_progress(f"🔬 Running K-Means clustering (k={k_clusters}) for {len(course_subjects)} subjects...")
+            report_progress(f"Running K-Means clustering (k={k_clusters}) for {len(course_subjects)} subjects...")
             
             logger.info(
                 "Running K-Means clustering (%s, k=%s) for college %s...",

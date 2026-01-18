@@ -72,6 +72,23 @@ def _time_str_to_minutes(value: str) -> Optional[int]:
     return hour * 60 + minute
 
 
+def is_time_within_preference(start_min: int, end_min: int, pref_start: Optional[int], pref_end: Optional[int]) -> bool:
+    """Check if a time range [start_min, end_min] fits within preferences."""
+    # If no preferences, it fits
+    if pref_start is None and pref_end is None:
+        return True
+        
+    # If only start pref, check start
+    if pref_start is not None and start_min < pref_start:
+        return False
+        
+    # If only end pref, check end
+    if pref_end is not None and end_min > pref_end:
+        return False
+        
+    return True
+
+
 def _parse_time_range_minutes(time_label: str):
     label = (time_label or "").strip()
     if not label:
@@ -1237,6 +1254,7 @@ def _retry_unscheduled_subjects(
     scheduled_rows: Optional[List[Dict]] = None,  # CP-scheduled subjects for student conflict checking
     booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
+    instructor_prefs: Optional[Dict[int, Dict]] = None,
 ) -> Dict[int, Dict]:
     """
     Retry pass: attempt to schedule subjects that weren't scheduled in initial cluster runs.
@@ -1341,6 +1359,7 @@ def _retry_unscheduled_subjects(
         global_instr_map=global_instr_map,
         booked_room_ranges_global=booked_room_ranges_global,
         booked_instr_ranges_global=booked_instr_ranges_global,
+        instructor_prefs=instructor_prefs,
     )
 
     # Use greedy approach for retry - simpler and faster than full CP model
@@ -1569,6 +1588,7 @@ def _cp_retry_mini_model(
     global_instr_map: Optional[Dict[Tuple[str, int, int], int]] = None,
     booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
+    instructor_prefs: Optional[Dict[int, Dict]] = None,
 ) -> Dict[int, Dict]:
     retry_results: Dict[int, Dict] = {}
 
@@ -1582,17 +1602,17 @@ def _cp_retry_mini_model(
 
     debug_subject_stats: Dict[int, Dict[str, int]] = defaultdict(
         lambda: {
-            "eligible_instrs": 0,
-            "eligible_rooms": 0,
-            "windows_considered": 0,
-            "windows_student_conflict": 0,
-            "room_checks": 0,
-            "room_conflicts": 0,
-            "instr_checks": 0,
-            "instr_conflicts": 0,
-            "candidates": 0,
-        }
-    )
+                "eligible_instrs": 0,
+                "eligible_rooms": 0,
+                "windows_considered": 0,
+                "windows_student_conflict": 0,
+                "room_checks": 0,
+                "room_conflicts": 0,
+                "instr_checks": 0,
+                "instr_conflicts": 0,
+                "candidates": 0,
+            }
+        )
 
     candidates: List[Dict[str, Any]] = []
 
@@ -1869,6 +1889,15 @@ def _cp_retry_mini_model(
                     for instructor_id in eligible_instrs:
                         stats["instr_checks"] += 1
                         
+                        # NEW: Check time preferences
+                        if instructor_prefs and instructor_id in instructor_prefs:
+                            prefs = instructor_prefs[instructor_id]
+                            # Start and end times of the candidate window
+                            block_start = int(first_slot["start_min"])
+                            block_end = int(last_slot["end_min"])
+                            if not is_time_within_preference(block_start, block_end, prefs['start_min'], prefs['end_min']):
+                                continue
+
                         # Check instructor availability for ALL days in the pattern
                         instr_available = True
                         for check_day in pattern_days:
@@ -2599,7 +2628,7 @@ def run_cp_scheduler(
             except Exception:
                 pass  # Ignore callback errors
     
-    report_progress("📊 Loading subjects and instructors...")
+    report_progress("Loading subjects and instructors...")
     
     # Load data from database using stored procedures for optimization
     college_course_ids = []
@@ -2962,6 +2991,7 @@ def run_cp_scheduler(
         instructor_limit_minutes[inst_id] = int(limit_hours) * 60
 
     instructor_current_minutes: Dict[int, int] = defaultdict(int)
+    instructor_current_units: Dict[int, int] = defaultdict(int)
     try:
         all_timeslots = db.query(models.Timeslot).all()
     except Exception:
@@ -3001,6 +3031,18 @@ def run_cp_scheduler(
         if parsed:
             start_min, end_min = parsed
             instructor_current_minutes[instr_id_int] += max(0, int(end_min) - int(start_min))
+            # Calculate current units
+            try:
+                if sched.subject_id:
+                     # We might need to fetch subject if not loaded. 
+                     # For safety, rely on unit if available, or try to load.
+                     # Since this is ORM, sched.subject might trigger a query.
+                     # To be safe and fast, maybe better to fetch units in bulk or rely on a simple query if needed.
+                     # But for now let's try accessing subject.unit if present
+                     if sched.subject:
+                         instructor_current_units[instr_id_int] += int(getattr(sched.subject, "unit", 0))
+            except Exception:
+                pass
             continue
         day_id_val = getattr(sched, "day_id", None)
         if day_id_val is None:
@@ -3017,6 +3059,29 @@ def run_cp_scheduler(
     
     # Load all rooms ordered by capacity
     rooms = db.query(models.Room).order_by(models.Room.capacity).all()
+    
+    # Load Building Distances for Travel Time Constraints
+    travel_times = {}
+    room_building_map = {}
+    try:
+        # Load distances
+        building_distances = db.query(models.BuildingDistance).all()
+        for bd in building_distances:
+            travel_times[(bd.from_building_id, bd.to_building_id)] = bd.travel_time_minutes
+            travel_times[(bd.to_building_id, bd.from_building_id)] = bd.travel_time_minutes
+            
+        # Map Room ID -> Building ID
+        # Note: We rely on the relationship or 'building_id' field. 
+        # Since we just query Room, we access the attribute.
+        for r in rooms:
+            if hasattr(r, 'building_id') and r.building_id:
+                room_building_map[r.id] = r.building_id
+                
+        if travel_times:
+            logger.info("Loaded %d building travel time pairs", len(travel_times))
+    except Exception as e:
+        logger.warning("Failed to load building distances: %s", e)
+
     logger.info(f"Loaded {len(rooms)} rooms")
     
     # Debug: Log resource counts
@@ -3096,6 +3161,28 @@ def run_cp_scheduler(
     # Create room_id_to_name and room_by_id mappings
     room_id_to_name = {room.id: room.name for room in rooms}
     room_by_id = {room.id: room for room in rooms}
+    
+    # Build instructor preferences lookup (time preferences and unit limits)
+    instructor_prefs = {}
+    for inst in instructors:
+        pref_start = getattr(inst, 'preferred_start_time', None)
+        pref_end = getattr(inst, 'preferred_end_time', None)
+        max_units = getattr(inst, 'max_units', None)
+        
+        # Convert time strings to minutes
+        start_min = _time_str_to_minutes(pref_start) if pref_start else None
+        end_min = _time_str_to_minutes(pref_end) if pref_end else None
+        
+        instructor_prefs[inst.id] = {
+            'start_min': start_min,
+            'end_min': end_min,
+            'max_units': max_units
+        }
+    
+    # Track currently assigned units per instructor (for max_units enforcement)
+    instructor_assigned_units: Dict[int, int] = defaultdict(int)
+    
+    logger.info("Loaded preferences for %d instructors", len(instructor_prefs))
     
     # Debug: Log detailed eligibility information
     logger.info("\nDetailed Eligibility Debug:")
@@ -3582,6 +3669,7 @@ def run_cp_scheduler(
         start_covers = {}  # Keep for backward compatibility
         presence_weekly_minutes = {}
         instructor_presence_terms = defaultdict(list)  # instructor_id -> [(presence_var, weekly_minutes), ...]
+        instructor_unit_terms = defaultdict(list)      # instructor_id -> [(presence_var, units), ...]
         
         # Global limit: maximum variables per subject to prevent memory explosion
         # OPTIMIZED: Reduced from 5000 to 300 for faster solving while maintaining schedulability
@@ -3867,6 +3955,15 @@ def run_cp_scheduler(
                         if _range_conflicts(booked_instr_ranges_global, instructor_id, d_id, start_min, end_min):
                             instr_ok = False
                             break
+                        
+                        # Check instructor time preferences
+                        if instructor_id in instructor_prefs:
+                            prefs = instructor_prefs[instructor_id]
+                            # Check every day in the option
+                            if not is_time_within_preference(start_min, end_min, prefs['start_min'], prefs['end_min']):
+                                instr_ok = False
+                                break
+                                
                         available_blocks = instructor_available_blocks.get(instructor_id, {}).get(d_id, set())
                         required_blocks = blocks_by_day.get(d_id, block_indices)  # Fallback to union if missing
                         # Ensure *all* required blocks for that day are available
@@ -3953,6 +4050,9 @@ def run_cp_scheduler(
 
                         instructor_presence_terms[instructor_id].append(
                             (presence, int(presence_weekly_minutes.get(start_var_key, 0)))
+                        )
+                        instructor_unit_terms[instructor_id].append(
+                            (presence, int(getattr(subject, "unit", 0)))
                         )
                         
                         # CRITICAL: Create separate interval for EACH day in day_ids
@@ -4272,7 +4372,7 @@ def run_cp_scheduler(
         student_intervals_by_resource = defaultdict(list)  # (course_id, year_level, day_id) -> [(var, start_min, duration_min, end_min), ...]
         
         # Precompute all interval data and grouping in one pass (no loops during CP construction)
-        var_to_interval_data = {}  # var -> (start_min, duration_min, end_min, room_name, instr_id, course_id, year_level, day_id)
+        var_to_interval_data = {}  # var -> (start_min, duration_min, end_min, room_name, instr_id, course_id, year_level, day_id, room_id)
         
         # FIXED: Group variables by subject first, then by cohort
         # This ensures we create one interval per subject, not one per CP variable
@@ -4335,7 +4435,8 @@ def run_cp_scheduler(
                 day_id_int = int(day_id) if day_id is not None else 0
 
             # Store for interval creation (one entry per day)
-            var_to_interval_data[var] = (start_min, duration_min, end_min, room_name, instructor_id, subj_course_id, year_level, day_id_int)
+            # Appended room_id to the tuple for travel time constraints
+            var_to_interval_data[var] = (start_min, duration_min, end_min, room_name, instructor_id, subj_course_id, year_level, day_id_int, room_id)
 
             # Precompute grouping maps - group by (resource, day_id) for each day separately
             if room_name:
@@ -4401,6 +4502,86 @@ def run_cp_scheduler(
             instr_no_overlap_count += 1
         
         logger.debug(f"Added {instr_no_overlap_count} instructor NoOverlap constraints")
+        
+        # ====================================================================
+        # CONSTRAINT GROUP 2b: Instructor Travel Time Constraints
+        # Rule: If instructor teaches in different buildings, enforce travel time gap
+        # ====================================================================
+        
+        if travel_times and instructor_ids:
+            travel_conflict_count = 0
+            
+            # Use instr_intervals_by_resource: (instr_id, day_id) -> [(var, start_min, duration_min, end_min), ...]
+            # Note: The 'var' here maps to var_to_interval_data which now has room_id.
+            
+            for (instr_id, day_id), intervals in instr_intervals_by_resource.items():
+                if len(intervals) < 2:
+                    continue
+                    
+                # Pairwise check for travel time violations
+                for i in range(len(intervals)):
+                    for j in range(i + 1, len(intervals)):
+                        varA, startA, durA, endA = intervals[i]
+                        varB, startB, durB, endB = intervals[j]
+                        
+                        # Get Room IDs
+                        dataA = var_to_interval_data.get(varA)
+                        dataB = var_to_interval_data.get(varB)
+                        
+                        if not dataA or not dataB: 
+                            continue
+                            
+                        # room_id is the last element (index 8)
+                        # (start_min, duration_min, end_min, room_name, instr_id, course_id, year_level, day_id, room_id)
+                        # Handle case where tuple might be old format (just in case)
+                        if len(dataA) < 9 or len(dataB) < 9:
+                            continue
+                            
+                        roomA = dataA[8]
+                        roomB = dataB[8]
+                        
+                        if roomA == roomB:
+                            continue
+                            
+                        bA = room_building_map.get(roomA)
+                        bB = room_building_map.get(roomB)
+                        
+                        if not bA or not bB or bA == bB:
+                            continue
+                            
+                        travel_min = travel_times.get((bA, bB), 0)
+                        if travel_min <= 0:
+                            continue
+                            
+                        # Enforce: If both A and B are present, they must be separated by travel_min
+                        # Since start/end times are FIXED CONSTANTS for these variables (they are OPTIONAL intervals),
+                        # we can statically determine if they violate the travel constraint.
+                        
+                        # Case 1: A is before B (A.end + travel > B.start)
+                        if endA <= startB:
+                            if endA + travel_min > startB:
+                                # StartB is too soon after EndA
+                                # Cannot have both
+                                model.AddBoolOr([varA.Not(), varB.Not()])
+                                travel_conflict_count += 1
+                                
+                        # Case 2: B is before A (B.end + travel > A.start)
+                        elif endB <= startA:
+                            if endB + travel_min > startA:
+                                # StartA is too soon after EndB
+                                # Cannot have both
+                                model.AddBoolOr([varA.Not(), varB.Not()])
+                                travel_conflict_count += 1
+                                
+                        # Case 3: Overlap
+                        # If they overlap temporally, the NoOverlap constraint handles it.
+                        # Do nothing here.
+            
+            if travel_conflict_count > 0:
+                logger.info(
+                    "Added %d travel time constraints for instructors (gap enforcement)",
+                    travel_conflict_count
+                )
         
         # ====================================================================
         # CONSTRAINT GROUP 3: Student Conflict Prevention (using CP-SAT Intervals)
@@ -4850,6 +5031,18 @@ def run_cp_scheduler(
         if distribution_penalty is not None:
             penalty_exprs.append(DAY_TARGET_PENALTY_WEIGHT * distribution_penalty)
 
+        # Enforce Instructor Max Units
+        for inst_id, terms in instructor_unit_terms.items():
+            max_units = instructor_prefs.get(inst_id, {}).get('max_units')
+            if max_units is None:
+                continue
+                
+            current_units = instructor_current_units.get(inst_id, 0)
+            remaining_capacity = max(0, max_units - current_units)
+            
+            if terms:
+                model.Add(sum(var * units for var, units in terms) <= remaining_capacity)
+
         overload_penalty_terms = []
         zero_var = model.NewIntVar(0, 0, f"cluster_{cluster_id}_zero")
         for inst_id in instructor_ids:
@@ -5117,7 +5310,7 @@ def run_cp_scheduler(
         solve_start = time.time()
         
         # Report progress for solver phase
-        report_progress(f"🧮 Solving cluster {cluster_id}: {total_start_vars} variables...")
+        report_progress(f"Solving cluster {cluster_id}: {total_start_vars} variables...")
         
         logger.info("Running solver for cluster %s (vars=%d, max_time=%.1fs)...", cluster_id, total_start_vars, cluster_max_time)
         status = solver.Solve(model)
@@ -5541,6 +5734,7 @@ def run_cp_scheduler(
             scheduled_rows=scheduled_rows_for_retry,  # Pass CP-scheduled subjects for student conflict checking
             booked_room_ranges_global=booked_room_ranges_global,
             booked_instr_ranges_global=booked_instr_ranges_global,
+            instructor_prefs=instructor_prefs,
         )
         
         # BUG FIX 3: Validate retry doesn't overwrite CP results for the same subject

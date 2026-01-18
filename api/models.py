@@ -60,6 +60,10 @@ class Instructor(Base):
     assignable_courses = Column(Text, nullable=True)  # Comma-separated list of course codes
     employment_type = Column(String(20), nullable=True)
     designation = Column(String(100), nullable=True)
+    # Teaching preferences
+    preferred_start_time = Column(String(10), nullable=True)  # e.g., "08:00"
+    preferred_end_time = Column(String(10), nullable=True)  # e.g., "17:00"
+    max_units = Column(Integer, nullable=True)  # Maximum units per semester
     
     college = relationship("College")
     user = relationship("User", back_populates="instructor", uselist=False)
@@ -109,12 +113,46 @@ class Room(Base):
     type = Column(String(10), nullable=False)  # 'LEC' or 'LAB'
     capacity = Column(Integer, nullable=True)  # Room capacity
     cluster = Column(Integer, nullable=True, default=-1)  # For room clustering
+    description = Column(Text, nullable=True)
+    building_id = Column(Integer, ForeignKey("buildings.id"), nullable=True)
     
     __table_args__ = (
         CheckConstraint("type IN ('LEC', 'LAB')", name="check_room_type"),
     )
     
+    building = relationship("Building", back_populates="rooms")
     schedules = relationship("Schedule", back_populates="room")
+
+
+class Building(Base):
+    __tablename__ = "buildings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False, unique=True)
+    code = Column(String(20), nullable=True)
+    description = Column(Text, nullable=True)
+
+    rooms = relationship("Room", back_populates="building")
+    # For distances logic
+    distances_from = relationship("BuildingDistance", foreign_keys="[BuildingDistance.from_building_id]", back_populates="from_building")
+    distances_to = relationship("BuildingDistance", foreign_keys="[BuildingDistance.to_building_id]", back_populates="to_building")
+
+
+class BuildingDistance(Base):
+    __tablename__ = "building_distances"
+
+    id = Column(Integer, primary_key=True, index=True)
+    from_building_id = Column(Integer, ForeignKey("buildings.id"), nullable=False)
+    to_building_id = Column(Integer, ForeignKey("buildings.id"), nullable=False)
+    travel_time_minutes = Column(Integer, nullable=False, default=0)
+
+    from_building = relationship("Building", foreign_keys=[from_building_id], back_populates="distances_from")
+    to_building = relationship("Building", foreign_keys=[to_building_id], back_populates="distances_to")
+
+    __table_args__ = (
+        # Ensure unique pairs
+        UniqueConstraint('from_building_id', 'to_building_id', name='uq_building_distance_pair'),
+    )
 
 
 class TimeBlock(Base):

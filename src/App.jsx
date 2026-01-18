@@ -11,6 +11,8 @@ import Instructor from './pages/Registrar/Instructor'
 import Day from './pages/Registrar/Day'
 import Subject from './pages/Registrar/Subject'
 import Room from './pages/Registrar/Room'
+import Buildings from './pages/Registrar/Buildings'
+import BuildingDistances from './pages/Registrar/BuildingDistances'
 import Schedule from './pages/Registrar/Schedule'
 import InstructorSchedule from './pages/Instructor/Schedule'
 import Curriculum from './pages/Registrar/Curriculum'
@@ -24,8 +26,8 @@ import AdminUsers from './pages/Admin/Users'
 import { isAuthenticated } from './store/auth'
 
 function Guard({ children, role }) {
-    const targetPath = role === 'instructor' ? '/login/instructor' : role === 'admin' ? '/login/admin' : '/login/registrar'
-    return isAuthenticated(role) ? children : <Navigate to={targetPath} replace />
+	const targetPath = role === 'instructor' ? '/login/instructor' : role === 'admin' ? '/login/admin' : '/login/registrar'
+	return isAuthenticated(role) ? children : <Navigate to={targetPath} replace />
 }
 
 export default function App() {
@@ -50,12 +52,14 @@ export default function App() {
 				<Route path="day" element={<Day />} />
 				<Route path="subject" element={<Subject />} />
 				<Route path="room" element={<Room />} />
+				<Route path="buildings" element={<Buildings />} />
+				<Route path="distances" element={<BuildingDistances />} />
 				<Route path="curriculum" element={<Curriculum />} />
 				<Route path="schedule" element={<Schedule />} />
-                <Route path="user" element={<UsersLayout />}>
-                    <Route index element={<Notifications />} />
-                </Route>
-                <Route path="account" element={<RegistrarAccount />} />
+				<Route path="user" element={<UsersLayout />}>
+					<Route index element={<Notifications />} />
+				</Route>
+				<Route path="account" element={<RegistrarAccount />} />
 			</Route>
 
 			<Route
