@@ -74,7 +74,7 @@ async function apiCall(endpoint, options = {}) {
       const error = await response.json().catch(() => null)
       throw new Error(
         (error && (error.detail || error.message || error.error)) ||
-          `HTTP ${response.status}: ${response.statusText}`
+        `HTTP ${response.status}: ${response.statusText}`
       )
     }
 
@@ -278,4 +278,11 @@ export async function scheduleCourse(courseId, year, semester, blocksCount) {
   }
 
   return json
+}
+
+export async function validateScheduleItem(item) {
+  return apiCall('/validate/schedule-item', {
+    method: 'POST',
+    body: JSON.stringify(item),
+  })
 }

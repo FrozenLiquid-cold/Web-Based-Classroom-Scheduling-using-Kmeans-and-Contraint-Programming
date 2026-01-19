@@ -19,6 +19,7 @@ from .routes.auth import auth_bp
 from .routes.entities import entities_bp
 from .routes.schedule import schedule_bp
 from .routes.buildings import buildings_bp
+from .routes.validation import validation_bp
 
 try:
     from .routes.clustering import clustering_bp
@@ -80,6 +81,7 @@ app.register_blueprint(auth_bp, url_prefix="/api/auth")
 app.register_blueprint(entities_bp, url_prefix="/api")
 app.register_blueprint(schedule_bp, url_prefix="/api/schedule")
 app.register_blueprint(buildings_bp, url_prefix="/api/buildings")
+app.register_blueprint(validation_bp, url_prefix="/api/validate")
 
 if clustering_bp:
     app.register_blueprint(clustering_bp, url_prefix="/api")

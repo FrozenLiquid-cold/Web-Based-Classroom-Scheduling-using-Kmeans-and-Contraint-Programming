@@ -308,3 +308,17 @@ class ScheduleSaveRequest(BaseModel):
     items: List[ScheduleItemCreate]
 
 
+
+class ScheduleValidationRequest(BaseModel):
+    id: Optional[int] = None  # Existing schedule ID if editing
+    subject_id: Optional[int] = None
+    instructor_id: Optional[int] = None
+    room_id: Optional[int] = None
+    day_id: Optional[int] = None  # Single day (backward compatibility)
+    day_ids: Optional[List[int]] = None  # Multiple days check
+    start_time: str
+    end_time: str
+    course_id: int
+    year: int
+    semester: int
+    block: Optional[str] = None

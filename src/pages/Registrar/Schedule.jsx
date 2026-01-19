@@ -5,11 +5,21 @@ import {
   getScheduleStatus,
   loadSchedule as loadScheduleApi,
   saveSchedule,
+  validateScheduleItem,
 } from "../../services/api";
 
 const YEARS = [1, 2, 3, 4];
 const BLOCK_OPTIONS = [1, 2, 3, 4];
 const SEMESTERS = [1, 2];
+
+// Helper to ensure every schedule item has a UI-stable ID
+const withUiIds = (items) => {
+  if (!Array.isArray(items)) return [];
+  return items.map(item => ({
+    ...item,
+    _uiId: item._uiId || `ui_${Math.random().toString(36).substr(2, 9)}_${Date.now()}`
+  }));
+};
 
 export default function RegistrarSchedule() {
   const [courses, setCourses] = useState([]);
@@ -39,6 +49,13 @@ export default function RegistrarSchedule() {
   // Animation states for progressive subject reveal
   const [revealedCount, setRevealedCount] = useState(0);
   const [isRevealing, setIsRevealing] = useState(false);
+
+  // Edit / Override states
+  const [editingItem, setEditingItem] = useState(null);
+  const [validationResult, setValidationResult] = useState({ valid: true, messages: [] });
+  const [isValidating, setIsValidating] = useState(false);
+
+
 
   useEffect(() => {
     async function loadData() {
@@ -104,7 +121,7 @@ export default function RegistrarSchedule() {
 
         if (resp && resp.status === "success") {
           const items = Array.isArray(resp.items) ? resp.items : [];
-          setSchedule(items);
+          setSchedule(withUiIds(items));
           setHasCheckedSavedSchedule(true);
           if (items.length > 0) {
             setSavedScheduleMessage(`Loaded saved schedule (${items.length} entries).`);
@@ -170,7 +187,7 @@ export default function RegistrarSchedule() {
       if (result.status === "success") {
         // Use result.items or result.result (array) - NOT subjects
         const scheduledItems = result.items || result.result || [];
-        setSchedule(scheduledItems);
+        setSchedule(withUiIds(scheduledItems));
         setJobStatus("succeeded");
         setJobId(null);
         setSubmitting(false);
@@ -216,7 +233,7 @@ export default function RegistrarSchedule() {
           const scheduledItems = Array.isArray(status.result)
             ? status.result
             : (status.result?.items || []);
-          setSchedule(scheduledItems);
+          setSchedule(withUiIds(scheduledItems));
           setJobStatus("succeeded");
           setProgress(100);
           setJobId(null);
@@ -382,6 +399,404 @@ export default function RegistrarSchedule() {
     }
   };
 
+  // --- Manual Override Logic ---
+
+  function openEditModal(slot) {
+    // Detect MW/TTH pattern from combined label
+    let dayMode = "SINGLE";
+    let dayIds = slot._dayIds || [slot.day_id];
+
+    if (slot._combinedDaysLabel === "M-W") {
+      dayMode = "MW";
+      // Get the day IDs for M and W
+      const m = days.find(d => d.label === 'M');
+      const w = days.find(d => d.label === 'W');
+      if (m && w) {
+        dayIds = [m.id, w.id];
+      }
+    } else if (slot._combinedDaysLabel === "T-TH") {
+      dayMode = "TTH";
+      const t = days.find(d => d.label === 'T');
+      const th = days.find(d => d.label === 'TH');
+      if (t && th) {
+        dayIds = [t.id, th.id];
+      }
+    }
+
+    // Parse time from the slot
+    let startTime = "07:30";
+    let endTime = "09:00";
+
+    if (slot.start_min != null && slot.end_min != null) {
+      startTime = formatTo24Hour(slot.start_min);
+      endTime = formatTo24Hour(slot.end_min);
+    } else if (slot.time && typeof slot.time === 'string') {
+      // Parse from time string like "7:00 AM - 8:30 AM"
+      const parsed = parseTimeRangeFromItem(slot);
+      if (parsed) {
+        startTime = minutesToTimeString(parsed.start);
+        endTime = minutesToTimeString(parsed.end);
+      }
+    }
+
+    setEditingItem({
+      ...slot,
+      _roomId: slot.room_id || "",
+      _instructorId: slot.instructor_id || "",
+      _dayId: slot.day_id || dayIds[0] || "",
+      _dayIds: dayIds,
+      _originalDayIds: dayIds,
+      _dayMode: dayMode,
+      _startTime: startTime,
+      _endTime: endTime,
+    });
+    setValidationResult({ valid: true, messages: [] });
+  }
+
+  // Helper to convert minutes to HH:MM string
+  function minutesToTimeString(minutes) {
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+  }
+
+  function formatTo24Hour(minutes) {
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+  }
+
+  async function validateInfo(item, isAutoCheck = false) {
+    if (!item) return;
+    setIsValidating(true);
+
+    const allMessages = [];
+
+    // --- TIME SANITY CHECK ---
+    const startMinutes = parseTimeToMinutes(item._startTime);
+    const endMinutes = parseTimeToMinutes(item._endTime);
+
+    if (startMinutes != null && endMinutes != null && endMinutes <= startMinutes) {
+      allMessages.push("Invalid Time Range: End time must be after start time.");
+      setValidationResult({
+        valid: false,
+        messages: allMessages
+      });
+      setIsValidating(false);
+      return; // Stop validation early
+    }
+
+    // --- LOCAL CONFLICT CHECK (against in-memory schedule items) ---
+    try {
+      const localConflicts = checkLocalConflicts(item);
+      allMessages.push(...localConflicts);
+    } catch (err) {
+      console.error("Local conflict check error:", err);
+    }
+
+    // --- BACKEND CONFLICT CHECK (against database records) ---
+    try {
+      // Prepare day IDs, filtering out invalid values
+      let dayIdsToSend = [];
+      if (item._dayIds && item._dayIds.length > 0) {
+        dayIdsToSend = item._dayIds.filter(d => d != null && !isNaN(d));
+      }
+      if (dayIdsToSend.length === 0 && item._dayId) {
+        const dayIdNum = Number(item._dayId);
+        if (!isNaN(dayIdNum)) {
+          dayIdsToSend = [dayIdNum];
+        }
+      }
+
+      // If still no valid days, skip backend validation
+      if (dayIdsToSend.length === 0) {
+        console.warn("No valid day IDs to validate");
+      } else {
+        const res = await validateScheduleItem({
+          id: item.id || null,
+          subject_id: item.subject_id,
+          instructor_id: item._instructorId ? Number(item._instructorId) : null,
+          room_id: item._roomId ? Number(item._roomId) : null,
+          day_id: dayIdsToSend[0] || null, // Primary day
+          day_ids: dayIdsToSend,
+          start_time: item._startTime,
+          end_time: item._endTime,
+          course_id: Number(form.course_id),
+          year: Number(form.year),
+          semester: Number(form.semester),
+          block: item._blockLabel || item.block || null
+        });
+
+        // Merge backend messages (avoid duplicates)
+        if (res.messages && res.messages.length > 0) {
+          res.messages.forEach(msg => {
+            if (!allMessages.includes(msg)) {
+              allMessages.push(msg);
+            }
+          });
+        }
+      }
+    } catch (err) {
+      console.error("Backend validation error:", err);
+      if (!isAutoCheck) {
+        allMessages.push("Backend validation failed: " + err.message);
+      }
+    }
+
+    setValidationResult({
+      valid: allMessages.length === 0,
+      messages: allMessages
+    });
+    setIsValidating(false);
+  }
+
+  // Check for conflicts against in-memory schedule items
+  function checkLocalConflicts(editedItem) {
+    const conflicts = [];
+
+    // Parse proposed times
+    const proposedStart = parseTimeToMinutes(editedItem._startTime);
+    const proposedEnd = parseTimeToMinutes(editedItem._endTime);
+
+    if (proposedStart === null || proposedEnd === null) return conflicts;
+
+    // Get days to check
+    const daysToCheck = editedItem._dayIds && editedItem._dayIds.length > 0
+      ? editedItem._dayIds
+      : [Number(editedItem._dayId)];
+
+    // Get the original day IDs to exclude ourselves
+    const originalDayIds = editedItem._originalDayIds || [editedItem.day_id];
+
+    // Iterate through all schedule items
+    schedule.forEach(item => {
+      // Skip the item we're editing (match by subject + original days)
+      if (item.subject_id === editedItem.subject_id &&
+        originalDayIds.includes(item.day_id)) {
+        return; // Skip self
+      }
+
+      // Check if this item shares any day with our proposed days
+      const itemDayId = item.day_id || item.dayId;
+      if (!daysToCheck.includes(itemDayId)) return;
+
+      // Parse existing item's time
+      const itemTimes = parseTimeRangeFromItem(item);
+      if (!itemTimes) return;
+
+      const { start: itemStart, end: itemEnd } = itemTimes;
+
+      // Check for time overlap
+      const overlaps = Math.max(proposedStart, itemStart) < Math.min(proposedEnd, itemEnd);
+      if (!overlaps) return;
+
+      // Check specific conflict types
+      const proposedRoomId = editedItem._roomId ? Number(editedItem._roomId) : null;
+      const proposedInstrId = editedItem._instructorId ? Number(editedItem._instructorId) : null;
+      const itemRoomId = item.room_id || item.roomId;
+      const itemInstrId = item.instructor_id || item.instructorId;
+
+      // Room conflict
+      if (proposedRoomId && itemRoomId && proposedRoomId === itemRoomId) {
+        const subjectCode = getSubjectCode(item.subject_id);
+        conflicts.push(`Room Conflict (Local): Room is occupied by ${subjectCode} at this time.`);
+      }
+
+      // Instructor conflict
+      if (proposedInstrId && itemInstrId && proposedInstrId === itemInstrId) {
+        const subjectCode = getSubjectCode(item.subject_id);
+        conflicts.push(`Instructor Conflict (Local): Instructor is teaching ${subjectCode} at this time.`);
+      }
+
+      // Student group conflict (same block)
+      const itemBlock = item.block || "";
+      const editBlock = editedItem.block || editedItem._blockLabel || "";
+      if (itemBlock === editBlock) {
+        const subjectCode = getSubjectCode(item.subject_id);
+        conflicts.push(`Student Group Conflict (Local): Block has ${subjectCode} at this time.`);
+      }
+    });
+
+    return conflicts;
+  }
+
+  // Parse "HH:MM" or "H:MM AM/PM" to minutes from midnight
+  function parseTimeToMinutes(timeStr) {
+    if (!timeStr) return null;
+
+    // Handle 24h format (from input type="time")
+    if (timeStr.includes(":") && !timeStr.includes(" ")) {
+      const [h, m] = timeStr.split(":").map(Number);
+      return h * 60 + m;
+    }
+
+    // Handle 12h format
+    const match = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    if (match) {
+      let h = parseInt(match[1], 10);
+      const m = parseInt(match[2], 10);
+      const period = match[3].toUpperCase();
+      if (period === "PM" && h !== 12) h += 12;
+      if (period === "AM" && h === 12) h = 0;
+      return h * 60 + m;
+    }
+
+    return null;
+  }
+
+  // Parse time range from schedule item (handles various formats)
+  function parseTimeRangeFromItem(item) {
+    // If start_min/end_min are available, use them directly
+    if (item.start_min != null && item.end_min != null) {
+      return { start: item.start_min, end: item.end_min };
+    }
+
+    // Parse from time string
+    const timeStr = item.time || item.time_label || "";
+    if (!timeStr) return null;
+
+    // Normalize dashes
+    const normalized = timeStr.replace(/[–—]/g, "-");
+    const parts = normalized.split("-");
+
+    if (parts.length >= 2) {
+      const start = parseTimeToMinutes(parts[0].trim());
+      const end = parseTimeToMinutes(parts[1].trim());
+      if (start !== null && end !== null) {
+        return { start, end };
+      }
+    }
+
+    return null;
+  }
+
+  // Auto-validation with debounce
+  useEffect(() => {
+    if (!editingItem) return;
+
+    const timer = setTimeout(() => {
+      validateInfo(editingItem, true);
+    }, 800);
+
+    return () => clearTimeout(timer);
+  }, [
+    editingItem?._dayId,
+    editingItem?._dayMode,
+    editingItem?._startTime,
+    editingItem?._endTime,
+    editingItem?._roomId,
+    editingItem?._instructorId
+  ]);
+
+  function handleEditChange(e) {
+    const { name, value } = e.target;
+
+    setEditingItem(prev => {
+      const next = { ...prev, [name]: value };
+
+      if (name === "_dayId") {
+        if (value === "MW") {
+          const m = days.find(d => d.label === 'M');
+          const w = days.find(d => d.label === 'W');
+          if (m && w) {
+            next._dayIds = [m.id, w.id];
+            next._dayMode = "MW";
+            next._dayId = m.id;
+          }
+        } else if (value === "TTH") {
+          const t = days.find(d => d.label === 'T');
+          const th = days.find(d => d.label === 'TH');
+          if (t && th) {
+            next._dayIds = [t.id, th.id];
+            next._dayMode = "TTH";
+            next._dayId = t.id;
+          }
+        } else {
+          const dayIdNum = Number(value);
+          next._dayIds = [dayIdNum];
+          next._dayMode = "SINGLE";
+          next._dayId = dayIdNum;
+        }
+      }
+      return next;
+    });
+    setValidationResult({ valid: true, messages: [] });
+  }
+
+  // Note: Save override logic is now inlined directly in the Save button onClick handler
+  function mergeEdit(original, edited) {
+    // Construct new time string "HH:MM-HH:MM"
+    const timeStr = `${edited._startTime}-${edited._endTime}`;
+
+    return {
+      ...original,
+      room_id: edited._roomId ? Number(edited._roomId) : null,
+      instructor_id: edited._instructorId ? Number(edited._instructorId) : null,
+      day_id: Number(edited._dayId),
+      time: timeStr,
+      // Clear min/max so UI calculates from string or we update them
+      start_min: getMinutes(edited._startTime),
+      end_min: getMinutes(edited._endTime),
+    };
+  }
+
+  function getMinutes(timeStr) {
+    if (!timeStr) return null;
+    const [h, m] = timeStr.split(':').map(Number);
+    return h * 60 + m;
+  }
+
+  const formatTo12HourStr = (time24) => {
+    if (!time24) return "";
+    const [h, m] = time24.split(":").map(Number);
+    const suffix = h >= 12 ? "PM" : "AM";
+    const h12 = h % 12 || 12;
+    return `${h12}:${m.toString().padStart(2, '0')} ${suffix}`;
+  };
+
+
+
+
+  function handleEditChange(e) {
+    const { name, value } = e.target;
+    setEditingItem(prev => ({ ...prev, [name]: value }));
+    setValidationResult({ valid: true, messages: [] });
+  }
+
+  function handleSaveOverride() {
+    setSchedule(prev => prev.map(item => {
+      // Use _uiId for robust matching of edited items
+      if (editingItem._uiId && item._uiId === editingItem._uiId) {
+        return mergeEdit(item, editingItem);
+      }
+      // Fallback for items without _uiId (should not happen with withUiIds)
+      if (item.id && editingItem.id && item.id === editingItem.id) {
+        return mergeEdit(item, editingItem);
+      }
+      return item;
+    }));
+    setEditingItem(null);
+  }
+
+  function mergeEdit(original, edited) {
+    const timeStr = `${edited._startTime}-${edited._endTime}`;
+    return {
+      ...original,
+      room_id: edited._roomId ? Number(edited._roomId) : null,
+      instructor_id: edited._instructorId ? Number(edited._instructorId) : null,
+      day_id: Number(edited._dayId),
+      time: timeStr,
+      start_min: getMinutes(edited._startTime),
+      end_min: getMinutes(edited._endTime),
+    };
+  }
+
+  function getMinutes(timeStr) {
+    if (!timeStr) return null;
+    const [h, m] = timeStr.split(':').map(Number);
+    return h * 60 + m;
+  }
+
   // Helper functions to convert IDs to readable names
   const getSubject = (id) => {
     if (!id) return null;
@@ -435,7 +850,11 @@ export default function RegistrarSchedule() {
     if (typeof value !== "string") {
       return value;
     }
-    return value.replace(/[–—−]/g, "-");
+    // Normalize dashes and strip day prefixes (M, T, W, TH, F, S followed by space)
+    let normalized = value.replace(/[–—−]/g, "-");
+    // Remove day prefix at the start (e.g., "T 17:30" -> "17:30", "M-W 7:00" -> "7:00")
+    normalized = normalized.replace(/^(M|T|W|TH|F|S|M-W|T-TH)\s+/i, "");
+    return normalized;
   };
 
   const formatTime12Hour = (timeStrRaw) => {
@@ -455,15 +874,17 @@ export default function RegistrarSchedule() {
       return `${start12} - ${end12}`;
     }
 
-    // Handle format like "7:30-9:00" or "07:30-09:00" (24-hour format)
+    // Handle format like "7:30-9:00" or "07:30-09:00" or "17:30 - 19:00" (24-hour format)
     if (timeStr.includes("-") && timeStr.includes(":")) {
-      const [start, end] = timeStr.split("-");
-      const start12 = convert24To12(start.trim());
-      const end12 = convert24To12(end.trim());
-      return `${start12} - ${end12}`;
+      const parts = timeStr.split("-").map(p => p.trim());
+      if (parts.length === 2) {
+        const start12 = convert24To12(parts[0]);
+        const end12 = convert24To12(parts[1]);
+        return `${start12} - ${end12}`;
+      }
     }
 
-    // Handle single time like "7:30" or "07:30"
+    // Handle single time like "7:30" or "07:30" or "17:30"
     if (timeStr.includes(":")) {
       return convert24To12(timeStr.trim());
     }
@@ -587,6 +1008,7 @@ export default function RegistrarSchedule() {
       return {
         ...rest,
         day_id: dayIds[0] ?? group.day_id ?? group.dayId ?? null,
+        _dayIds: dayIds, // Keep the day IDs for edit modal
         _combinedDaysLabel: combinedDays || (labels[0] || "—"),
       };
     });
@@ -703,8 +1125,8 @@ export default function RegistrarSchedule() {
     const blockLabel = slot._blockLabel || "";
 
     // Create unique key that includes block number if applicable
-    const blockNum = slot._blockNumber || 1;
-    const uniqueKey = `${slot.subject_id || slot.room_id || idx}-${idx}-${blockNum}`;
+    // Create unique key using _uiId if available
+    const key = slot._uiId || `${slot.subject_id || slot.room_id || idx}-${idx}-${blockNum}`;
 
     // Animation: determine if this row should be visible yet
     const isVisible = !isRevealing || idx < revealedCount;
@@ -712,15 +1134,18 @@ export default function RegistrarSchedule() {
 
     return (
       <tr
-        key={uniqueKey}
-        className={`transition-all duration-300 ease-out ${isVisible
+        key={key}
+        onClick={() => openEditModal(slot)}
+        title="Click to edit schedule"
+        className={`hover:bg-blue-50 transition-all duration-300 ease-out cursor-pointer ${isVisible
           ? 'opacity-100 translate-y-0'
           : 'opacity-0 translate-y-2'
           }`}
         style={{
           transitionDelay: animationDelay,
-          transform: isVisible ? 'translateY(0)' : 'translateY(8px)'
+          transform: isVisible ? 'translateY(0)' : 'translateY(8px)',
         }}
+
       >
         <td className="px-4 py-2 text-sm text-gray-700">{subjectCode}</td>
         <td className="px-4 py-2 text-sm text-gray-700">{subjectDescription}</td>
@@ -1031,6 +1456,285 @@ export default function RegistrarSchedule() {
             ? " — please keep this page open while we generate the schedule."
             : ""}
         </p>
+      )}
+
+      {/* Edit Modal */}
+      {editingItem && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className={`bg-white rounded-2xl shadow-2xl w-full max-w-3xl overflow-hidden transform transition-all ${validationResult.messages.length > 0
+            ? 'ring-4 ring-red-500 shadow-[0_0_50px_rgba(239,68,68,0.4)]'
+            : 'ring-1 ring-gray-200'
+            }`}>
+            {/* Header */}
+            <div className={`px-8 py-5 flex justify-between items-center ${validationResult.messages.length > 0
+              ? 'bg-gradient-to-r from-red-600 to-red-500'
+              : 'bg-gradient-to-r from-indigo-600 via-blue-600 to-blue-500'
+              }`}>
+              <div>
+                <h3 className="font-bold text-xl text-white tracking-wide">
+                  {validationResult.messages.length > 0 ? "⚠️ Conflict Detected" : "📝 Edit Schedule"}
+                </h3>
+                {validationResult.messages.length === 0 && (
+                  <p className="text-white/70 text-sm mt-0.5">Modify the schedule details below</p>
+                )}
+              </div>
+              <button
+                onClick={() => setEditingItem(null)}
+                className="text-white/80 hover:text-white hover:bg-white/20 p-2 rounded-lg transition-all"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-8 space-y-6">
+              {/* Subject Info Card */}
+              <div className="bg-gradient-to-br from-gray-50 to-gray-100 p-5 rounded-xl border border-gray-200 shadow-sm">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 bg-indigo-100 rounded-xl flex items-center justify-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                    </svg>
+                  </div>
+                  <div>
+                    <div className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Subject</div>
+                    <div className="font-bold text-gray-900 text-lg">
+                      {getSubjectCode(editingItem.subject_id)}
+                      <span className="text-gray-300 mx-2">•</span>
+                      <span className="font-medium text-gray-600">{getSubjectDescription(editingItem.subject_id)}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
+                <div className="md:col-span-4">
+                  <label className="block text-xs font-bold text-gray-500 uppercase mb-1.5">Day</label>
+                  <select
+                    name="_dayId"
+                    value={
+                      editingItem._dayMode === "MW" ? "MW"
+                        : editingItem._dayMode === "TTH" ? "TTH"
+                          : String(editingItem._dayId || "")
+                    }
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      console.log("Day dropdown changed to:", value);
+
+                      setEditingItem(prev => {
+                        const next = { ...prev };
+
+                        if (value === "MW") {
+                          const m = days.find(d => d.label === 'M');
+                          const w = days.find(d => d.label === 'W');
+                          if (m && w) {
+                            next._dayIds = [m.id, w.id];
+                            next._dayMode = "MW";
+                            next._dayId = m.id;
+                            next._originalDayIds = prev._originalDayIds || [m.id, w.id];
+                          }
+                        } else if (value === "TTH") {
+                          const t = days.find(d => d.label === 'T');
+                          const th = days.find(d => d.label === 'TH');
+                          if (t && th) {
+                            next._dayIds = [t.id, th.id];
+                            next._dayMode = "TTH";
+                            next._dayId = t.id;
+                            next._originalDayIds = prev._originalDayIds || [t.id, th.id];
+                          }
+                        } else if (value) {
+                          // Single day
+                          const dayIdNum = Number(value);
+                          next._dayIds = [dayIdNum];
+                          next._dayMode = "SINGLE";
+                          next._dayId = dayIdNum;
+                        }
+
+                        return next;
+                      });
+                      setValidationResult({ valid: true, messages: [] });
+                    }}
+                    className={`w-full p-2.5 border rounded-lg focus:ring-2 outline-none bg-white ${validationResult.messages.length > 0 ? 'border-red-300 focus:ring-red-500 text-red-900' : 'border-gray-300 focus:ring-blue-500'
+                      }`}
+                  >
+                    <option value="">-- Select Day --</option>
+                    <optgroup label="Patterns">
+                      <option value="MW">Monday - Wednesday</option>
+                      <option value="TTH">Tuesday - Thursday</option>
+                    </optgroup>
+                    <optgroup label="Single Day">
+                      {days.map(d => <option key={d.id} value={String(d.id)}>{d.label}</option>)}
+                    </optgroup>
+                  </select>
+                </div>
+
+                <div className="md:col-span-8">
+                  <label className="block text-xs font-bold text-gray-500 uppercase mb-1.5">Time Range</label>
+                  <div className="flex gap-4 items-center">
+                    <div className="relative flex-1">
+                      <input
+                        type="time"
+                        name="_startTime"
+                        value={editingItem._startTime}
+                        onChange={handleEditChange}
+                        className={`w-full p-2.5 border rounded-lg focus:ring-2 outline-none ${validationResult.messages.length > 0 ? 'border-red-300 focus:ring-red-500 text-red-900' : 'border-gray-300 focus:ring-blue-500'
+                          }`}
+                      />
+                    </div>
+                    <span className="text-gray-400 font-medium">–</span>
+                    <div className="relative flex-1">
+                      <input
+                        type="time"
+                        name="_endTime"
+                        value={editingItem._endTime}
+                        onChange={handleEditChange}
+                        className={`w-full p-2.5 border rounded-lg focus:ring-2 outline-none ${validationResult.messages.length > 0 ? 'border-red-300 focus:ring-red-500 text-red-900' : 'border-gray-300 focus:ring-blue-500'
+                          }`}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="md:col-span-6">
+                  <label className="block text-xs font-bold text-gray-500 uppercase mb-1.5">Room</label>
+                  <select
+                    name="_roomId"
+                    value={editingItem._roomId}
+                    onChange={handleEditChange}
+                    className={`w-full p-2.5 border rounded-lg focus:ring-2 outline-none bg-white ${validationResult.messages.length > 0 ? 'border-red-300 focus:ring-red-500 text-red-900' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'
+                      }`}
+                  >
+                    <option value="">-- No Room --</option>
+                    {rooms.map(r => <option key={r.id} value={r.id}>{r.name} {r.building_id ? `(Bldg)` : ''}</option>)}
+                  </select>
+                </div>
+
+                <div className="md:col-span-6">
+                  <label className="block text-xs font-bold text-gray-500 uppercase mb-1.5">Instructor</label>
+                  <select
+                    name="_instructorId"
+                    value={editingItem._instructorId}
+                    onChange={handleEditChange}
+                    className={`w-full p-2.5 border rounded-lg focus:ring-2 outline-none bg-white ${validationResult.messages.length > 0 ? 'border-red-300 focus:ring-red-500 text-red-900' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'
+                      }`}
+                  >
+                    <option value="">-- No Instructor --</option>
+                    {instructors.map(i => (
+                      <option key={i.id} value={i.id}>
+                        {i.last_name}, {i.first_name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* Validation Feedback Area */}
+              <div className={`transition-all duration-300 ease-in-out ${validationResult.messages.length > 0 ? 'opacity-100 max-h-40' : 'opacity-0 max-h-0 overflow-hidden'
+                }`}>
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-900 animate-pulse-slow">
+                  <div className="font-bold mb-2 flex items-center gap-2 text-red-700">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5">
+                      <path fillRule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003zM12 8.25a.75.75 0 01.75.75v3.75a.75.75 0 01-1.5 0V9a.75.75 0 01.75-.75zm0 8.25a.75.75 0 100-1.5.75.75 0 000 1.5z" clipRule="evenodd" />
+                    </svg>
+                    CRITICAL CONFLICTS FOUND
+                  </div>
+                  <ul className="list-disc pl-5 space-y-1 text-red-800 font-medium">
+                    {validationResult.messages.map((m, i) => <li key={i}>{m}</li>)}
+                  </ul>
+                </div>
+              </div>
+
+              <div className="border-t pt-5 flex justify-between items-center">
+                <div className="flex items-center gap-2 text-sm text-gray-500 min-h-[1.5rem]">
+                  {isValidating && (
+                    <>
+                      <svg className="animate-spin h-4 w-4 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                      </svg>
+                      <span>Checking for conflicts...</span>
+                    </>
+                  )}
+                </div>
+
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setEditingItem(null)}
+                    className="px-5 py-2.5 border border-gray-300 text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors focus:ring-2 focus:ring-gray-200"
+                  >
+                    Cancel
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      if (!editingItem) return;
+
+                      const targetDayIds = editingItem._dayIds || [Number(editingItem._dayId)];
+                      const originalDayIds = editingItem._originalDayIds || [editingItem.day_id];
+
+                      // Create new items for each target day
+                      const newItems = targetDayIds.map(dId => {
+                        const startStr = formatTo12HourStr(editingItem._startTime);
+                        const endStr = formatTo12HourStr(editingItem._endTime);
+                        const timeStr = `${startStr} - ${endStr}`;
+
+                        return {
+                          ...editingItem,
+                          day_id: dId,
+                          dayId: dId,
+                          time: timeStr,
+                          start_time: editingItem._startTime,
+                          end_time: editingItem._endTime,
+                          start_min: getMinutes(editingItem._startTime),
+                          end_min: getMinutes(editingItem._endTime),
+                          room_id: Number(editingItem._roomId) || null,
+                          roomId: Number(editingItem._roomId) || null,
+                          instructor_id: Number(editingItem._instructorId) || null,
+                          instructorId: Number(editingItem._instructorId) || null,
+                          _uiId: `override-${Date.now()}-${dId}-${Math.random().toString(36).substr(2, 5)}`
+                        };
+                      });
+
+                      setSchedule(prev => {
+                        const filtered = prev.filter(item => {
+                          if (item.subject_id !== editingItem.subject_id) return true;
+                          const itemBlock = item.block || "";
+                          const editBlock = editingItem.block || editingItem._blockLabel || "";
+                          if (itemBlock !== editBlock) return true;
+                          const itemDayId = item.day_id || item.dayId;
+                          if (originalDayIds.includes(itemDayId)) return false;
+                          return true;
+                        });
+                        return [...filtered, ...newItems];
+                      });
+
+                      setEditingItem(null);
+                      setSaveMessage("Changes applied locally.");
+                      setTimeout(() => setSaveMessage(""), 3000);
+                    }}
+                    disabled={isValidating || validationResult.messages.length > 0}
+                    className={`px-5 py-2.5 font-medium rounded-lg shadow-md transition-all focus:ring-2 focus:ring-blue-500 flex items-center gap-2 ${isValidating || validationResult.messages.length > 0
+                      ? 'bg-gray-400 cursor-not-allowed text-white shadow-none'
+                      : 'bg-blue-600 hover:bg-blue-700 text-white hover:shadow-lg'
+                      }`}
+                  >
+                    {validationResult.messages.length > 0 ? (
+                      <>
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M13.477 14.89A6 6 0 015.11 6.524l8.367 8.368zm1.414-1.414L6.524 5.11a6 6 0 018.367 8.367zM18 10a8 8 0 11-16 0 8 8 0 0116 0z" clipRule="evenodd" />
+                        </svg>
+                        Cannot Save
+                      </>
+                    ) : (
+                      isValidating ? "Checking..." : "Save Changes"
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
