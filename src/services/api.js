@@ -72,10 +72,12 @@ async function apiCall(endpoint, options = {}) {
 
     if (!response.ok) {
       const error = await response.json().catch(() => null)
-      throw new Error(
+      const errObj = new Error(
         (error && (error.detail || error.message || error.error)) ||
         `HTTP ${response.status}: ${response.statusText}`
       )
+      errObj.data = error // Attach full error data
+      throw errObj
     }
 
     if (response.status === 204 || response.headers.get('content-length') === '0') {
@@ -228,6 +230,21 @@ export async function loadSchedule(courseId, semester, year = null, instructorId
   return apiCall(`/schedule/load?${params.toString()}`)
 }
 
+/**
+ * Load all schedules for an instructor in a single optimized API call.
+ * This eliminates the N+1 query problem when loading the instructor Schedule page.
+ * 
+ * @param {number} instructorId - The instructor's ID
+ * @param {number|null} semester - Optional semester filter (1 or 2)
+ * @returns {Promise<{status: string, items: Array, course_ids: Array<number>, count: number}>}
+ */
+export async function loadInstructorSchedules(instructorId, semester = null) {
+  if (!instructorId) throw new Error('Missing instructorId')
+  const params = new URLSearchParams({ instructor_id: instructorId })
+  if (semester !== null) params.append('semester', semester)
+  return apiCall(`/schedule/load-instructor?${params.toString()}`)
+}
+
 export async function getInstructorWorkload(instructorId, semester) {
   if (!instructorId) throw new Error('Missing instructorId')
   const params = new URLSearchParams({ semester })
@@ -243,6 +260,16 @@ export async function getScheduleStatus(jobId) {
   return apiCall(`/schedule/status?job_id=${encodeURIComponent(jobId)}`, {
     timeout: TIMEOUTS.SCHEDULE,
   })
+}
+
+export async function getRoomSchedule(roomId, semester, dayId = null) {
+  const params = new URLSearchParams({
+    room_id: roomId,
+    semester: semester
+  })
+  if (dayId) params.append('day_id', dayId)
+
+  return apiCall(`/schedule/room?${params.toString()}`)
 }
 
 export async function scheduleCourse(courseId, year, semester, blocksCount) {
@@ -285,4 +312,51 @@ export async function validateScheduleItem(item) {
     method: 'POST',
     body: JSON.stringify(item),
   })
+}
+
+// Swap Request API functions
+export async function searchSwappableSchedules(params) {
+  return apiCall('/swap-requests/search', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  })
+}
+
+export async function validateSwapRequest(data) {
+  return apiCall('/swap-requests/validate', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function createSwapRequest(data) {
+  return apiCall('/swap-requests', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function getIncomingSwapRequests(instructorId) {
+  return apiCall(`/swap-requests/incoming?instructor_id=${instructorId}`)
+}
+
+export async function getOutgoingSwapRequests(instructorId) {
+  return apiCall(`/swap-requests/outgoing?instructor_id=${instructorId}`)
+}
+
+export async function acceptSwapRequest(requestId) {
+  return apiCall(`/swap-requests/${requestId}/accept`, {
+    method: 'POST',
+  })
+}
+
+export async function rejectSwapRequest(requestId, reason = '') {
+  return apiCall(`/swap-requests/${requestId}/reject`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  })
+}
+
+export async function getSwapRequestPendingCount(instructorId) {
+  return apiCall(`/swap-requests/pending-count?instructor_id=${instructorId}`)
 }

@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useOutletContext, useNavigate } from 'react-router-dom'
 import { getInstructorWorkload } from '../../services/api'
 
 export default function Dashboard() {
+    const { mustChangeCredentials } = useOutletContext() || {}
+    const navigate = useNavigate()
+
     const session = useMemo(() => {
         try { return JSON.parse(localStorage.getItem('jrmsu.session') || 'null') } catch { return null }
     }, [])
@@ -13,14 +17,9 @@ export default function Dashboard() {
     const [loading, setLoading] = useState(false)
     const [error, setError] = useState('')
     const [refreshTick, setRefreshTick] = useState(0)
-    const [isDark, setIsDark] = useState(() => {
-        const saved = localStorage.getItem('jrmsu.theme')
-        return saved ? saved === 'dark' : false
-    })
 
-    useEffect(() => {
-        localStorage.setItem('jrmsu.theme', isDark ? 'dark' : 'light')
-    }, [isDark])
+    // Get isDark from layout context
+    const { isDark } = useOutletContext() || { isDark: false }
 
     useEffect(() => {
         let cancelled = false
@@ -106,21 +105,6 @@ export default function Dashboard() {
                         <p className={theme.textMuted}>{currentDate}</p>
                     </div>
                     <div className="flex items-center gap-3 mt-4 md:mt-0">
-                        <button
-                            onClick={() => setIsDark(!isDark)}
-                            className={`p-2.5 rounded-xl ${theme.input} border transition-all hover:scale-105`}
-                            title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-                        >
-                            {isDark ? (
-                                <svg className="w-5 h-5 text-yellow-400" fill="currentColor" viewBox="0 0 20 20">
-                                    <path fillRule="evenodd" d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4 8a4 4 0 11-8 0 4 4 0 018 0zm-.464 4.95l.707.707a1 1 0 001.414-1.414l-.707-.707a1 1 0 00-1.414 1.414zm2.12-10.607a1 1 0 010 1.414l-.706.707a1 1 0 11-1.414-1.414l.707-.707a1 1 0 011.414 0zM17 11a1 1 0 100-2h-1a1 1 0 100 2h1zm-7 4a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zM5.05 6.464A1 1 0 106.465 5.05l-.708-.707a1 1 0 00-1.414 1.414l.707.707zm1.414 8.486l-.707.707a1 1 0 01-1.414-1.414l.707-.707a1 1 0 011.414 1.414zM4 11a1 1 0 100-2H3a1 1 0 000 2h1z" clipRule="evenodd" />
-                                </svg>
-                            ) : (
-                                <svg className="w-5 h-5 text-slate-600" fill="currentColor" viewBox="0 0 20 20">
-                                    <path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z" />
-                                </svg>
-                            )}
-                        </button>
                         <select
                             className={`px-4 py-2.5 rounded-xl ${theme.input} border focus:ring-2 focus:ring-emerald-500 focus:border-transparent transition-all`}
                             value={semester}
@@ -142,6 +126,37 @@ export default function Dashboard() {
                         </button>
                     </div>
                 </div>
+
+                {/* First-login credential change notification */}
+                {mustChangeCredentials && (
+                    <div className={`backdrop-blur-xl rounded-2xl border p-5 mb-6 ${isDark ? 'bg-amber-500/10 border-amber-500/30' : 'bg-amber-50 border-amber-200'}`}>
+                        <div className="flex items-center justify-between gap-4">
+                            <div className="flex items-start gap-3">
+                                <div className={`flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center ${isDark ? 'bg-amber-500/20' : 'bg-amber-100'}`}>
+                                    <svg className="w-5 h-5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                                    </svg>
+                                </div>
+                                <div className="flex-1">
+                                    <h3 className="text-amber-600 font-semibold">Update Your Credentials</h3>
+                                    <p className={`text-sm ${isDark ? 'text-amber-300' : 'text-amber-700'}`}>
+                                        For security, please change your default username and password.
+                                    </p>
+                                </div>
+                            </div>
+                            <button
+                                onClick={() => navigate('/i/account')}
+                                className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-medium transition-all flex items-center gap-2 whitespace-nowrap"
+                            >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                </svg>
+                                Go to Account
+                            </button>
+                        </div>
+                    </div>
+                )}
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
                     <div className={`lg:col-span-1 backdrop-blur-xl rounded-2xl border p-6 flex flex-col items-center justify-center ${theme.card}`}>

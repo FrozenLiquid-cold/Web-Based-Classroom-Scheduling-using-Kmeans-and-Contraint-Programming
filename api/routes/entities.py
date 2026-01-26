@@ -79,38 +79,55 @@ def _parse_time_range_minutes(time_label: str):
     if not label:
         return None
 
-    label = re.sub(r"^(M|T|W|TH|F)\s+", "", label, flags=re.IGNORECASE)
+    # Remove day prefix if present
+    label = re.sub(r"^(M|T|W|TH|F|SAT|SUN|TTH)\s+", "", label, flags=re.IGNORECASE)
 
+    # Normalize various dash characters
     normalized = (
         label.replace("—", "-")
         .replace("–", "-")
         .replace("−", "-")
     )
 
+    # Try format: "480-600" (minutes from midnight)
     match = re.match(r"^(\d+)\s*-\s*(\d+)$", normalized)
     if match:
         try:
             start_min = int(match.group(1))
             end_min = int(match.group(2))
+            if end_min > start_min:
+                return start_min, end_min
         except Exception:
-            return None
-        if end_min <= start_min:
-            return None
-        return start_min, end_min
+            pass
 
+    # Try format: "08:00:00-10:00:00" or "8:00:00-10:00:00" (HH:MM:SS with seconds)
+    match = re.match(r"(\d{1,2}):(\d{2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2}):(\d{2})", normalized)
+    if match:
+        try:
+            start_h, start_m = int(match.group(1)), int(match.group(2))
+            end_h, end_m = int(match.group(4)), int(match.group(5))
+            start_min = start_h * 60 + start_m
+            end_min = end_h * 60 + end_m
+            if end_min > start_min:
+                return start_min, end_min
+        except Exception:
+            pass
+
+    # Try format: "08:00-10:00" or "8:00-10:00" (HH:MM)
     parts = [p.strip() for p in normalized.split("-") if p.strip()]
-    if len(parts) != 2:
-        return None
+    if len(parts) == 2:
+        try:
+            # Handle HH:MM:SS by stripping seconds
+            part1 = re.sub(r":\d{2}$", "", parts[0]) if parts[0].count(":") > 1 else parts[0]
+            part2 = re.sub(r":\d{2}$", "", parts[1]) if parts[1].count(":") > 1 else parts[1]
+            start_min = _time_str_to_minutes(part1)
+            end_min = _time_str_to_minutes(part2)
+            if end_min > start_min:
+                return start_min, end_min
+        except Exception:
+            pass
 
-    try:
-        start_min = _time_str_to_minutes(parts[0])
-        end_min = _time_str_to_minutes(parts[1])
-    except Exception:
-        return None
-
-    if end_min <= start_min:
-        return None
-    return start_min, end_min
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +456,9 @@ def get_instructor_workload(instructor_id: int):
                 start_min, end_min = parsed
                 total_minutes += max(0, end_min - start_min)
                 continue
+            else:
+                # Log unparsed time for debugging
+                logger.warning(f"Could not parse time range from: '{sched.time}' (cleaned: '{time_label}')")
 
             ts = (
                 db.query(models.Timeslot)

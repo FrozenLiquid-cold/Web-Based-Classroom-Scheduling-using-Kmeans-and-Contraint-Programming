@@ -329,6 +329,68 @@ def get_schedules_for_course(
     return schedules
 
 
+def get_instructor_schedules(
+    db: Session,
+    instructor_id: int,
+    semester: Optional[int] = None
+) -> List[models.Schedule]:
+    """
+    Get all schedules for an instructor using stored procedure.
+    
+    This is optimized to fetch all instructor schedules in a single query,
+    eliminating the need for N+1 queries when loading instructor schedule pages.
+    
+    Args:
+        db: Database session
+        instructor_id: Instructor ID
+        semester: Optional semester filter (1 or 2)
+    
+    Returns:
+        List of Schedule models containing all schedules for the instructor
+    """
+    try:
+        # Try using the stored procedure first
+        result = db.execute(
+            text("SELECT * FROM get_instructor_schedules(:p_instructor_id, :p_semester)"),
+            {"p_instructor_id": instructor_id, "p_semester": semester}
+        )
+        
+        schedules = []
+        for row in result:
+            schedule = models.Schedule(
+                id=row.id,
+                subject_id=row.subject_id,
+                instructor_id=row.instructor_id,
+                room_id=row.room_id,
+                day_id=row.day_id,
+                time=row.time,
+                course_id=row.course_id,
+                year=row.year,
+                semester=row.semester,
+                block=row.block,
+            )
+            schedules.append(schedule)
+        
+        return schedules
+    except Exception:
+        # Fall back to direct query if stored procedure doesn't exist
+        query = db.query(models.Schedule).filter(
+            models.Schedule.instructor_id == instructor_id
+        )
+        if semester is not None:
+            query = query.filter(models.Schedule.semester == semester)
+        
+        query = query.order_by(
+            models.Schedule.course_id,
+            models.Schedule.semester,
+            models.Schedule.year,
+            models.Schedule.day_id,
+            models.Schedule.time
+        )
+        
+        return query.all()
+
+
 def get_courses_by_college(
     db: Session,
     college_id: int

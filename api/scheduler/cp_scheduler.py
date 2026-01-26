@@ -72,6 +72,18 @@ def _time_str_to_minutes(value: str) -> Optional[int]:
     return hour * 60 + minute
 
 
+def _minutes_to_time_str(total_minutes: int) -> str:
+    """Convert minutes since midnight to HH:MM format."""
+    if total_minutes is None:
+        return ""
+    h = total_minutes // 60
+    m = total_minutes % 60
+    # Handle AM/PM logic if needed to match frontend expectations?
+    # Frontend handles 24h format (e.g. 13:00) correctly.
+    # 7:00 -> "7:00", 13:00 -> "13:00"
+    return f"{h}:{m:02d}"
+
+
 def is_time_within_preference(start_min: int, end_min: int, pref_start: Optional[int], pref_end: Optional[int]) -> bool:
     """Check if a time range [start_min, end_min] fits within preferences."""
     # If no preferences, it fits
@@ -673,11 +685,15 @@ def generate_subject_start_options(
         thu_day = day_label_to_day.get(THU)
         fri_day = day_label_to_day.get(FRI)
 
-        # Pattern MW (LAB) - uses all blocks on M/W; lab-vs-lec is enforced via
-        # room/instructor eligibility, not via is_lab on the time grid.
+        # Pattern MW (LAB) - Filter to only use is_lab=True slots (90 min)
+        # LAB subjects MUST use LAB-designated time blocks to get proper 1.5-hour duration
         if mon_day and wed_day and MON in slots_by_day and WED in slots_by_day:
-            debug_log("Generating MW LAB patterns")
-            for mon_slot in slots_by_day[MON]:
+            debug_log("Generating MW LAB patterns (filtering for is_lab=True slots)")
+            # Filter to only LAB slots for LAB subjects
+            mon_lab_slots = [s for s in slots_by_day[MON] if s.get("is_lab", False)]
+            wed_lab_slots = [s for s in slots_by_day[WED] if s.get("is_lab", False)]
+            debug_log(f"Filtered LAB slots: M={len(mon_lab_slots)}, W={len(wed_lab_slots)}")
+            for mon_slot in mon_lab_slots:
                 wed_slot = _find_matching_slot(slots_by_day[WED], mon_slot)
                 if wed_slot is None:
                     continue
@@ -718,11 +734,14 @@ def generate_subject_start_options(
                     "num_slots": len(all_slot_indexes),
                 })
 
-        # Pattern TTh (LAB)
+        # Pattern TTh (LAB) - Filter to only use is_lab=True slots (90 min)
         if tue_day and thu_day and TUE in slots_by_day and THU in slots_by_day:
-            debug_log("Generating TTh LAB patterns")
-            for tue_slot in slots_by_day[TUE]:
-                thu_slot = _find_matching_slot(slots_by_day[THU], tue_slot)
+            debug_log("Generating TTh LAB patterns (filtering for is_lab=True slots)")
+            tue_lab_slots = [s for s in slots_by_day[TUE] if s.get("is_lab", False)]
+            thu_lab_slots = [s for s in slots_by_day[THU] if s.get("is_lab", False)]
+            debug_log(f"Filtered LAB slots: T={len(tue_lab_slots)}, TH={len(thu_lab_slots)}")
+            for tue_slot in tue_lab_slots:
+                thu_slot = _find_matching_slot(thu_lab_slots, tue_slot)
                 if thu_slot is None:
                     continue
 
@@ -762,10 +781,12 @@ def generate_subject_start_options(
                     "num_slots": len(all_slot_indexes),
                 })
 
-        # Pattern F (single-day LAB) - single-day is allowed only on Friday.
+        # Pattern F (single-day LAB) - Filter to only use is_lab=True slots (90 min)
         if fri_day and FRI in slots_by_day:
-            debug_log("Generating F LAB patterns")
-            for fri_slot in slots_by_day[FRI]:
+            debug_log("Generating F LAB patterns (filtering for is_lab=True slots)")
+            fri_lab_slots = [s for s in slots_by_day[FRI] if s.get("is_lab", False)]
+            debug_log(f"Filtered LAB slots: F={len(fri_lab_slots)}")
+            for fri_slot in fri_lab_slots:
                 slot_indexes = fri_slot.get("index", [])
                 if isinstance(slot_indexes, int):
                     slot_indexes = [slot_indexes]
@@ -2224,7 +2245,7 @@ def _cp_retry_mini_model(
                     "instructor_id": instructor_id,
                     "room_id": room_id,
                     "day_id": day_info["day_id"],
-                    "time": day_info["time_label"],
+                    "time": day_info["time_label"] if day_info["time_label"] else f"{_minutes_to_time_str(day_info['start_min'])}–{_minutes_to_time_str(day_info['end_min'])}",
                     "year": subj_year,
                     "semester": subject.semester if subject.semester else semester,
                     "block": subj_block_label,
@@ -2248,7 +2269,7 @@ def _cp_retry_mini_model(
                 "instructor_id": instructor_id,
                 "room_id": room_id,
                 "day_id": day_id,
-                "time": time_label,
+                "time": time_label if time_label else f"{_minutes_to_time_str(start_min)}–{_minutes_to_time_str(end_min)}",
                 "year": subj_year,
                 "semester": subject.semester if subject.semester else semester,
                 "block": subj_block_label,
@@ -5549,9 +5570,16 @@ def run_cp_scheduler(
                                 continue
 
                     if not time_label:
-                        from_minutes = lambda m: f"{m//60}:{str(m%60).zfill(2)}"
-                        span_label = f"{from_minutes(int(start_min_day))}–{from_minutes(int(end_min_day))}"
-                        time_label = f"{day_label} {span_label}" if day_label else span_label
+                        s_str = _minutes_to_time_str(int(start_min_day))
+                        e_str = _minutes_to_time_str(int(end_min_day))
+                        span_label = f"{s_str}–{e_str}"
+                        # If day_label is present, we might want to include it, but typically
+                        # the UI expects just the time range if the column is already the day.
+                        # However, to be safe and match previous logic:
+                        # Change: Do not include day_label in the time string.
+                        # The database has separate day_id column, and RoomSchedule.jsx displays day separately.
+                        # Including it breaks frontend parsing (causing "12:00 AM").
+                        time_label = span_label
 
 
                     # If end_block_id still None, set it equal to start_block_id (single-block subject)

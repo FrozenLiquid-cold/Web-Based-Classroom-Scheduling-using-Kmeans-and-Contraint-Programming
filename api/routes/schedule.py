@@ -19,12 +19,69 @@ from api.db import SessionLocal
 from api.job_queue import queue_manager
 from api.scheduler.scheduler import load_schedule, save_schedule as persist_schedule
 from api.scheduler.course_scheduler import schedule_course_refactored
+from sqlalchemy.orm import joinedload
 
 schedule_bp = Blueprint("schedule", __name__)
 
 
 def _get_session() -> SessionLocal:
     return SessionLocal()
+
+
+@schedule_bp.route("/room", methods=["GET"])
+def get_room_schedule():
+    """Get schedule for a specific room, semester, and optional day."""
+    room_id = request.args.get("room_id", type=int)
+    semester = request.args.get("semester", type=int)
+    day_id = request.args.get("day_id", type=int)
+    
+    if not room_id or not semester:
+         return jsonify({"detail": "room_id and semester are required"}), 400
+
+    session = _get_session()
+    try:
+        query = session.query(models.Schedule).filter(
+            models.Schedule.room_id == room_id,
+            models.Schedule.semester == semester
+        )
+        
+        if day_id:
+            query = query.filter(models.Schedule.day_id == day_id)
+            
+        # Eager load relationships
+        query = query.options(
+            joinedload(models.Schedule.subject),
+            joinedload(models.Schedule.instructor),
+            joinedload(models.Schedule.day)
+        )
+        
+        schedules = query.all()
+        
+        results = []
+        for s in schedules:
+            instructor_name = ""
+            if s.instructor:
+                instructor_name = f"{s.instructor.first_name} {s.instructor.last_name}"
+                
+            results.append({
+                "id": s.id,
+                "time": s.time,
+                "day_id": s.day_id,
+                "day_label": s.day.label if s.day else "",
+                "subject_code": s.subject.code if s.subject else "",
+                "subject_description": s.subject.description if s.subject else "",
+                "type": s.subject.type if s.subject else "",
+                "instructor_name": instructor_name,
+                "block": s.block,
+                "year": s.year,
+                "semester": s.semester
+            })
+            
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        session.close()
 
 
 @schedule_bp.route("/course", methods=["POST"])
@@ -397,6 +454,99 @@ def load_schedule_route():
                 "count": len(items),
             }
         )
+    finally:
+        db.close()
+
+
+@schedule_bp.route("/load-instructor", methods=["GET"])
+def load_instructor_schedule():
+    """
+    Load all schedules for an instructor in a single optimized query.
+    
+    This endpoint eliminates the N+1 query problem on the instructor Schedule page
+    by returning all schedules for an instructor across all courses in one call.
+    
+    Query params:
+        instructor_id: Required. The instructor's ID.
+        semester: Optional. Filter by semester (1 or 2).
+    
+    Returns:
+        {
+            "status": "success",
+            "instructor_id": <id>,
+            "semester": <semester or null>,
+            "items": [...schedule items...],
+            "course_ids": [list of unique course IDs with schedules],
+            "count": <total count>
+        }
+    """
+    instructor_id = request.args.get("instructor_id", type=int)
+    if not instructor_id:
+        response = jsonify({"detail": "instructor_id query parameter is required"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 400
+    
+    semester = request.args.get("semester", type=int)
+    
+    db = _get_session()
+    try:
+        # Use direct ORM query for reliable cross-database compatibility
+        # This leverages the idx_schedules_instructor_id index for optimization
+        query = db.query(models.Schedule).filter(
+            models.Schedule.instructor_id == instructor_id
+        )
+        if semester is not None:
+            query = query.filter(models.Schedule.semester == semester)
+        
+        query = query.order_by(
+            models.Schedule.course_id,
+            models.Schedule.semester,
+            models.Schedule.year,
+            models.Schedule.day_id,
+            models.Schedule.time
+        )
+        
+        schedules = query.all()
+        
+        # Build items list and collect unique course IDs
+        course_ids = set()
+        items = []
+        for sched in schedules:
+            course_ids.add(sched.course_id)
+            items.append({
+                "id": sched.id,
+                "subject_id": sched.subject_id,
+                "instructor_id": sched.instructor_id,
+                "room_id": sched.room_id,
+                "day_id": sched.day_id,
+                "time": sched.time,
+                "course_id": sched.course_id,
+                "year": sched.year,
+                "semester": sched.semester,
+                "block": getattr(sched, "block", None),
+            })
+        
+        response = jsonify({
+            "status": "success",
+            "instructor_id": instructor_id,
+            "semester": semester,
+            "items": items,
+            "course_ids": sorted(list(course_ids)),
+            "count": len(items),
+        })
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Error loading instructor schedules: {e}")
+        response = jsonify({
+            "status": "error",
+            "detail": str(e),
+            "items": [],
+            "course_ids": [],
+            "count": 0
+        })
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 500
     finally:
         db.close()
 

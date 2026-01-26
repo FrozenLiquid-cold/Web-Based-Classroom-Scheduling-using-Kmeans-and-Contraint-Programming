@@ -15,6 +15,7 @@ import Buildings from './pages/Registrar/Buildings'
 import BuildingDistances from './pages/Registrar/BuildingDistances'
 import Schedule from './pages/Registrar/Schedule'
 import InstructorSchedule from './pages/Instructor/Schedule'
+import InstructorSwapRequests from './pages/Instructor/SwapRequests'
 import Curriculum from './pages/Registrar/Curriculum'
 import Notifications from './pages/User/Notifications'
 import UsersLayout from './pages/User/Layout'
@@ -23,6 +24,7 @@ import InstructorAccount from './pages/Instructor/Account'
 import AdminLayout from './layouts/AdminLayout'
 import AdminDashboard from './pages/Admin/Dashboard'
 import AdminUsers from './pages/Admin/Users'
+import AdminRoomSchedule from './pages/Admin/RoomSchedule'
 import { isAuthenticated } from './store/auth'
 
 function Guard({ children, role }) {
@@ -73,6 +75,7 @@ export default function App() {
 				<Route index element={<Navigate to="dashboard" replace />} />
 				<Route path="dashboard" element={<InstructorDashboard />} />
 				<Route path="schedule" element={<InstructorSchedule />} />
+				<Route path="swap-requests" element={<InstructorSwapRequests />} />
 				<Route path="account" element={<InstructorAccount />} />
 				<Route path="notifications" element={<UsersLayout />}>
 					<Route index element={<Notifications />} />
@@ -90,6 +93,7 @@ export default function App() {
 				<Route index element={<Navigate to="dashboard" replace />} />
 				<Route path="dashboard" element={<AdminDashboard />} />
 				<Route path="users" element={<AdminUsers />} />
+				<Route path="room-schedule" element={<AdminRoomSchedule />} />
 			</Route>
 		</Routes>
 	)

@@ -1,5 +1,6 @@
 """SQLAlchemy models for JRMSU Scheduler"""
-from sqlalchemy import Column, Integer, String, ForeignKey, Text, CheckConstraint, UniqueConstraint, Boolean, Time
+from sqlalchemy import Column, Integer, String, ForeignKey, Text, CheckConstraint, UniqueConstraint, Boolean, Time, DateTime
+from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 
 # Import Base from db to avoid circular imports
@@ -228,3 +229,42 @@ class Schedule(Base):
         UniqueConstraint("instructor_id", "day_id", "time", "year", "semester", name="uq_instructor_time"),
     )
 
+
+class SwapRequest(Base):
+    """
+    Stores instructor-to-instructor schedule swap requests.
+    
+    When swapping, only the time/day/room are exchanged between schedules.
+    Each instructor keeps teaching their own subject.
+    """
+    __tablename__ = "swap_requests"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # The schedule the requester wants to swap away
+    requester_schedule_id = Column(Integer, ForeignKey("schedules.id"), nullable=False)
+    # The schedule the requester wants to get (from target instructor)
+    target_schedule_id = Column(Integer, ForeignKey("schedules.id"), nullable=False)
+    
+    # The instructors involved
+    requester_id = Column(Integer, ForeignKey("instructors.id"), nullable=False)
+    target_id = Column(Integer, ForeignKey("instructors.id"), nullable=False)
+    
+    # Request details
+    reason = Column(Text, nullable=True)
+    status = Column(String(20), default="pending", nullable=False)  # pending, accepted, rejected
+    rejection_reason = Column(Text, nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=func.now())
+    responded_at = Column(DateTime, nullable=True)
+    
+    # Relationships
+    requester_schedule = relationship("Schedule", foreign_keys=[requester_schedule_id])
+    target_schedule = relationship("Schedule", foreign_keys=[target_schedule_id])
+    requester = relationship("Instructor", foreign_keys=[requester_id])
+    target = relationship("Instructor", foreign_keys=[target_id])
+    
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'accepted', 'rejected')", name="check_swap_status"),
+    )
