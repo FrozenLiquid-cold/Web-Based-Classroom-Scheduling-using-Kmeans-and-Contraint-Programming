@@ -268,3 +268,28 @@ class SwapRequest(Base):
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'accepted', 'rejected')", name="check_swap_status"),
     )
+
+
+class CurriculumSubject(Base):
+    """
+    Represents a subject in a curriculum (parsed from PDF).
+    This table stores the 'official' curriculum structure for a course.
+    """
+    __tablename__ = "curriculum_subjects"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
+    year_level = Column(Integer, nullable=False)  # 1, 2, 3, 4
+    semester = Column(Integer, nullable=False)    # 1, 2
+    code = Column(String(50), nullable=False)
+    description = Column(Text, nullable=False)
+    units = Column(Integer, nullable=False, default=0)
+    prerequisite = Column(String(255), nullable=True)
+    
+    # New fields for structured layout
+    is_exit_point = Column(Boolean, default=False)
+    extra_info = Column(Text, nullable=True) # For exit point labels or extra info
+    
+    # Establish relationship to Course if needed, though mostly used for filtering
+    course = relationship("Course")
+

@@ -6,6 +6,7 @@
 }
 
 /* Local font faces (drop the actual files into public/fonts/) */
+/* 
 @font-face {
   font-family: 'Lastica';
   src: url('/fonts/Lastica.woff2') format('woff2');
@@ -21,7 +22,10 @@
   src: url('/fonts/ArialMTPro.woff2') format('woff2');
   font-display: swap;
 }
+*/
+
 /* Archivo Black and Poppins can be provided locally as well; Google-hosted fallbacks can also work */
+/*
 @font-face {
   font-family: 'Archivo Black';
   src: url('/fonts/ArchivoBlack.woff2') format('woff2');
@@ -38,7 +42,8 @@
   src: url('/fonts/Poppins-SemiBold.woff2') format('woff2');
   font-display: swap;
   font-weight: 600;
-}
+} 
+*/
 
 body {
 	background-color: var(--color-light);

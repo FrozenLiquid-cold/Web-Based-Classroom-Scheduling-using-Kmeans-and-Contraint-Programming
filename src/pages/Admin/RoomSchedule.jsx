@@ -67,56 +67,161 @@ export default function RoomSchedule() {
         fetchSchedule()
     }, [selectedRoom, semester, selectedDay])
 
-    // Extract start time in minutes from a time string
-    const extractStartMinutes = (timeStr) => {
-        if (!timeStr) return null
-        const match = timeStr.match(/(\d{1,2}):(\d{2})/)
-        if (match) {
-            return parseInt(match[1]) * 60 + parseInt(match[2])
+    // Robust time parser using Regex
+    const parseTimeRange = (timeStr) => {
+        if (!timeStr) return { start: 0, end: 0 };
+
+        // Match two times separated by hyphen, en-dash, or em-dash
+        // Groups: 1=H1, 2=M1, 3=AM/PM1, 4=H2, 5=M2, 6=AM/PM2
+        const regex = /(\d{1,2})[:.](\d{2})\s*(AM|PM)?\s*[-–—]\s*(\d{1,2})[:.](\d{2})\s*(AM|PM)?/i;
+        const match = timeStr.match(regex);
+
+        if (!match) {
+            // Fallback for simple formats or log error
+            console.warn("Invalid time format:", timeStr);
+            return { start: 0, end: 0 };
         }
-        return null
+
+        const toMinutes = (hStr, mStr, pStr) => {
+            let h = parseInt(hStr);
+            const m = parseInt(mStr);
+            const p = pStr ? pStr.toUpperCase() : null;
+
+            // Heuristic for missing AM/PM: 
+            // 7-11 is AM, 12 is PM, 1-6 is PM (unless specifically AM)
+            // This is loose but prevents crashes
+
+            if (p === 'PM' && h !== 12) h += 12;
+            if (p === 'AM' && h === 12) h = 0;
+
+            // If no period, assume business hours (7-6) logic? 
+            // Better to assume AM if < 7, PM if < 7? No, strictly 12h leads to issues.
+            // Let's rely on standard fallback if p is null: existing logic was h
+
+            return h * 60 + m;
+        };
+
+        // Determine implicit AM/PM if missing
+        // If first has no period, inherit from second? (e.g. 7:30 - 9:00 AM)
+        let p1 = match[3];
+        let p2 = match[6];
+
+        // Convert
+        const start = toMinutes(match[1], match[2], p1);
+        let end = toMinutes(match[4], match[5], p2);
+
+        // Fix for "1:00" interpreted as AM when it should be PM (if start is > end)
+        // e.g. 11:30 - 1:00. 11:30=690, 1:00=60. 690 > 60. End must be PM.
+        if (end < start) {
+            end += 12 * 60;
+        }
+
+        return { start, end };
+    };
+
+    // Convert minutes back to "7:30 AM" format
+    const minutesToTime = (mins) => {
+        const h = Math.floor(mins / 60);
+        const m = mins % 60;
+        const period = h >= 12 ? 'PM' : 'AM';
+        const h12 = h % 12 || 12;
+        const mStr = m.toString().padStart(2, '0');
+        return `${h12}:${mStr} ${period}`;
     }
 
-    // Build full day grid with occupied/vacant slots
+    // Build smart timeline with Error Boundary
     const fullDayGrid = useMemo(() => {
-        // Track which schedules have been assigned to prevent duplicates
-        const assignedScheduleIds = new Set()
+        if (!scheduleData) return [];
 
-        // Build the grid
-        return MASTER_TIME_SLOTS.map((masterSlot, idx) => {
-            // Find schedules that start within this master slot's time range
-            const matchingSchedules = scheduleData.filter(slot => {
-                // Skip if already assigned to another slot
-                if (assignedScheduleIds.has(slot.id)) return false
+        try {
+            const START_OF_DAY = 7 * 60; // 7:00 AM
+            const END_OF_DAY = 19 * 60;  // 7:00 PM
 
-                const startMin = extractStartMinutes(slot.time)
-                if (startMin === null) return false
+            const formatRange = (s, e) => `${minutesToTime(s)} – ${minutesToTime(e)}`;
+            const schedulesByDay = {};
+            days.forEach(d => { schedulesByDay[d.id] = [] });
 
-                // Check if schedule starts within this master slot
-                return startMin >= masterSlot.start && startMin < masterSlot.end
-            })
+            scheduleData.forEach(s => {
+                if (!schedulesByDay[s.day_id]) schedulesByDay[s.day_id] = [];
+                const range = parseTimeRange(s.time);
+                // Filter invalid ranges to prevent layout breaking
+                if (range.start > 0 || range.end > 0) {
+                    schedulesByDay[s.day_id].push({ ...s, _start: range.start, _end: range.end });
+                }
+            });
 
-            // Mark these schedules as assigned
-            matchingSchedules.forEach(s => assignedScheduleIds.add(s.id))
+            // Checkpoints for standard slots
+            const SLOT_BOUNDARIES = [510, 600, 690, 780, 870, 960, 1050, 1140];
 
-            if (matchingSchedules.length > 0) {
-                // Return occupied slots
-                return matchingSchedules.map((schedule, subIdx) => ({
-                    ...schedule,
-                    masterSlotLabel: masterSlot.label,
-                    isVacant: false,
-                    key: `${idx}-${subIdx}-${schedule.id}`
-                }))
-            } else {
-                // Return vacant slot
-                return [{
-                    masterSlotLabel: masterSlot.label,
-                    isVacant: true,
-                    key: `${idx}-vacant`
-                }]
+            const pushVacantSlots = (timeline, start, end, day) => {
+                if (start >= end) return;
+                const breaks = SLOT_BOUNDARIES.filter(b => b > start && b < end);
+                let current = start;
+                breaks.forEach(b => {
+                    timeline.push({
+                        isVacant: true,
+                        day_label: day.label,
+                        time: formatRange(current, b),
+                        key: `vacant-${day.id}-${current}`
+                    });
+                    current = b;
+                });
+                if (current < end) {
+                    timeline.push({
+                        isVacant: true,
+                        day_label: day.label,
+                        time: formatRange(current, end),
+                        key: `vacant-${day.id}-${current}`
+                    });
+                }
             }
-        }).flat()
-    }, [scheduleData])
+
+            let timeline = [];
+            const daysToProcess = selectedDay
+                ? days.filter(d => String(d.id) === String(selectedDay))
+                : days;
+
+            daysToProcess.forEach(day => {
+                const dayScheds = schedulesByDay[day.id] || [];
+                dayScheds.sort((a, b) => a._start - b._start);
+
+                let cursor = START_OF_DAY;
+
+                dayScheds.forEach((sched) => {
+                    // Gap before this schedule?
+                    if (sched._start > cursor) {
+                        pushVacantSlots(timeline, cursor, sched._start, day);
+                    }
+
+                    // Check for conflict (overlap with previous)
+                    // If sched starts before cursor, it overlaps with what we just processed
+                    const isConflict = sched._start < cursor;
+
+                    // Add the schedule itself
+                    timeline.push({
+                        ...sched,
+                        isVacant: false,
+                        isConflict: isConflict,
+                        key: `sched-${sched.id}`
+                    });
+
+                    // Move cursor
+                    // Handle overlaps: if cursor was already passed this schedule's end (nested?), don't move back
+                    cursor = Math.max(cursor, sched._end);
+                });
+
+                if (cursor < END_OF_DAY) {
+                    pushVacantSlots(timeline, cursor, END_OF_DAY, day);
+                }
+            });
+
+            return timeline;
+
+        } catch (err) {
+            console.error("Critical error building timeline:", err);
+            return []; // Prevent page crash
+        }
+    }, [scheduleData, days, selectedDay]);
 
     // Helper to format time robustly
     const formatTime = (timeStr) => {
@@ -252,10 +357,15 @@ export default function RoomSchedule() {
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {fullDayGrid.map((slot, idx) => (
-                                    <tr key={slot.key} className={`transition-colors ${slot.isVacant ? 'bg-green-50/30 hover:bg-green-50/50' : 'hover:bg-slate-50'}`}>
+                                    <tr key={slot.key} className={`transition-colors ${slot.isVacant
+                                        ? 'bg-green-50/30 hover:bg-green-50/50'
+                                        : slot.isConflict
+                                            ? 'bg-red-50 border-l-4 border-red-500'
+                                            : 'hover:bg-slate-50'
+                                        }`}>
                                         <td className="px-6 py-4 text-slate-400 font-mono text-sm">{idx + 1}</td>
                                         <td className="px-6 py-4 text-slate-600 font-mono text-sm font-medium">
-                                            {slot.isVacant ? slot.masterSlotLabel : formatTime(slot.time)}
+                                            {slot.isVacant ? slot.time : formatTime(slot.time)}
                                         </td>
                                         {!selectedDay && (
                                             <td className="px-6 py-4">
@@ -272,6 +382,7 @@ export default function RoomSchedule() {
                                             <span className={`text-sm ${slot.isVacant ? 'text-slate-400 italic' : 'text-slate-800 font-semibold'}`}>
                                                 {slot.isVacant ? '—' : (slot.subject_code || '—')}
                                             </span>
+                                            {slot.isConflict && <span className="ml-2 px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded uppercase">Double Booked</span>}
                                         </td>
                                         <td className="px-6 py-4 text-sm max-w-xs truncate" title={slot.subject_description}>
                                             <span className={slot.isVacant ? 'text-slate-400 italic' : 'text-slate-600'}>
@@ -312,10 +423,21 @@ export default function RoomSchedule() {
                                             ) : (
                                                 <div className="flex items-center gap-1.5">
                                                     <span className="relative flex h-2.5 w-2.5">
-                                                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                                                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500"></span>
+                                                        {slot.isConflict ? (
+                                                            <>
+                                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                                                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-600"></span>
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                                                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500"></span>
+                                                            </>
+                                                        )}
                                                     </span>
-                                                    <span className="text-xs font-medium text-red-600">Occupied</span>
+                                                    <span className={`text-xs font-medium ${slot.isConflict ? 'text-red-700 font-bold' : 'text-red-600'}`}>
+                                                        {slot.isConflict ? 'CONFLICT' : 'Occupied'}
+                                                    </span>
                                                 </div>
                                             )}
                                         </td>

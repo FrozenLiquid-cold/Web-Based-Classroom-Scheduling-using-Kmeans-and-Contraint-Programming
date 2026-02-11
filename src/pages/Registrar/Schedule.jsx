@@ -1,12 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import { list } from "../../store/db";
 import {
   generateSchedule as generateScheduleApi,
   getScheduleStatus,
   loadSchedule as loadScheduleApi,
   saveSchedule,
+
   validateScheduleItem,
+  getSchedulingSuggestions,
+  checkAvailability
 } from "../../services/api";
+import SchedulerDiagnostics from "../../components/SchedulerDiagnostics";
 
 const YEARS = [1, 2, 3, 4];
 const BLOCK_OPTIONS = [1, 2, 3, 4];
@@ -45,6 +49,7 @@ export default function RegistrarSchedule() {
   const [isLoadingSavedSchedule, setIsLoadingSavedSchedule] = useState(false);
   const [savedScheduleMessage, setSavedScheduleMessage] = useState("");
   const [hasCheckedSavedSchedule, setHasCheckedSavedSchedule] = useState(false);
+  const [diagnostics, setDiagnostics] = useState({});
 
   // Animation states for progressive subject reveal
   const [revealedCount, setRevealedCount] = useState(0);
@@ -52,8 +57,16 @@ export default function RegistrarSchedule() {
 
   // Edit / Override states
   const [editingItem, setEditingItem] = useState(null);
+  const [resolvingItem, setResolvingItem] = useState(null);
+  const [availableResources, setAvailableResources] = useState({ rooms: [], instructors: [] });
+  const [isCheckingAvailability, setIsCheckingAvailability] = useState(false);
+  const [suggestions, setSuggestions] = useState([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
   const [validationResult, setValidationResult] = useState({ valid: true, messages: [] });
   const [isValidating, setIsValidating] = useState(false);
+
+  // Recommendations modal state
+  const [recommendationModalItem, setRecommendationModalItem] = useState(null);
 
 
 
@@ -160,11 +173,14 @@ export default function RegistrarSchedule() {
     };
   }, [form.course_id, form.year, form.semester]);
 
+
+
   const handleSubmit = async (event) => {
     event.preventDefault();
     setSubmitting(true);
     setError("");
     setSchedule([]);
+    setDiagnostics({});
     setJobStatus("initializing");
     setStatusMessage("Initializing scheduler...");
     setProgress(10);
@@ -188,6 +204,7 @@ export default function RegistrarSchedule() {
         // Use result.items or result.result (array) - NOT subjects
         const scheduledItems = result.items || result.result || [];
         setSchedule(withUiIds(scheduledItems));
+        setDiagnostics(result.diagnostics || {});
         setJobStatus("succeeded");
         setJobId(null);
         setSubmitting(false);
@@ -228,13 +245,24 @@ export default function RegistrarSchedule() {
         }
 
         if (status.status === "succeeded" || status.status === "completed") {
-          // Use status.result directly (array of scheduled items) - NOT subjects
-          // Backend returns: {"status": "completed", "result": [scheduled_items...]}
-          const scheduledItems = Array.isArray(status.result)
-            ? status.result
-            : (status.result?.items || []);
-          setSchedule(withUiIds(scheduledItems));
+          // Handle result format where result might be wrapped in another result object
+          // status.result from API is typically { items: [], count: N, diagnostics: {} } OR just []
+          const finalResult = status.result || [];
+
+          let scheduledItems = [];
+          let resultDiagnostics = {};
+
+          if (Array.isArray(finalResult)) {
+            scheduledItems = finalResult;
+            resultDiagnostics = status.diagnostics || {};
+          } else if (typeof finalResult === 'object') {
+            scheduledItems = finalResult.items || finalResult.scheduled || [];
+            resultDiagnostics = finalResult.diagnostics || status.diagnostics || {};
+          }
+
           setJobStatus("succeeded");
+          setSchedule(withUiIds(scheduledItems));
+          setDiagnostics(resultDiagnostics);
           setProgress(100);
           setJobId(null);
           setSubmitting(false);
@@ -598,14 +626,22 @@ export default function RegistrarSchedule() {
 
       // Room conflict
       if (proposedRoomId && itemRoomId && proposedRoomId === itemRoomId) {
-        const subjectCode = getSubjectCode(item.subject_id);
-        conflicts.push(`Room Conflict (Local): Room is occupied by ${subjectCode} at this time.`);
+        const proposedRoomName = getRoomName(proposedRoomId);
+        // Exception: FIELD room allows overlaps (multi-class area)
+        if (!proposedRoomName || !proposedRoomName.includes("FIELD")) {
+          const subjectCode = getSubjectCode(item.subject_id);
+          conflicts.push(`Room Conflict (Local): Room is occupied by ${subjectCode} at this time.`);
+        }
       }
 
       // Instructor conflict
       if (proposedInstrId && itemInstrId && proposedInstrId === itemInstrId) {
-        const subjectCode = getSubjectCode(item.subject_id);
-        conflicts.push(`Instructor Conflict (Local): Instructor is teaching ${subjectCode} at this time.`);
+        const proposedRoomName = getRoomName(proposedRoomId);
+        // Exception: If using FIELD, assume mass supervision is allowed
+        if (!proposedRoomName || !proposedRoomName.includes("FIELD")) {
+          const subjectCode = getSubjectCode(item.subject_id);
+          conflicts.push(`Instructor Conflict (Local): Instructor is teaching ${subjectCode} at this time.`);
+        }
       }
 
       // Student group conflict (same block)
@@ -656,7 +692,7 @@ export default function RegistrarSchedule() {
     if (!timeStr) return null;
 
     // Normalize dashes
-    const normalized = timeStr.replace(/[–—]/g, "-");
+    const normalized = timeStr.replace(/[â€“â€”]/g, "-");
     const parts = normalized.split("-");
 
     if (parts.length >= 2) {
@@ -810,27 +846,27 @@ export default function RegistrarSchedule() {
 
   const getSubjectDescription = (id) => {
     const subject = getSubject(id);
-    return subject?.description || "—";
+    return subject?.description || "\u2014";
   };
 
   const getSubjectType = (id) => {
     const subject = getSubject(id);
-    return subject?.type || "—";
+    return subject?.type || "\u2014";
   };
 
   const getSubjectUnit = (id) => {
     const subject = getSubject(id);
-    return subject?.unit ?? "—";
+    return subject?.unit ?? "\u2014";
   };
 
   const getRoomName = (id) => {
-    if (!id) return "—";
+    if (!id) return "\u2014";
     const room = rooms.find((r) => r.id === id);
     return room?.name || `ID: ${id}`;
   };
 
   const getInstructorName = (id) => {
-    if (!id) return "—";
+    if (!id) return "\u2014";
     const instructor = instructors.find((i) => i.id === id);
     if (!instructor) return `ID: ${id}`;
     const firstName = instructor.first_name || instructor.firstName || "";
@@ -840,7 +876,7 @@ export default function RegistrarSchedule() {
   };
 
   const getDayName = (id) => {
-    if (!id) return "—";
+    if (!id) return "\u2014";
     const day = days.find((d) => d.id === id);
     return day?.label || `ID: ${id}`;
   };
@@ -851,14 +887,14 @@ export default function RegistrarSchedule() {
       return value;
     }
     // Normalize dashes and strip day prefixes (M, T, W, TH, F, S followed by space)
-    let normalized = value.replace(/[–—−]/g, "-");
+    let normalized = value.replace(/[\u2013\u2014\u2212]/g, "-");
     // Remove day prefix at the start (e.g., "T 17:30" -> "17:30", "M-W 7:00" -> "7:00")
     normalized = normalized.replace(/^(M|T|W|TH|F|S|M-W|T-TH)\s+/i, "");
     return normalized;
   };
 
   const formatTime12Hour = (timeStrRaw) => {
-    if (!timeStrRaw) return "—";
+    if (!timeStrRaw) return "\u2014";
     const timeStr = normalizeTimeRangeString(timeStrRaw);
 
     // Handle format like "450-570" (minutes from midnight)
@@ -902,7 +938,7 @@ export default function RegistrarSchedule() {
   };
 
   const convert24To12 = (time24) => {
-    if (!time24) return "—";
+    if (!time24) return "\u2014";
     const match = time24.match(/^(\d{1,2}):(\d{2})/);
     if (!match) return time24;
 
@@ -1009,7 +1045,7 @@ export default function RegistrarSchedule() {
         ...rest,
         day_id: dayIds[0] ?? group.day_id ?? group.dayId ?? null,
         _dayIds: dayIds, // Keep the day IDs for edit modal
-        _combinedDaysLabel: combinedDays || (labels[0] || "—"),
+        _combinedDaysLabel: combinedDays || (labels[0] || "\u2014"),
       };
     });
 
@@ -1099,7 +1135,7 @@ export default function RegistrarSchedule() {
       return formatTime12Hour(timeStr);
     }
 
-    return "—";
+    return "\u2014";
   };
 
   const renderScheduleRow = (slot, idx) => {
@@ -1121,6 +1157,30 @@ export default function RegistrarSchedule() {
     const instructorId = slot.instructor_id || slot.instructorId;
     const instructorLabel = getInstructorName(instructorId);
 
+    // Diagnostics check for unscheduled items
+    const isUnscheduled = !dayId && !slot.time && !roomId;
+
+
+
+
+    // Try multiple lookup strategies to handle type mismatches
+    const diagEntry = diagnostics[subjectId] ||
+      diagnostics[String(subjectId)] ||
+      diagnostics[Number(subjectId)];
+
+    let failureReason = null;
+    let failureDetail = null;
+
+    if (diagEntry) {
+      if (typeof diagEntry === 'string') {
+        failureReason = diagEntry;
+        failureDetail = "Unscheduled subject";
+      } else if (typeof diagEntry === 'object') {
+        failureReason = diagEntry.failure_reason;
+        failureDetail = diagEntry.detail || JSON.stringify(diagEntry.metrics) || "No details available";
+      }
+    }
+
     // Get block label (Block A, Block B, etc.)
     const blockLabel = slot._blockLabel || "";
 
@@ -1136,7 +1196,7 @@ export default function RegistrarSchedule() {
       <tr
         key={key}
         onClick={() => openEditModal(slot)}
-        title="Click to edit schedule"
+        title={isUnscheduled ? (failureDetail || "Unscheduled") : "Click to edit schedule"}
         className={`hover:bg-blue-50 transition-all duration-300 ease-out cursor-pointer ${isVisible
           ? 'opacity-100 translate-y-0'
           : 'opacity-0 translate-y-2'
@@ -1152,8 +1212,65 @@ export default function RegistrarSchedule() {
         <td className="px-4 py-2 text-sm text-gray-700">{subjectType}</td>
         <td className="px-4 py-2 text-sm text-gray-700">{subjectUnit}</td>
         <td className="px-4 py-2 text-sm text-gray-700">{dayLabel}</td>
-        <td className="px-4 py-2 text-sm text-gray-700">{timeLabel}</td>
-        <td className="px-4 py-2 text-sm text-gray-700">{roomLabel}</td>
+        <td className="px-4 py-2 text-sm text-gray-700">
+          {isUnscheduled ? (
+            <div className="flex flex-col items-start gap-1">
+              {failureReason && (
+                <span className="text-red-600 font-semibold text-xs bg-red-50 px-2 py-1 rounded border border-red-100">
+                  {failureReason}
+                </span>
+              )}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const recs = diagEntry?.recommendations || [];
+                  setResolvingItem({ ...slot, failureReason, recommendations: recs });
+                }}
+                className="text-white text-xs bg-blue-500 hover:bg-blue-600 px-2 py-1 rounded shadow-sm flex items-center gap-1 active:scale-95 transition-transform"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" />
+                </svg>
+                Resolve
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span>{timeLabel}</span>
+              {slot.is_recommended && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    // Get recommendations from diagnostics
+                    const diagEntry = diagnostics[slot.subject_id] || diagnostics[String(slot.subject_id)];
+                    const alternatives = diagEntry?.recommendations || [];
+                    setRecommendationModalItem({ ...slot, alternatives });
+                  }}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-amber-700 bg-amber-100 border border-amber-200 rounded-full hover:bg-amber-200 transition-colors cursor-pointer"
+                  title="Click to see alternative scheduling options"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                  </svg>
+                  Suggested
+                </button>
+              )}
+            </div>
+          )}
+        </td>
+        <td className="px-4 py-2 text-sm text-gray-700">
+          <div className="flex items-center gap-2">
+            <span>{roomLabel}</span>
+            {slot.is_soft_constraint && (
+              <span
+                className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-orange-100 text-orange-700 border border-orange-200 uppercase tracking-wide cursor-help"
+                title="Preferred room was unavailable (Simple Fallback applied)"
+              >
+                Fallback
+              </span>
+            )}
+          </div>
+        </td>
         <td className="px-4 py-2 text-sm text-gray-700">{instructorLabel}</td>
       </tr>
     );
@@ -1363,6 +1480,12 @@ export default function RegistrarSchedule() {
         </p>
       )}
 
+      {/* Scheduler Diagnostics Panel */}
+      <SchedulerDiagnostics
+        diagnostics={diagnostics}
+        isVisible={jobStatus === "succeeded" && Object.keys(diagnostics).length > 0}
+      />
+
       {Object.keys(expandedSchedule).length > 0 && (
         <div className="mt-6">
           <div className="flex justify-between items-center mb-3">
@@ -1453,7 +1576,7 @@ export default function RegistrarSchedule() {
           Scheduler status:{" "}
           <span className="font-semibold capitalize">{jobStatus}</span>
           {jobStatus === "queued" || jobStatus === "running"
-            ? " — please keep this page open while we generate the schedule."
+            ? " \u2014 please keep this page open while we generate the schedule."
             : ""}
         </p>
       )}
@@ -1465,6 +1588,16 @@ export default function RegistrarSchedule() {
             ? 'ring-4 ring-red-500 shadow-[0_0_50px_rgba(239,68,68,0.4)]'
             : 'ring-1 ring-gray-200'
             }`}>
+
+            {/* Availability Effect */}
+            <EffectCheckAvailability
+              editingItem={editingItem}
+              form={form}
+              setAvailableResources={setAvailableResources}
+              setIsCheckingAvailability={setIsCheckingAvailability}
+              parseTimeToMinutes={parseTimeToMinutes}
+            />
+
             {/* Header */}
             <div className={`px-8 py-5 flex justify-between items-center ${validationResult.messages.length > 0
               ? 'bg-gradient-to-r from-red-600 to-red-500'
@@ -1472,7 +1605,7 @@ export default function RegistrarSchedule() {
               }`}>
               <div>
                 <h3 className="font-bold text-xl text-white tracking-wide">
-                  {validationResult.messages.length > 0 ? "⚠️ Conflict Detected" : "📝 Edit Schedule"}
+                  {validationResult.messages.length > 0 ? "\u26A0\uFE0F Conflict Detected" : "\uD83D\uDCDD Edit Schedule"}
                 </h3>
                 {validationResult.messages.length === 0 && (
                   <p className="text-white/70 text-sm mt-0.5">Modify the schedule details below</p>
@@ -1501,7 +1634,7 @@ export default function RegistrarSchedule() {
                     <div className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Subject</div>
                     <div className="font-bold text-gray-900 text-lg">
                       {getSubjectCode(editingItem.subject_id)}
-                      <span className="text-gray-300 mx-2">•</span>
+                      <span className="text-gray-300 mx-2">{'\u2022'}</span>
                       <span className="font-medium text-gray-600">{getSubjectDescription(editingItem.subject_id)}</span>
                     </div>
                   </div>
@@ -1582,7 +1715,7 @@ export default function RegistrarSchedule() {
                           }`}
                       />
                     </div>
-                    <span className="text-gray-400 font-medium">–</span>
+                    <span className="text-gray-400 font-medium">{'\u2013'}</span>
                     <div className="relative flex-1">
                       <input
                         type="time"
@@ -1606,7 +1739,35 @@ export default function RegistrarSchedule() {
                       }`}
                   >
                     <option value="">-- No Room --</option>
-                    {rooms.map(r => <option key={r.id} value={r.id}>{r.name} {r.building_id ? `(Bldg)` : ''}</option>)}
+                    {rooms.map(r => {
+                      const isAvail = availableResources.rooms.includes(r.id);
+
+                      // Check for NSTP special case
+                      const subject = getSubject(editingItem.subject_id);
+                      const isNSTP = subject && subject.code.toUpperCase().startsWith("NSTP");
+                      const isField = r.name.toUpperCase().includes("FIELD");
+
+                      // Logic:
+                      // 1. If Room is FIELD and Subject is NSTP -> FORCE ENABLE (ignore availability)
+                      // 2. If Room is FIELD and Subject is NOT NSTP -> FORCE DISABLE/HIDE
+                      // 3. Otherwise -> Use standard availability check
+
+                      let isDisabled = !isAvail;
+
+                      if (isField) {
+                        if (isNSTP) isDisabled = false; // Always allow FIELD for NSTP
+                        else isDisabled = true;         // Never allow FIELD for non-NSTP
+                      }
+
+                      // Always show current selection even if technically "busy" (maybe it's self)
+                      // But for override, we usually want to pick a NEW room. 
+                      // Let's mark busy ones.
+                      return (
+                        <option key={r.id} value={r.id} disabled={isDisabled} className={isDisabled ? "text-gray-400 bg-gray-50" : "font-medium"}>
+                          {r.name} {r.building_id ? `(Bldg)` : ''} {!isAvail & !isField ? "(Busy)" : ""} {isField && !isAvail ? "(Shared)" : ""}
+                        </option>
+                      );
+                    })}
                   </select>
                 </div>
 
@@ -1620,11 +1781,31 @@ export default function RegistrarSchedule() {
                       }`}
                   >
                     <option value="">-- No Instructor --</option>
-                    {instructors.map(i => (
-                      <option key={i.id} value={i.id}>
-                        {i.last_name}, {i.first_name}
-                      </option>
-                    ))}
+                    {instructors
+                      .filter(i => {
+                        // Filter: Only show eligible instructors if a restriction list exists
+                        if (availableResources.eligibleInstructors && availableResources.eligibleInstructors.length > 0) {
+                          const isEligible = availableResources.eligibleInstructors.includes(i.id);
+                          return isEligible;
+                        }
+                        // If no restriction list (e.g. backend returned empty for some reason, or no subject_id),
+                        // we might normally show all. But for "Smart Override" with subject_id, 
+                        // empty eligible list means NO ONE is eligible. 
+                        if (availableResources.eligibleInstructors) {
+                          console.log("Eligible list exists but empty -> Hiding all");
+                          return false;
+                        }
+
+                        return true;
+                      })
+                      .map(i => {
+                        const isAvail = availableResources.instructors.includes(i.id);
+                        return (
+                          <option key={i.id} value={i.id} className={!isAvail ? "text-gray-400 bg-gray-50" : "font-medium"}>
+                            {i.last_name}, {i.first_name} {!isAvail ? "(Busy)" : ""}
+                          </option>
+                        );
+                      })}
                   </select>
                 </div>
               </div>
@@ -1699,10 +1880,44 @@ export default function RegistrarSchedule() {
                       setSchedule(prev => {
                         const filtered = prev.filter(item => {
                           if (item.subject_id !== editingItem.subject_id) return true;
-                          const itemBlock = item.block || "";
-                          const editBlock = editingItem.block || editingItem._blockLabel || "";
+                          // Normalize block comparison
+                          // item.block might be "A", "1", etc.
+                          // editingItem._blockLabel might be "Block A"
+                          const extractBlock = (val) => {
+                            if (!val) return "";
+                            val = String(val).trim();
+                            if (val.startsWith("Block ")) return val.replace("Block ", "");
+                            return val;
+                          };
+
+                          const itemBlock = extractBlock(item.block || item._blockLabel);
+                          const editBlock = extractBlock(editingItem.block || editingItem._blockLabel);
+
+                          // If blocks differ, do not replace/remove (keep checking other items)
                           if (itemBlock !== editBlock) return true;
+
+                          // Debug replacement logic
+                          // console.log("Checking item for replacement:", item);
+                          // console.log("Original Days:", originalDayIds);
+
                           const itemDayId = item.day_id || item.dayId;
+
+                          // Logic to detect if we are replacing an "Unscheduled / Resolve" item
+                          // Typically such items have NO day_id and NO time/room
+                          const isUnscheduledItem = !itemDayId && !item.time && !item.room_id;
+
+                          // If current item is unscheduled, AND we were editing an unscheduled item (originalDayIds has a null/empty),
+                          // this is the one to remove.
+                          if (isUnscheduledItem) {
+                            // Check if we started editing an unscheduled item
+                            // OriginalDayIds for unscheduled is usually [undefined] or [null] or []
+                            const wasUnscheduled = originalDayIds.length === 0 || originalDayIds.some(d => !d);
+                            if (wasUnscheduled) {
+                              // console.log("Removing unscheduled item during override:", item);
+                              return false;
+                            }
+                          }
+
                           if (originalDayIds.includes(itemDayId)) return false;
                           return true;
                         });
@@ -1736,6 +1951,364 @@ export default function RegistrarSchedule() {
           </div>
         </div>
       )}
+      {/* RESOLVE MODAL */}
+      {/* RESOLVE MODAL */}
+      {resolvingItem && (
+        <ResolveModal
+          resolvingItem={resolvingItem}
+          setResolvingItem={setResolvingItem}
+          openEditModal={openEditModal}
+          form={form}
+        />
+      )}
+
+
+      {/* Recommendations Alternatives Modal */}
+      {recommendationModalItem && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden">
+            {/* Header */}
+            <div className="px-6 py-4 bg-gradient-to-r from-amber-500 to-orange-500 flex justify-between items-center">
+              <div>
+                <h3 className="font-bold text-xl text-white tracking-wide">
+                  ðŸ“‹ Scheduling Alternatives
+                </h3>
+                <p className="text-white/80 text-sm mt-0.5">
+                  This slot was auto-suggested. Choose a different option if preferred.
+                </p>
+              </div>
+              <button
+                onClick={() => setRecommendationModalItem(null)}
+                className="text-white/80 hover:text-white hover:bg-white/20 p-2 rounded-lg transition-all"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-6">
+              {/* Current Selection */}
+              <div className="mb-4 p-4 bg-amber-50 border border-amber-200 rounded-lg">
+                <div className="text-xs font-bold text-amber-600 uppercase tracking-wide mb-1">Current (Auto-Selected)</div>
+                <div className="flex items-center gap-4 text-sm">
+                  <span className="font-semibold text-gray-800">{getSubjectCode(recommendationModalItem.subject_id)}</span>
+                  <span className="text-gray-600">{recommendationModalItem.day || getDayName(recommendationModalItem.day_id)}</span>
+                  <span className="text-gray-600">{formatTimeRange(recommendationModalItem)}</span>
+                  <span className="text-gray-600">{getRoomName(recommendationModalItem.room_id)}</span>
+                  <span className="text-gray-600">{getInstructorName(recommendationModalItem.instructor_id)}</span>
+                </div>
+              </div>
+
+              {/* Alternatives List */}
+              <div className="mb-4">
+                <h4 className="font-semibold text-gray-700 mb-2 flex items-center gap-2">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-blue-500" viewBox="0 0 20 20" fill="currentColor">
+                    <path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z" />
+                  </svg>
+                  Other Available Options
+                </h4>
+
+                {recommendationModalItem.alternatives && recommendationModalItem.alternatives.length > 0 ? (
+                  <div className="space-y-2 max-h-60 overflow-y-auto">
+                    {recommendationModalItem.alternatives.map((alt, idx) => (
+                      <button
+                        key={idx}
+                        onClick={() => {
+                          // Apply this alternative
+                          setSchedule(prev => prev.map(item => {
+                            if ((item._uiId && item._uiId === recommendationModalItem._uiId) ||
+                              (item.subject_id === recommendationModalItem.subject_id && item.block === recommendationModalItem.block)) {
+                              return {
+                                ...item,
+                                room_id: alt.room_id,
+                                room_name: alt.room_name,
+                                instructor_id: alt.instructor_id,
+                                instructor_name: alt.instructor_name,
+                                day_id: alt.day_id,
+                                day: alt.day_label,
+                                time: alt.time,
+                                start_min: alt.start_min,
+                                end_min: alt.end_min,
+                                is_recommended: true,
+                              };
+                            }
+                            return item;
+                          }));
+                          setRecommendationModalItem(null);
+                        }}
+                        className="w-full text-left p-3 border border-blue-100 bg-blue-50 hover:bg-blue-100 rounded-lg text-sm flex justify-between items-center group transition-colors"
+                      >
+                        <div className="flex items-center gap-4">
+                          <div className="w-8 h-8 bg-blue-200 rounded-full flex items-center justify-center text-blue-700 font-bold text-xs">
+                            {idx + 1}
+                          </div>
+                          <div>
+                            <div className="font-semibold text-gray-800">{alt.day_label} @ {alt.time}</div>
+                            <div className="text-xs text-gray-600">{alt.room_name} â€¢ {alt.instructor_name || 'TBA'}</div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-gray-500">Score: {alt.score || 'â€”'}</span>
+                          <span className="opacity-0 group-hover:opacity-100 text-blue-600 font-medium text-xs bg-white px-2 py-1 rounded shadow-sm transition-opacity">
+                            Apply
+                          </span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="bg-gray-50 rounded border border-gray-200 p-4 text-center text-sm text-gray-500">
+                    No alternative options available.
+                  </div>
+                )}
+              </div>
+
+              {/* Actions */}
+              <div className="flex justify-end gap-3 pt-4 border-t border-gray-200">
+                <button
+                  onClick={() => setRecommendationModalItem(null)}
+                  className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 font-medium"
+                >
+                  Keep Current
+                </button>
+                <button
+                  onClick={() => {
+                    setRecommendationModalItem(null);
+                    openEditModal(recommendationModalItem);
+                  }}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-md flex items-center gap-2"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                    <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z" />
+                  </svg>
+                  Custom Edit
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
+}
+
+// Sub-component for Resolve Modal
+function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) {
+  const [suggestions, setSuggestions] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!resolvingItem) return;
+
+    // Use recommendations passed from parent if available
+    if (resolvingItem.recommendations && resolvingItem.recommendations.length > 0) {
+      const mappedRecs = resolvingItem.recommendations.map(r => ({
+        ...r,
+        room: r.room_name,
+        day: r.day_label || r.day,
+        day_ids: [r.day_id]
+      }));
+      setSuggestions(mappedRecs);
+      setLoading(false);
+      return;
+    }
+
+    // Reset
+    setSuggestions([]);
+    setLoading(true);
+
+    const subjectId = resolvingItem.subject_id;
+    const courseId = Number(form.course_id);
+    const year = Number(resolvingItem.year || form.year);
+    const semester = Number(form.semester);
+
+    getSchedulingSuggestions(subjectId, courseId, year, semester)
+      .then(resp => {
+        if (resp && resp.suggestions) {
+          setSuggestions(resp.suggestions);
+        }
+      })
+      .catch(err => console.error("Failed to fetch suggestions:", err))
+      .finally(() => setLoading(false));
+
+  }, [resolvingItem]);
+
+  // Helper inside component to avoid scope issues
+  function minutesToTimeString(minutes) {
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden animate-in fade-in zoom-in duration-200">
+        <div className="bg-gradient-to-r from-blue-600 to-indigo-600 p-4 flex justify-between items-center text-white">
+          <h3 className="font-bold text-lg flex items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+            </svg>
+            Resolve Scheduling Conflict
+          </h3>
+          <button onClick={() => setResolvingItem(null)} className="hover:bg-white/20 p-1 rounded-full transition-colors">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="p-6">
+          <div className="mb-6">
+            <h4 className="text-gray-900 font-semibold text-lg mb-1">
+              Subject ID: {resolvingItem.subject_id}
+            </h4>
+            <div className="flex gap-2 text-sm">
+              <span className="bg-gray-100 text-gray-800 px-2 py-0.5 rounded">
+                {resolvingItem.year ? `Year ${resolvingItem.year}` : 'Unk Year'}
+              </span>
+            </div>
+          </div>
+
+          <div className="bg-red-50 border border-red-100 rounded-lg p-4 mb-6">
+            <div className="text-xs font-bold text-red-500 uppercase tracking-wide mb-1">Diagnosed Issue</div>
+            <div className="text-red-800 font-semibold text-lg flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+              </svg>
+              {resolvingItem.failureReason || "Unscheduled"}
+            </div>
+            <p className="text-red-700/80 text-sm mt-1">
+              {resolvingItem.failureReason === "Solver Conflict" && "Valid slots exist, but they conflict with other scheduled classes. Try manually placing this subject."}
+              {resolvingItem.failureReason === "No Rooms" && "No rooms are available or eligible for this subject type."}
+              {resolvingItem.failureReason === "No Instructor" && "No eligible instructor is available."}
+              {resolvingItem.failureReason === "Room Conflict" && "All eligible rooms are fully booked during suggested times."}
+              {resolvingItem.failureReason === "Instructor Conflict" && "The assigned instructor is fully booked."}
+              {resolvingItem.failureReason === "Student Conflict" && "Scheduling this would overlap with another class for this block."}
+              {resolvingItem.failureReason === "Unscheduled" && "The scheduler could not find a valid slot."}
+            </p>
+          </div>
+
+          <div>
+            <h5 className="font-semibold text-gray-700 mb-3 flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-green-500" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M6.267 3.455a3.066 3.066 0 001.745-.723 3.066 3.066 0 013.976 0 3.066 3.066 0 001.745.723 3.066 3.066 0 012.812 2.812c.051.643.304 1.254.723 1.745a3.066 3.066 0 010 3.976 3.066 3.066 0 00-.723 1.745 3.066 3.066 0 01-2.812 2.812 3.066 3.066 0 00-1.745.723 3.066 3.066 0 01-3.976 0 3.066 3.066 0 00-1.745-.723 3.066 3.066 0 01-2.812-2.812 3.066 3.066 0 00-.723-1.745 3.066 3.066 0 010-3.976 3.066 3.066 0 00.723-1.745 3.066 3.066 0 012.812-2.812zm7.44 5.252a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+              </svg>
+              Suggestions
+            </h5>
+
+            {loading ? (
+              <div className="flex justify-center p-4">
+                <svg className="animate-spin h-5 w-5 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                </svg>
+              </div>
+            ) : suggestions.length > 0 ? (
+              <div className="space-y-2 max-h-40 overflow-y-auto">
+                {suggestions.map((s, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => {
+                      setResolvingItem(null);
+                      // Pre-fill edit modal - construct object compatible with openEditModal/editingItem
+                      const overrideItem = {
+                        ...resolvingItem,
+                        _roomId: s.room_id,
+                        _instructorId: s.instructor_id,
+                        _dayIds: s.day_ids, // array
+                        _startTime: minutesToTimeString(s.start_min),
+                        _endTime: minutesToTimeString(s.end_min),
+                        // For display:
+                        _combinedDaysLabel: s.day,
+                      };
+                      openEditModal(overrideItem);
+                    }}
+                    className="w-full text-left p-2 border border-green-100 bg-green-50 hover:bg-green-100 rounded text-sm text-green-900 flex justify-between items-center group transition-colors"
+                  >
+                    <div>
+                      <div className="font-semibold">{s.day} @ {s.time}</div>
+                      <div className="text-xs text-green-700">{s.room} • {s.instructor_id ? "Instructor Avail" : "No Instr"}</div>
+                    </div>
+                    <span className="opacity-0 group-hover:opacity-100 text-green-600 font-medium text-xs bg-white px-2 py-1 rounded shadow-sm">
+                      Apply
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="bg-gray-50 rounded border border-gray-200 p-4 text-center text-sm text-gray-500">
+                No automated suggestions found.<br />
+                <span className="text-xs">Please use "Manual Override" to force a slot.</span>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-6 flex justify-end gap-3">
+            <button
+              onClick={() => setResolvingItem(null)}
+              className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 font-medium"
+            >
+              Close
+            </button>
+            <button
+              onClick={() => {
+                setResolvingItem(null);
+                openEditModal(resolvingItem);
+              }}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-md flex items-center gap-2"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z" />
+              </svg>
+              Manual Override
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// Helper component to run availability check effect
+function EffectCheckAvailability({ editingItem, form, setAvailableResources, setIsCheckingAvailability, parseTimeToMinutes }) {
+  useEffect(() => {
+    if (!editingItem) return;
+
+    const dayId = editingItem._dayId;
+    const startMin = parseTimeToMinutes(editingItem._startTime);
+    const endMin = parseTimeToMinutes(editingItem._endTime);
+
+    // Only check if we have a valid single day and valid times
+    if (!dayId || startMin === null || endMin === null || startMin >= endMin) {
+      return;
+    }
+
+    let active = true;
+    setIsCheckingAvailability(true);
+
+    const year = Number(form.year);
+    const semester = Number(form.semester);
+
+    checkAvailability(semester, year, dayId, startMin, endMin, editingItem.subject_id)
+      .then(res => {
+        if (active && res) {
+          console.log("Availability Check Response:", res); // Debug log
+          setAvailableResources({
+            rooms: res.available_rooms || [],
+            instructors: res.available_instructors || [],
+            eligibleInstructors: res.eligible_instructors // New field
+          });
+        }
+      })
+      .catch(err => console.error("Availability check failed", err))
+      .finally(() => {
+        if (active) setIsCheckingAvailability(false);
+      });
+
+    return () => { active = false; };
+  }, [editingItem?._dayId, editingItem?._startTime, editingItem?._endTime]);
+
+  return null;
 }

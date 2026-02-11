@@ -11,7 +11,9 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Now import other dependencies after setting up the path
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
+import re
+from collections import defaultdict
 try:
     from api import models
 except ImportError:
@@ -39,29 +41,13 @@ def run_scheduler(
     block_capacity_overrides: Optional[List[Dict[str, Any]]] = None,
     blocks_count: Optional[int] = None,
     progress_callback: Optional[Any] = None,
-) -> List[Dict]:
+) -> Tuple[List[Dict], Dict[int, Dict]]:
     """
     Generate schedules for one or more year levels using K-Means clustering
     followed by the OR-Tools CP solver (with greedy fallback).
-    
-    Args:
-        db: Database session
-        course_id: Course identifier
-        year: Legacy single-year parameter (used when years is not provided)
-        years: Optional list of year levels to schedule in a single run
-        semester: Semester (1-2)
-        subject_ids: Optional subset of subject IDs to schedule
-        use_cp: Enable OR-Tools solver
-        max_time_seconds: Max solver time (per cluster)
-        use_kmeans: Enable K-Means pre-clustering
-        k_clusters: Number of clusters for K-Means
-        weight_slots: Weight multiplier for recommended slots in clustering
-        force_refit: Force re-run of clustering even if cache exists
-        block_capacity_overrides: Optional list of per-block capacity overrides (course_id, year, block_id, capacity)
-        progress_callback: Optional callback function to report progress (accepts message string)
-    
+
     Returns:
-        Aggregated list of scheduled items covering all requested years.
+        Tuple of (Aggregated list of scheduled items, Dict of scheduling diagnostics)
     """
     import time
     
@@ -152,7 +138,7 @@ def run_scheduler(
             years_to_process,
             list(requested_subject_ids_filter) if requested_subject_ids_filter else "all",
         )
-        return []
+        return [], {}
     
     if missing_year_subjects:
         logger.info(
@@ -288,7 +274,174 @@ def run_scheduler(
                 years_to_process,
             )
             
-            aggregated_results = run_cp_scheduler(
+            # LOAD EXISTING BOOKINGS
+            # Detect booking from other courses/years to prevent inter-run conflicts
+            logger.info("Loading existing bookings to prevent conflicts...")
+            
+            # Fetch all schedules for this semester
+            # We want to BLOCK everything except what we are currently regenerating
+            existing_schedules = db.query(models.Schedule).filter(
+                models.Schedule.semester == semester
+            ).options(joinedload(models.Schedule.room)).all()
+            
+            booked_room_ranges = defaultdict(list)
+            booked_instr_ranges = defaultdict(list)
+            
+            years_set = set(years_to_process)
+            regenerating_count = 0
+            blocking_count = 0
+            
+            # Load time utilities
+            from .timeslots import TIME_BLOCKS, time_to_minutes
+            
+            # Helper to normalize time strings for matching (handle different dash types)
+            def normalize_time_str(s):
+                if not s: return ""
+                return s.replace("–", "-").replace("—", "-").replace(" ", "").upper()
+
+            # Create lookup map for normalized time labels -> (start_min, end_min)
+            # We map standard block labels to their true minute ranges
+            block_lookup = {}
+            for tb in TIME_BLOCKS:
+                # Store normalized label matches (e.g. "2:30-4:00")
+                norm_label = normalize_time_str(tb['label'])
+                start_m = time_to_minutes(tb['start'])
+                end_m = time_to_minutes(tb['end'])
+                block_lookup[norm_label] = (start_m, end_m)
+
+                # Store 24-hour implicit matches (e.g. "14:30-16:00")
+                # Because DB might store "14:30-16:00" which doesn't match label "2:30-4:00"
+                start_24 = tb['start'].strip() # "14:30"
+                end_24 = tb['end'].strip()     # "16:00"
+                label_24 = f"{start_24}-{end_24}"
+                label_24_norm = normalize_time_str(label_24)
+                block_lookup[label_24_norm] = (start_m, end_m)
+
+                # Also try single-digit hour variant if strictly "07:00" -> "7:00"
+                if start_24.startswith("0"):
+                    label_24_short = f"{start_24[1:]}-{end_24}"
+                    block_lookup[normalize_time_str(label_24_short)] = (start_m, end_m)
+
+            for sched in existing_schedules:
+                # SKIP if this schedule is being regenerated in the current run
+                # (Same course AND same year level)
+                if sched.course_id == course_id and sched.year in years_set:
+                    regenerating_count += 1
+                    continue
+                
+                blocking_count += 1
+                
+                # Parse existing booking using ROBUST block matching
+                if not sched.time: continue
+                
+                # sched.time is like "M 7:30–9:00 LAB"
+                # We want to find which block label appears in this string
+                matched_range = None
+                sched_time_norm = normalize_time_str(sched.time)
+                
+                # Check for exact block matches
+                for label_norm, (s_min, e_min) in block_lookup.items():
+                    if label_norm in sched_time_norm:
+                        matched_range = (s_min, e_min)
+                        break
+                
+                if not matched_range:
+                    # Fallback: Parse distinct times found in string using regex
+                    # This works for "14:30-16:00" (24h) and "4:00 PM - 7:00 AM" (12h)
+                    # For "1:00 - 2:30", we need heuristic (1:00 is PM)
+                    try:
+                        # Find all HH:MM patterns
+                        import re
+                        times = re.findall(r'(\d{1,2}):(\d{2})', sched.time)
+                        if len(times) >= 2:
+                            # Take first and second (start/end)
+                            h1, m1 = map(int, times[0])
+                            h2, m2 = map(int, times[1])
+                            
+                            def normalize_mins(h, m):
+                                # Heuristic: School runs 7am to 9pm.
+                                # If hour < 7, it's PM (13:00 - 18:00 mapping from 1-6)
+                                # 12 is 12 PM (noon)
+                                if h < 7: h += 12
+                                elif h == 12: pass # 12:00 is noon
+                                # If explicitly PM in string? 
+                                # This heuristic is primarily for "1:00-2:30" format without AM/PM labels
+                                # But if string has "PM", purely numeric parse ignores it.
+                                # However, DB usually uses 24h or labels.
+                                return h * 60 + m
+                            
+                            s_min = normalize_mins(h1, m1)
+                            e_min = normalize_mins(h2, m2)
+                            
+                            # Correction: if "11:30 - 1:00", s=690, e=60 (converted to 780 by heuristic? No, 1 < 7 -> 13)
+                            # 11:30 -> 11 >= 7 -> 11:30 AM.
+                            # 1:00 -> 1 < 7 -> 1:00 PM.
+                            # Works!
+                            
+                            # What if "7:00 PM"? 7 >= 7. Treated as 7:00 AM? 
+                            # If "PM" is present in string, we should respect it.
+                            # Rudimentary PM check:
+                            if "PM" in sched.time.upper() and s_min < 720 and h1 < 12:
+                                s_min += 720
+                            if "PM" in sched.time.upper() and e_min < 720 and h2 < 12:
+                                e_min += 720
+                                
+                            blocked_range = (s_min, e_min, {
+                                "course_id": sched.course_id,
+                                "year": sched.year,
+                                "subject_id": sched.subject_id,
+                                "description": f"Course {sched.course_id} Year {sched.year}"
+                            })
+                            
+                            # Append
+                            if s_min < e_min:
+                                if sched.room_id and sched.room:
+                                    key = (sched.room.name, sched.day_id)
+                                    booked_room_ranges[key].append(blocked_range)
+                                    
+                                    # DEBUG: Log if we are blocking any GS ER room
+                                    if "GS ER" in str(sched.room.name):
+                                        logger.info(f"[SCHEDULER FILTER] Blocking {sched.room.name} (ID {sched.room_id}) Day {sched.day_id}: {sched.time} -> {blocked_range}. SubjID={sched.subject_id}, Year={sched.year}, Course={sched.course_id}")
+
+                                if sched.instructor_id:
+                                    booked_instr_ranges[(sched.instructor_id, sched.day_id)].append(blocked_range)
+                                continue
+                    except Exception:
+                        pass
+                    continue
+
+                s_min, e_min = matched_range
+                
+                if s_min >= e_min: continue
+                
+                metadata = {
+                    "course_id": sched.course_id,
+                    "year": sched.year,
+                    "subject_id": sched.subject_id,
+                    "description": f"Course {sched.course_id} Year {sched.year}"
+                }
+                
+                # Add to room ranges
+                # Use room NAME because cp_scheduler expects names for existing bookings
+                if sched.room_id and sched.room:
+                    # Provide (room_name, day_id) -> list of (start, end, metadata)
+                    key = (sched.room.name, sched.day_id)
+                    booked_room_ranges[key].append((s_min, e_min, metadata))
+                    
+                    # DEBUG: Log if we are blocking any GS ER room
+                    if "GS ER" in str(sched.room.name):
+                         logger.info(f"[SCHEDULER FILTER MAIN] Blocking {sched.room.name} (ID {sched.room_id}) Day {sched.day_id}: {sched.time} -> {(s_min, e_min)}. SubjID={sched.subject_id}, Year={sched.year}, Course={sched.course_id}")
+
+                
+                # Add to instr ranges
+                if sched.instructor_id:
+                     key = (sched.instructor_id, sched.day_id)
+                     booked_instr_ranges[key].append((s_min, e_min, metadata))
+            
+            logger.info(f"Existing bookings analysis: {regenerating_count} items being replaced, {blocking_count} items treated as blocked.")
+            logger.info(f"Constructed {len(booked_room_ranges)} room blocking entries and {len(booked_instr_ranges)} instructor blocking entries.")
+
+            aggregated_results, scheduling_diagnostics = run_cp_scheduler(
                 db=db,
                 course_id=course_id,
                 year=years_to_process[0],
@@ -302,6 +455,8 @@ def run_scheduler(
                 block_capacity_overrides=block_capacity_map,
                 block_count=int(blocks_count) if blocks_count is not None else 1,
                 progress_callback=report_progress,
+                booked_room_ranges_global=booked_room_ranges,
+                booked_instr_ranges_global=booked_instr_ranges,
             )
             
             cp_elapsed = time.time() - cp_start
@@ -313,6 +468,12 @@ def run_scheduler(
                 len(aggregated_results),
                 len(requested_subject_ids),
             )
+            
+            # DEBUG: Check diagnostics returned from CP
+            print(f"DEBUG: run_scheduler received diagnostics from CP. keys={list(scheduling_diagnostics.keys())}")
+            if scheduling_diagnostics:
+                k = next(iter(scheduling_diagnostics))
+                print(f"DEBUG: Sample diag entry [{k}]: {scheduling_diagnostics[k]}")
 
             allowed_subject_ids = set(requested_subject_ids)
             filtered_results = []
@@ -411,7 +572,7 @@ def run_scheduler(
                         "block": block_label,
                     })
 
-            return deduped_results
+            return deduped_results, scheduling_diagnostics
         except ImportError as err:
             logger.warning(
                 "OR-Tools not available (ImportError: %s), falling back to greedy algorithm",
@@ -429,7 +590,7 @@ def run_scheduler(
         from .greedy import run_greedy_scheduler
         
         if not course_subjects:
-            return []
+            return [], {}
         
         instructors = db.query(models.Instructor).filter(
             (models.Instructor.college_id == college_id) | (models.Instructor.college_id.is_(None))
@@ -438,10 +599,17 @@ def run_scheduler(
         days = db.query(models.Day).all()
         
         if not instructors or not rooms or not days:
-            return []
+            return [], {}
         
         logger.info("Using greedy algorithm fallback for %d subjects", len(requested_subject_ids))
-        greedy_results = run_greedy_scheduler(course_subjects, instructors, rooms, days)
+        greedy_results = run_greedy_scheduler(
+            course_subjects,
+            instructors,
+            rooms,
+            days,
+            booked_room_ranges_global=booked_room_ranges,
+            booked_instr_ranges_global=booked_instr_ranges,
+        )
         
         # Annotate greedy results with year & semester metadata
         enriched_results = []
@@ -459,7 +627,7 @@ def run_scheduler(
                 "semester": subj.semester or semester,
             })
         
-        return enriched_results
+        return enriched_results, {}
     except ImportError as err:
         logger.error("Greedy scheduler not available (ImportError: %s)", err)
         # Return empty assignments
@@ -476,7 +644,7 @@ def run_scheduler(
                 "instructor_id": None,
             }
             for sid in empty_subject_ids
-        ]
+        ], {}
 
 
 def save_schedule(
@@ -509,6 +677,12 @@ def save_schedule(
     # Create new schedule entries
     schedules = []
     logger = logging.getLogger(__name__)
+    
+    # ROOM CONFLICT PREVENTION: Track room bookings to prevent double-booking
+    # Key: (room_id, day_id, time_str) -> first item that booked this slot
+    room_bookings_by_slot = {}  # (room_id, day_id, time) -> schedule_item
+    skipped_duplicates = []
+    
     for item in schedule_items:
         # CRITICAL: Validate that we're using solver results, not subject defaults
         subject_id = item.get("subject_id")
@@ -529,6 +703,26 @@ def save_schedule(
             logger.error(f"[SAVE BUG] Missing time for subject {subject_id} - using solver result, not subject default! Item: {item}")
             continue
         
+        # ROOM CONFLICT CHECK: Prevent double-booking of same room/day/time
+        room_id = item.get("room_id")
+        if room_id is not None and day_id is not None and time_str:
+            room_slot_key = (room_id, day_id, time_str)
+            if room_slot_key in room_bookings_by_slot:
+                existing_item = room_bookings_by_slot[room_slot_key]
+                logger.warning(
+                    f"[SAVE CONFLICT] Room double-booking prevented! "
+                    f"Room {room_id} Day {day_id} Time {time_str} already assigned to Subject {existing_item.get('subject_id')} Block {existing_item.get('block')}. "
+                    f"Skipping Subject {subject_id} Block {block_value}."
+                )
+                skipped_duplicates.append({
+                    "skipped_item": item,
+                    "existing_item": existing_item,
+                    "reason": "room_double_booking"
+                })
+                continue
+            # Register this room slot as booked
+            room_bookings_by_slot[room_slot_key] = item
+        
         # Log first few items to verify we're saving solver results
         if len(schedules) < 3:
             logger.info(f"[SAVE] Saving subject {subject_id}: day_id={day_id}, time={time_str}, room_id={item.get('room_id')}, instructor_id={item.get('instructor_id')}, block={block_value}")
@@ -546,6 +740,10 @@ def save_schedule(
         )
         db.add(schedule)
         schedules.append(schedule)
+    
+    # Log summary of skipped duplicates
+    if skipped_duplicates:
+        logger.warning(f"[SAVE SUMMARY] Skipped {len(skipped_duplicates)} items due to room double-booking conflicts")
     
     db.commit()
     
@@ -648,4 +846,321 @@ def run_scheduler_ortools(
         # No solution found, return empty assignments
         return [{"subject_id": s.id, "day_id": None, "time": None, "room_id": None, "instructor_id": None} 
                 for s in subjects]
+
 """
+
+def get_suggestions(
+    db: Session,
+    subject_id: int,
+    course_id: int,
+    year: int,
+    semester: int,
+) -> List[Dict]:
+    """Get alternative scheduling suggestions for an unscheduled subject."""
+    from .cp_scheduler import find_alternative_slots
+    from collections import defaultdict
+    from sqlalchemy.orm import joinedload
+    from .timeslots import TIME_BLOCKS, time_to_minutes
+
+    # 1. Load Data (Instructors, Rooms, Days)
+    # We load broad set then filter? Or just load what we need.
+    # We need all rooms and days.
+    rooms = db.query(models.Room).all()
+    days = db.query(models.Day).all()
+    
+    # 2. Build Maps
+    room_id_to_name = {r.id: r.name for r in rooms}
+    
+    # 3. Load Existing Bookings (Global)
+    # Similar to run_scheduler, we need to know what's booked.
+    existing_schedules = db.query(models.Schedule).filter(
+        models.Schedule.semester == semester
+    ).options(joinedload(models.Schedule.room)).all()
+
+    booked_room_slots_global = set()
+    booked_instr_slots_global = set()
+    
+    # Load slots structure
+    from .timeslots import get_slots_by_day
+    slots_by_day = get_slots_by_day(days)
+    
+    # Helper to normalize time strings
+    def normalize_time_str(s):
+        if not s: return ""
+        return s.replace("–", "-").replace("—", "-").replace(" ", "").upper()
+        
+    # Create lookup for time strings -> range
+    block_lookup = {}
+    for tb in TIME_BLOCKS:
+        norm_label = normalize_time_str(tb['label'])
+        start_m = time_to_minutes(tb['start'])
+        end_m = time_to_minutes(tb['end'])
+        block_lookup[norm_label] = (start_m, end_m)
+        
+        # 24h
+        start_24 = tb['start'].strip()
+        end_24 = tb['end'].strip()
+        label_24_norm = normalize_time_str(f"{start_24}-{end_24}")
+        block_lookup[label_24_norm] = (start_m, end_m)
+        if start_24.startswith("0"):
+             block_lookup[normalize_time_str(f"{start_24[1:]}-{end_24}")] = (start_m, end_m)
+
+    # Populate booked slots
+    for sched in existing_schedules:
+        if not sched.time: continue
+        
+        # Determine range
+        matched_range = None
+        sched_time_norm = normalize_time_str(sched.time)
+        for label_norm, (s_min, e_min) in block_lookup.items():
+            if label_norm in sched_time_norm:
+                matched_range = (s_min, e_min)
+                break
+        
+        if not matched_range:
+             # Try regex fallback
+             import re
+             times = re.findall(r'(\d{1,2}):(\d{2})', sched.time)
+             if len(times) >= 2:
+                 h1, m1 = map(int, times[0])
+                 h2, m2 = map(int, times[1])
+                 def norm_mins(h, m):
+                     if h < 7: h += 12
+                     elif h == 12: pass 
+                     return h * 60 + m
+                 s_min = norm_mins(h1, m1)
+                 e_min = norm_mins(h2, m2)
+                 # simple pm check
+                 if "PM" in sched_time_norm and s_min < 720 and h1 < 12: s_min += 720
+                 if "PM" in sched_time_norm and e_min < 720 and h2 < 12: e_min += 720
+                 matched_range = (s_min, e_min)
+        
+        if not matched_range: continue
+        s_min, e_min = matched_range
+        if s_min >= e_min: continue
+        
+        # Mark occupied slots
+        # Map range to day slots
+        day_slots = slots_by_day.get(sched.day.label, []) if sched.day else []
+        for slot in day_slots:
+             # Check overlap
+             # slot covers [slot_start, slot_end]
+             # sched covers [s_min, e_min]
+             slot_s = slot["start_min"]
+             slot_e = slot["end_min"]
+             # Overlap logic: not (end1 <= start2 or start1 >= end2)
+             if not (slot_e <= s_min or slot_s >= e_min):
+                 if sched.room_id and sched.room:
+                      booked_room_slots_global.add((sched.room.name, sched.day_id, slot["index"]))
+                 if sched.instructor_id:
+                      booked_instr_slots_global.add((sched.instructor_id, sched.day_id, slot["index"]))
+
+    # 4. Load Eligibility Maps
+    # We need to know valid rooms/instructors for this subject
+    # Re-use logic from db_procedures or just build complete map for simplicity?
+    # Ideally use db_procedures, but let's build map for this specific subject to be fast.
+    
+    course_to_instructors = defaultdict(list)
+    course_to_rooms = defaultdict(list)
+    
+    # Just fetch for this subject
+    from api import db_procedures
+    try:
+        db_instrs = db_procedures.get_instructor_eligibility(db, subject_id)
+        if db_instrs:
+            course_to_instructors[subject_id] = [i.id for i in db_instrs]
+            
+        db_rooms = db_procedures.get_room_eligibility(db, subject_id)
+        if db_rooms:
+            course_to_rooms[subject_id] = [r.id for r in db_rooms]
+    except Exception as e:
+        logger.error(f"Error fetching eligibility for suggestion: {e}")
+
+    # 5. Call CP Helper
+    return find_alternative_slots(
+        db=db,
+        subject_id=subject_id,
+        course_id=course_id,
+        year=year,
+        semester=semester,
+        rooms=rooms,
+        days=days,
+        slots_by_day=slots_by_day,
+        booked_room_slots_global=booked_room_slots_global,
+        booked_instr_slots_global=booked_instr_slots_global,
+        course_to_instructors=course_to_instructors,
+        course_to_rooms=course_to_rooms,
+        room_id_to_name=room_id_to_name
+    )
+
+def check_resource_availability(
+    db: Session,
+    semester: int,
+    year: int,
+    day_id: int,
+    start_min: int,
+    end_min: int,
+    subject_id: Optional[int] = None
+) -> Dict[str, List[int]]:
+    """
+    Check which rooms and instructors are available during a specific window.
+    If subject_id is provided, also filters instructors by subject eligibility.
+    """
+    from sqlalchemy.orm import joinedload
+    from api import db_procedures
+    
+    # 1. Fetch all resources
+    all_rooms = db.query(models.Room).all()
+    all_instructors = db.query(models.Instructor).all()
+    
+    # 2. Identify the requested day label
+    day_obj = db.query(models.Day).filter(models.Day.id == day_id).first()
+    if not day_obj:
+        return {"available_rooms": [r.id for r in all_rooms], "available_instructors": [i.id for i in all_instructors]}
+        
+    # 3. Fetch existing schedules that might conflict
+    # Query schedules for the same semester/year that are on the same day_id
+    conflicting_schedules = db.query(models.Schedule).filter(
+        models.Schedule.semester == semester,
+        models.Schedule.year == year,
+        models.Schedule.day_id == day_id
+    ).all()
+    
+    busy_room_ids = set()
+    busy_instructor_ids = set()
+    
+    # 4. Filter for Time Overlap
+    import re
+    from .timeslots import TIME_BLOCKS, time_to_minutes
+    
+    def parse_time_range(time_str):
+        if not time_str: return None
+        # Normalize
+        s = time_str.replace("–", "-").replace("—", "-").replace(" ", "").upper()
+        
+        # Check against TIME_BLOCKS
+        for tb in TIME_BLOCKS:
+            tb_norm = tb['label'].replace("–", "-").replace("—", "-").replace(" ", "").upper()
+            if tb_norm in s:
+                 return time_to_minutes(tb['start']), time_to_minutes(tb['end'])
+                 
+        # Regex fallback
+        times = re.findall(r'(\d{1,2}):(\d{2})', s)
+        if len(times) >= 2:
+             h1, m1 = map(int, times[0])
+             h2, m2 = map(int, times[1])
+             
+             def to_min(h, m):
+                 if h < 7: h += 12
+                 elif h == 12: pass
+                 return h * 60 + m
+                 
+             s_m = to_min(h1, m1)
+             e_m = to_min(h2, m2)
+             
+             # PM adjust logic simlar to get_suggestions
+             if "PM" in s and s_m < 720 and h1 < 12: s_m += 720
+             if "PM" in s and e_m < 720 and h2 < 12: e_m += 720
+             
+             return s_m, e_m
+             
+        return None
+
+    for sched in conflicting_schedules:
+        if not sched.time: continue
+        
+        rng = parse_time_range(sched.time)
+        if not rng: continue
+        
+        s_exist, e_exist = rng
+        
+        # Check overlap: request=[start_min, end_min], exist=[s_exist, e_exist]
+        # Overlap if NOT (end1 <= start2 or start1 >= end2)
+        if not (e_exist <= start_min or s_exist >= end_min):
+            # Conflict!
+            if sched.room_id:
+                busy_room_ids.add(sched.room_id)
+            if sched.instructor_id:
+                busy_instructor_ids.add(sched.instructor_id)
+    
+    # 5. Determine base availability (time-based)
+    avail_rooms = [r.id for r in all_rooms if r.id not in busy_room_ids]
+    avail_instructors = [i.id for i in all_instructors if i.id not in busy_instructor_ids]
+    
+    # 6. Apply strictly filtering if subject_id is provided
+    if subject_id:
+        try:
+             # Filter Rooms: FIELD room logic
+             subject = db.query(models.Subject).get(subject_id)
+             if subject:
+                 is_nstp = subject.code.upper().startswith("NSTP")
+                 field_room = next((r for r in all_rooms if r.name == "FIELD"), None)
+                 
+                 if field_room:
+                     if is_nstp:
+                         # NSTP MUST use FIELD. Filter out everything else.
+                         # If FIELD is available, it should be the only option.
+                         # If FIELD is busy, list should be empty.
+                         if field_room.id in avail_rooms:
+                             avail_rooms = [field_room.id]
+                         else:
+                             avail_rooms = []
+                     else:
+                         # Non-NSTP cannot use FIELD
+                         # avail_rooms is a list of IDs
+                         if field_room.id in avail_rooms:
+                             avail_rooms.remove(field_room.id)
+
+             # Filter Instructors: Only show instructors who are BOTH available (time) AND eligible (specialization)
+             eligible_instrs = db_procedures.get_instructor_eligibility(db, subject_id)
+             
+             # Smart Specialization Enforcement:
+             # If ANY instructor explicitly lists this subject code in assignable_courses, 
+             # restrict the pool to ONLY those specialized instructors.
+             # Otherwise, fall back to the broader usage (e.g. College match).
+             if subject and eligible_instrs:
+                 strict_matches = []
+                 subject_code = subject.code.strip().upper()
+                 is_nstp = subject_code.startswith("NSTP")
+                 
+                 for i in eligible_instrs:
+                     if i.assignable_courses:
+                         # Split by comma and normalize
+                         courses = [c.strip().upper() for c in i.assignable_courses.split(',')]
+                         
+                         match = False
+                         if is_nstp:
+                             # NSTP special case: match prefix
+                             if any(c.startswith("NSTP") for c in courses):
+                                 match = True
+                         else:
+                             # Exact match for standard subjects
+                             if subject_code in courses:
+                                 match = True
+                                 
+                         if match:
+                             strict_matches.append(i)
+                 
+                 # Logic: If we found ANYONE with strict specialization, enforce it.
+                 # This prevents "General" instructors from cluttering the list when specialists exist.
+                 if strict_matches:
+                     eligible_instrs = strict_matches
+
+             if eligible_instrs: # If we have specialized logic, filter.
+                  eligible_ids = {i.id for i in eligible_instrs}
+                  # Intersect
+                  avail_instructors = [i_id for i_id in avail_instructors if i_id in eligible_ids]
+                  
+                  return {
+                      "available_rooms": avail_rooms,
+                      "available_instructors": avail_instructors,
+                      "eligible_instructors": list(eligible_ids) # Return all eligible, regardless of availability
+                  }
+        except Exception as e:
+             logger.error(f"Error filtering eligible instructors for availability check: {e}")
+
+    return {
+        "available_rooms": avail_rooms,
+        "available_instructors": avail_instructors,
+        "eligible_instructors": [] # No restriction known
+    }

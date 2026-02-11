@@ -8,6 +8,8 @@ from pathlib import Path
 from flask import Blueprint, jsonify, request
 from pydantic import ValidationError
 
+logger = logging.getLogger(__name__)
+
 # Ensure the project root is in the Python path
 project_root = str(Path(__file__).parent.parent.parent)
 if project_root not in sys.path:
@@ -241,7 +243,10 @@ def generate_schedule():
                             "years": years,
                             "semester": schedule_request.semester,
                             "items": items,  # For backward compatibility
+                            "scheduled": items, # For frontend compatibility (calls it .scheduled)
                             "result": items,  # New: direct array for frontend
+                            "diagnostics": result.get("diagnostics", {}),
+                            "count": len(items),
                             "count": len(items),
                             "elapsed_time": round(elapsed, 2),
                             "already_queued": already_queued,
@@ -294,6 +299,16 @@ def get_schedule_status():
     # Frontend expects: {"status": "completed", "result": [scheduled_items...]}
     if status_obj.get("status") == "succeeded":
         result_data = status_obj.get("result", {})
+        
+        # DEBUG DIAGNOSTICS
+        raw_diag = result_data.get("diagnostics", {}) if isinstance(result_data, dict) else {}
+        print(f"DEBUG: API route sending diagnostics check. JobID={job_id}, Keys={len(raw_diag)}")
+        if len(raw_diag) > 0:
+            sample_k = next(iter(raw_diag))
+            print(f"DEBUG: Sample diag: {raw_diag[sample_k]}")
+        else:
+            print(f"DEBUG: DIAGNOSTICS EMPTY IN API ROUTE! Result keys: {result_data.keys() if isinstance(result_data, dict) else 'Not a dict'}")
+
         # Extract items array from result (result may be {"items": [...], "count": N} or just [...])
         if isinstance(result_data, dict) and "items" in result_data:
             scheduled_items = result_data["items"]
@@ -305,6 +320,7 @@ def get_schedule_status():
         response = jsonify({
             "status": "completed",
             "result": scheduled_items,
+            "diagnostics": raw_diag,
             "job_id": status_obj.get("job_id"),
             "created_at": status_obj.get("created_at"),
             "started_at": status_obj.get("started_at"),
@@ -584,3 +600,99 @@ def delete_schedule():
     finally:
         db.close()
 
+
+@schedule_bp.route("/item/<int:schedule_id>", methods=["DELETE"])
+def delete_schedule_item(schedule_id):
+    """Delete a single schedule item by ID."""
+    db = _get_session()
+    try:
+        deleted = db.query(models.Schedule).filter(models.Schedule.id == schedule_id).delete()
+        db.commit()
+        if deleted:
+            return jsonify({"status": "success", "message": "Schedule item deleted"}), 200
+        else:
+            return jsonify({"detail": "Schedule item not found"}), 404
+    except Exception as e:
+        db.rollback()
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+
+
+@schedule_bp.route("/suggestions", methods=["GET"])
+def get_scheduling_suggestions():
+    """Get alternative slot suggestions for a failed subject."""
+    subject_id = request.args.get("subject_id", type=int)
+    course_id = request.args.get("course_id", type=int)
+    year = request.args.get("year", type=int)
+    semester = request.args.get("semester", type=int)
+
+    if not all([subject_id, course_id, year, semester]):
+        return jsonify({"detail": "Missing required parameters"}), 400
+
+    from api.scheduler.scheduler import get_suggestions
+    
+    session = _get_session()
+    try:
+        suggestions = get_suggestions(
+            db=session,
+            subject_id=subject_id,
+            course_id=course_id,
+            year=year,
+            semester=semester
+        )
+        return jsonify({"suggestions": suggestions})
+    except Exception as e:
+        logger.error(f"Error fetching suggestions: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        session.close()
+
+
+
+@schedule_bp.route("/availability", methods=["GET"])
+def check_availability():
+    """Check availability of rooms/instructors for a specific time window."""
+    semester = request.args.get("semester", type=int)
+    year = request.args.get("year", type=int)
+    day_id = request.args.get("day_id", type=int)
+    start_time = request.args.get("start_time") # HH:MM string, or we parse? function expects mins.
+    # Actually function expects start_min, end_min. 
+    # Let's accept start_min, end_min directly to avoid re-parsing here, or parse if string.
+    # Or just pass the time string logic?
+    # The frontend usually works with HH:MM 24h or similar.
+    # The `check_resource_availability` function uses `start_min`, `end_min`.
+    # Let's check what the frontend sends. Usually it sends strings.
+    # But `check_resource_availability` logic expects start_min/end_min AND parses inside?
+    # No, I implemented `check_resource_availability` to take `start_min`, `end_min` but it also has internal `parse_time_range`?
+    # Wait, my implementation of `check_resource_availability` HAS a `parse_time_range` helper but it uses it on EXISTING schedules.
+    # It takes `start_min` and `end_min` as integers for the QUERY/REQUEST.
+    # So I need to parse inputs here.
+    
+    start_min = request.args.get("start_min", type=int)
+    end_min = request.args.get("end_min", type=int)
+    
+    subject_id = request.args.get("subject_id", type=int)
+    
+    if not all([semester, year, day_id, start_min is not None, end_min is not None]):
+         return jsonify({"detail": "Missing required parameters"}), 400
+         
+    from api.scheduler.scheduler import check_resource_availability
+    
+    session = _get_session()
+    try:
+        result = check_resource_availability(
+            db=session,
+            semester=semester,
+            year=year,
+            day_id=day_id,
+            start_min=start_min,
+            end_min=end_min,
+            subject_id=subject_id
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error checking availability: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        session.close()

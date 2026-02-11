@@ -103,6 +103,7 @@ def create_time_slots_for_day(day_label: str) -> List[Dict]:
     return slots
 
 
+
 def get_all_time_slots(days: List[str]) -> List[Dict]:
     """Get all time slots for all days"""
     all_slots = []
@@ -110,4 +111,12 @@ def get_all_time_slots(days: List[str]) -> List[Dict]:
         day_slots = create_time_slots_for_day(day)
         all_slots.extend(day_slots)
     return all_slots
+
+# Function expected by scheduler.py to return Dict[str, List[Dict]]
+def get_slots_by_day(days: List[str]) -> Dict[str, Dict]:
+    """
+    Get time slots for multiple days, returned as a dictionary:
+    { "DayLabel": [slots...] }
+    """
+    return {day: create_time_slots_for_day(day) for day in days}
 

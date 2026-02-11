@@ -4,6 +4,7 @@ import logging
 from flask import Blueprint, jsonify, request
 from pydantic import ValidationError
 from sqlalchemy import or_
+from sqlalchemy.orm import joinedload
 
 from api import models
 from api import schemas
@@ -55,6 +56,13 @@ def validate_schedule_item():
         if start_time >= end_time:
             return jsonify({"valid": False, "messages": ["End time must be after start time"]}), 400
 
+        # Determine special room characteristics (FIELD allows overlap)
+        is_field_room = False
+        if req.room_id:
+            room_obj = db.query(models.Room).get(req.room_id)
+            if room_obj and "FIELD" in room_obj.name.upper():
+                is_field_room = True
+
         # Collect all conflicts
         
         # We need to check conflicts separately for EACH day
@@ -83,13 +91,16 @@ def validate_schedule_item():
                  query = query.filter(models.Schedule.id != req.id)
 
              # 1. Check Room Conflict (Active Term Global Resource)
-             if req.room_id:
+             if req.room_id and not is_field_room:
                  # Note: Removed .filter(year) for global check
                  # We need a fresh query that covers ALL years for this room/day/sem
                  room_query = db.query(models.Schedule).filter(
                      models.Schedule.day_id == check_day_id,
                      models.Schedule.semester == req.semester,
                      models.Schedule.room_id == req.room_id
+                 ).options(
+                     joinedload(models.Schedule.course),
+                     joinedload(models.Schedule.subject)
                  )
                  if req.id:
                      room_query = room_query.filter(models.Schedule.id != req.id)
@@ -102,12 +113,18 @@ def validate_schedule_item():
                      logger.info(f"Comparing proposed [{start_time}-{end_time}] vs Item {item.id} [{i_start}-{i_end}] (raw: '{item.time}')")
                      
                      if times_overlap(start_time, end_time, i_start, i_end):
-                         messages.append(f"Room Conflict (Day {check_day_id}): Room is occupied by {item.subject_id} at this time.")
-                         logger.info("Conflict FOUND!")
+                         # Enhanced Conflict Message
+                         subj_code = item.subject.code if item.subject else f"Subject {item.subject_id}"
+                         course_code = item.course.code if item.course else f"Course {item.course_id}"
+                         conflict_time = item.time or "?"
+                         
+                         msg = f"Room Conflict (Day {check_day_id}): Occupied by {course_code} - {subj_code} ({conflict_time})"
+                         messages.append(msg)
+                         logger.info(f"Conflict FOUND: {msg}")
 
 
              # 2. Check Instructor Conflict (Active Term Global Resource)
-             if req.instructor_id:
+             if req.instructor_id and not is_field_room:
                  instr_query = db.query(models.Schedule).filter(
                      models.Schedule.day_id == check_day_id,
                      models.Schedule.semester == req.semester,

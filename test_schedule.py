@@ -145,6 +145,19 @@ def test_schedule():
 
         print(f"Base URL: {BASE_URL}")
         print(f"Total items: {len(result_data)}")
+        
+        print("\nRoom 15 (GS ER 7) occupants:")
+        for item in scheduled_items:
+            if str(item.get("room_id")) == "15":
+                print(f"  {_item_label(item)}")
+        
+        print("\n=== Unscheduled 'GE - US' (ID 9) Details ===")
+        for item in unscheduled_items:
+            # Check subject_id in various formats
+            sid = item.get("subject_id")
+            if sid == 9 or sid == "9" or item.get("subject_code") == "GE - US":
+                print(json.dumps(item, indent=2))
+
         print(f"Scheduled items: {len(scheduled_items)}")
         print(f"Unscheduled/placeholder items: {len(unscheduled_items)}")
         print(f"Items per block: {json.dumps(blocks, sort_keys=True)}")

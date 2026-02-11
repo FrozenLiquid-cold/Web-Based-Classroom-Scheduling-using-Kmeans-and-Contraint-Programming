@@ -256,6 +256,10 @@ export async function deleteSchedule(courseId, year, semester) {
   return apiCall(`/schedule/delete?${params.toString()}`, { method: 'DELETE' })
 }
 
+export async function deleteScheduleItem(id) {
+  return apiCall(`/schedule/item/${id}`, { method: 'DELETE' })
+}
+
 export async function getScheduleStatus(jobId) {
   return apiCall(`/schedule/status?job_id=${encodeURIComponent(jobId)}`, {
     timeout: TIMEOUTS.SCHEDULE,
@@ -273,7 +277,7 @@ export async function getRoomSchedule(roomId, semester, dayId = null) {
 }
 
 export async function scheduleCourse(courseId, year, semester, blocksCount) {
-  const response = await fetch(`${API_URL}/schedule_course`, {
+  const response = await fetch(`${API_URL}/schedule/course`, {
     method: 'POST',
     headers: defaultHeaders(),
     body: JSON.stringify({
@@ -359,4 +363,30 @@ export async function rejectSwapRequest(requestId, reason = '') {
 
 export async function getSwapRequestPendingCount(instructorId) {
   return apiCall(`/swap-requests/pending-count?instructor_id=${instructorId}`)
+}
+
+export async function getAdminStats(semester = 1) {
+  return apiCall(`/stats/admin?semester=${semester}`)
+}
+
+export async function getSchedulingSuggestions(subjectId, courseId, year, semester) {
+  const params = new URLSearchParams({
+    subject_id: subjectId,
+    course_id: courseId,
+    year,
+    semester
+  })
+  return apiCall(`/schedule/suggestions?${params.toString()}`)
+}
+
+export async function checkAvailability(semester, year, dayId, startMin, endMin, subjectId = null) {
+  const params = new URLSearchParams({
+    semester,
+    year,
+    day_id: dayId,
+    start_min: startMin,
+    end_min: endMin
+  })
+  if (subjectId) params.append('subject_id', subjectId)
+  return apiCall(`/schedule/availability?${params.toString()}`)
 }

@@ -25,6 +25,7 @@ import AdminLayout from './layouts/AdminLayout'
 import AdminDashboard from './pages/Admin/Dashboard'
 import AdminUsers from './pages/Admin/Users'
 import AdminRoomSchedule from './pages/Admin/RoomSchedule'
+import ScheduleCourse from './pages/Admin/ScheduleCourse'
 import { isAuthenticated } from './store/auth'
 
 function Guard({ children, role }) {
@@ -94,6 +95,7 @@ export default function App() {
 				<Route path="dashboard" element={<AdminDashboard />} />
 				<Route path="users" element={<AdminUsers />} />
 				<Route path="room-schedule" element={<AdminRoomSchedule />} />
+				<Route path="generate" element={<ScheduleCourse />} />
 			</Route>
 		</Routes>
 	)

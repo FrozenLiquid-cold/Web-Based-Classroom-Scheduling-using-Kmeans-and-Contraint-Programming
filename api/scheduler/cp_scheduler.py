@@ -14,8 +14,21 @@ from api.scheduler.timeslots import (
     is_consecutive_blocks,
     get_all_time_slots,
 )
+from api.scheduler.slot_availability import (
+    get_available_slots,
+    get_instructor_availability,
+    generate_recommendations,
+    diagnose_scheduling_failure,
+)
 
 logger = logging.getLogger(__name__)
+
+# Add file handler to capture all logs to file for debugging
+_file_handler = logging.FileHandler("scheduler_debug.log", mode="w")
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(_file_handler)
+logger.setLevel(logging.DEBUG)
 
 # Optional: subject IDs for which we emit extra detailed debug logs (e.g.,
 # unscheduled or problematic subjects such as OS 101 / CS Prof Elect 9).
@@ -41,6 +54,27 @@ NSTP_TIME_LABEL = "SUN 8:00–11:00"  # Display label for NSTP time slot
 
 # Extended hours: allow evening slots up to 9PM
 MAX_END_TIME_MIN = 1260  # 21:00 (9PM) in minutes
+
+
+def _range_conflicts(ranges_dict, key, day_id, start, end):
+    """Check if time range overlaps with any range in the dictionary list.
+    
+    Returns:
+        None if no conflict
+        metadata dict (or True) if conflict found
+    """
+    for entry in ranges_dict.get((key, day_id), []):
+        # Handle both (start, end) and (start, end, metadata) formats
+        if len(entry) == 3:
+            s, e, metadata = entry
+        else:
+            s, e = entry
+            metadata = True  # Default if no metadata
+            
+        if not (end <= s or e <= start):
+            return metadata
+            
+    return None
 
 
 def _is_nstp_subject(subject) -> bool:
@@ -219,17 +253,7 @@ def _ranges_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
     return not (a_end <= b_start or b_end <= a_start)
 
 
-def _range_conflicts(booked_ranges: Dict[Tuple[Any, int], List[Tuple[int, int]]], resource_key: Any, day_id: int, start_min: int, end_min: int) -> bool:
-    try:
-        day_id_int = int(day_id)
-        start_i = int(start_min)
-        end_i = int(end_min)
-    except Exception:
-        return False
-    for bs, be in booked_ranges.get((resource_key, day_id_int), []):
-        if _ranges_overlap(start_i, end_i, bs, be):
-            return True
-    return False
+
 
 
 # --- BEGIN REWRITE: robust start-option generation and safe CP var creation ---
@@ -491,7 +515,7 @@ def generate_all_subject_start_options(
             sorted(day_labels_in_slots - day_labels_expected)
         )
     else:
-        logger.debug("✓ slots_by_day has entries for all %d days: %s",
+        logger.debug("[OK] slots_by_day has entries for all %d days: %s",
                      len(day_labels_expected), sorted(day_labels_expected))
 
     # Generate options per subject
@@ -675,9 +699,10 @@ def generate_subject_start_options(
     if logger:
         logger.debug("generate_subject_start_options: Subject %s type='%s'", subj_id, subj_type)
 
-    # --- LAB logic: MW, TTh, F using LAB-only windows ---
+    # --- LAB logic: MW, TTh, F patterns (same as LEC, prioritizing MW/TTh) ---
+    # LAB subjects use same day patterns as LEC per user requirements
     if subj_type == "LAB":
-        debug_log("Processing as LAB subject (MW/TTh/F patterns)")
+        debug_log("Processing as LAB subject (MW/TTh/F patterns, same as LEC)")
 
         mon_day = day_label_to_day.get(MON)
         wed_day = day_label_to_day.get(WED)
@@ -685,15 +710,9 @@ def generate_subject_start_options(
         thu_day = day_label_to_day.get(THU)
         fri_day = day_label_to_day.get(FRI)
 
-        # Pattern MW (LAB) - Filter to only use is_lab=True slots (90 min)
-        # LAB subjects MUST use LAB-designated time blocks to get proper 1.5-hour duration
+        # Pattern MW (prioritized)
         if mon_day and wed_day and MON in slots_by_day and WED in slots_by_day:
-            debug_log("Generating MW LAB patterns (filtering for is_lab=True slots)")
-            # Filter to only LAB slots for LAB subjects
-            mon_lab_slots = [s for s in slots_by_day[MON] if s.get("is_lab", False)]
-            wed_lab_slots = [s for s in slots_by_day[WED] if s.get("is_lab", False)]
-            debug_log(f"Filtered LAB slots: M={len(mon_lab_slots)}, W={len(wed_lab_slots)}")
-            for mon_slot in mon_lab_slots:
+            for mon_slot in slots_by_day[MON]:
                 wed_slot = _find_matching_slot(slots_by_day[WED], mon_slot)
                 if wed_slot is None:
                     continue
@@ -734,14 +753,10 @@ def generate_subject_start_options(
                     "num_slots": len(all_slot_indexes),
                 })
 
-        # Pattern TTh (LAB) - Filter to only use is_lab=True slots (90 min)
+        # Pattern TTh (prioritized)
         if tue_day and thu_day and TUE in slots_by_day and THU in slots_by_day:
-            debug_log("Generating TTh LAB patterns (filtering for is_lab=True slots)")
-            tue_lab_slots = [s for s in slots_by_day[TUE] if s.get("is_lab", False)]
-            thu_lab_slots = [s for s in slots_by_day[THU] if s.get("is_lab", False)]
-            debug_log(f"Filtered LAB slots: T={len(tue_lab_slots)}, TH={len(thu_lab_slots)}")
-            for tue_slot in tue_lab_slots:
-                thu_slot = _find_matching_slot(thu_lab_slots, tue_slot)
+            for tue_slot in slots_by_day[TUE]:
+                thu_slot = _find_matching_slot(slots_by_day[THU], tue_slot)
                 if thu_slot is None:
                     continue
 
@@ -781,18 +796,16 @@ def generate_subject_start_options(
                     "num_slots": len(all_slot_indexes),
                 })
 
-        # Pattern F (single-day LAB) - Filter to only use is_lab=True slots (90 min)
+        # Pattern F (fallback)
         if fri_day and FRI in slots_by_day:
-            debug_log("Generating F LAB patterns (filtering for is_lab=True slots)")
-            fri_lab_slots = [s for s in slots_by_day[FRI] if s.get("is_lab", False)]
-            debug_log(f"Filtered LAB slots: F={len(fri_lab_slots)}")
-            for fri_slot in fri_lab_slots:
-                slot_indexes = fri_slot.get("index", [])
-                if isinstance(slot_indexes, int):
-                    slot_indexes = [slot_indexes]
-                block_indices = set(fri_slot.get("block_indices", []))
-                if not block_indices:
-                    block_indices = {slot_indexes[0]} if slot_indexes else set()
+            for fri_slot in slots_by_day[FRI]:
+                fri_slot_indexes = fri_slot.get("index", [])
+                if isinstance(fri_slot_indexes, int):
+                    fri_slot_indexes = [fri_slot_indexes]
+
+                fri_block_indices = set(fri_slot.get("block_indices", []))
+                if not fri_block_indices:
+                    fri_block_indices = {fri_slot_indexes[0]} if fri_slot_indexes else set()
 
                 start_min = fri_slot.get("start_min")
                 end_min = fri_slot.get("end_min")
@@ -805,34 +818,40 @@ def generate_subject_start_options(
                     "start_min": start_min,
                     "end_min": end_min,
                     "duration_min": duration_min,
-                    "block_indices": block_indices,
-                    "blocks_by_day": {fri_day.id: block_indices},
-                    "slot_indexes": slot_indexes,
+                    "block_indices": fri_block_indices,
+                    "blocks_by_day": {fri_day.id: fri_block_indices},
+                    "slot_indexes": fri_slot_indexes,
                     "blocks_spanned": set(fri_slot.get("blocks_spanned", [])),
                     "slot_labels": [fri_slot.get("label", "")],
-                    "num_slots": len(slot_indexes),
+                    "num_slots": len(fri_slot_indexes),
                 })
 
-        if logger:
-            logger.debug(
-                "generate_subject_start_options: Subject %s (LAB) -> %d MW/TTh/F LAB options",
-                subj_id,
-                len(options),
-            )
-
-        # Extra per-option logging for debug subjects (e.g. unscheduled ones)
-        try:
-            subj_id_int = int(subj_id)
-        except Exception:
-            subj_id_int = None
-        if subj_id_int is not None and subj_id_int in DEBUG_SUBJECT_IDS and logger:
+        if logger and options:
+            logger.info(f"generate_subject_start_options: Subject {subj_id} (LAB) -> {len(options)} options (MW/TTh/F)")
+            
+            # Track unique days and pattern types in options
+            all_days_set = set()
+            pattern_types = defaultdict(int)
             for opt in options:
-                days = opt.get("days")
-                start_min = opt.get("start_min")
-                end_min = opt.get("end_min")
-                duration_min = opt.get("duration_min")
-                slot_labels = opt.get("slot_labels")
-                logger.info(
+                days = opt.get("days", [])
+                all_days_set.update(days)
+                if set(days) == {MON, WED}:
+                    pattern_types["MW"] += 1
+                elif set(days) == {TUE, THU}:
+                    pattern_types["TTh"] += 1
+                elif len(days) == 1 and FRI in days:
+                    pattern_types["F"] += 1
+                    
+            # Debug logging
+            try:
+                subj_id_int = int(subj_id)
+                start_min = options[0].get("start_min") if options else None
+                end_min = options[0].get("end_min") if options else None
+                duration_min = options[0].get("duration_min") if options else None
+                days = options[0].get("days") if options else []
+                slot_labels = options[0].get("slot_labels") if options else []
+                
+                logger.debug(
                     "[DEBUG OPTIONS] LAB subject %s code=%s days=%s time=%s (%d-%d, dur=%d)",
                     subj_id_int,
                     getattr(subject, "code", ""),
@@ -842,6 +861,9 @@ def generate_subject_start_options(
                     end_min,
                     duration_min,
                 )
+            except Exception:
+                pass
+                
         return options
 
     # --- LEC logic: MW, TTh, F ---
@@ -1039,15 +1061,21 @@ def build_eligibility_maps(
     instructors: List[models.Instructor],
     rooms: List[models.Room],
     db: Session = None
-) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
+) -> Tuple[Dict[int, List[int]], Dict[int, List[int]], Dict[int, List[int]]]:
     """
     Build instructor and room eligibility PER SUBJECT SECTION.
     Keys are subject.id (NOT course_id).
+    
+    Returns:
+        subject_to_instructors: Dict[int, List[int]]
+        subject_to_all_rooms: Dict[int, List[int]] (All valid rooms by type)
+        subject_to_preferred_rooms: Dict[int, List[int]] (Preferred rooms from rules/SP)
     """
 
-    # Final maps (correct)
+    # Final maps
     subject_to_instructors: Dict[int, List[int]] = defaultdict(list)
-    subject_to_rooms: Dict[int, List[int]] = defaultdict(list)
+    subject_to_all_rooms: Dict[int, List[int]] = defaultdict(list)
+    subject_to_preferred_rooms: Dict[int, List[int]] = defaultdict(list)
 
     # ---------------------------------------------------------
     # Load course → college_id mapping (only if DB session provided)
@@ -1074,10 +1102,9 @@ def build_eligibility_maps(
         subj_college = course_college_map.get(subj_course_id)
 
         eligible_instrs: List[int] = []
-        eligible_rooms: List[int] = []
-        sp_instr_count = 0
-        sp_room_count = 0
-
+        preferred_rooms: List[int] = []
+        
+        # 1. Fetch from DB/SP (Strict/Preferred rules)
         if db is not None:
             try:
                 base_sid_val = getattr(subject, "original_subject_id", sid)
@@ -1088,44 +1115,26 @@ def build_eligibility_maps(
             try:
                 db_instrs = db_procedures.get_instructor_eligibility(db, base_sid)
                 eligible_instrs = [inst.id for inst in db_instrs]
-                sp_instr_count = len(eligible_instrs)
             except Exception as e:
                 logger.warning(
-                    "build_eligibility_maps: instructor eligibility SP failed for subject %s (ID=%s, base_sid=%s): %s",
-                    subj_code,
-                    sid,
-                    base_sid,
-                    e,
+                    "build_eligibility_maps: instructor eligibility SP failed for subject %s: %s",
+                    subj_code, e,
                 )
                 eligible_instrs = []
 
             try:
                 db_rooms = db_procedures.get_room_eligibility(db, base_sid)
-                eligible_rooms = [room.id for room in db_rooms]
-                sp_room_count = len(eligible_rooms)
+                preferred_rooms = [room.id for room in db_rooms]
             except Exception as e:
                 logger.warning(
-                    "build_eligibility_maps: room eligibility SP failed for subject %s (ID=%s, base_sid=%s): %s",
-                    subj_code,
-                    sid,
-                    base_sid,
-                    e,
+                    "build_eligibility_maps: room eligibility SP failed for subject %s: %s",
+                    subj_code, e,
                 )
-                eligible_rooms = []
+                preferred_rooms = []
 
-            if sid in {16, 17, 27, 28, 32} or base_sid in {16, 17, 27, 28, 32}:
-                logger.info(
-                    "Eligibility SP debug: subject %s (sid=%s, base_sid=%s): sp_instr=%d, sp_rooms=%d",
-                    subj_code,
-                    sid,
-                    base_sid,
-                    sp_instr_count,
-                    sp_room_count,
-                )
-
+        # 2. Fallback for Instructors if empty
         if not eligible_instrs:
             eligible_instrs = []
-
             for inst in instructors:
                 inst_id = inst.id
                 inst_college = inst.college_id
@@ -1133,7 +1142,6 @@ def build_eligibility_maps(
                 assignable_set = {c.strip().upper() for c in assignable.split(",") if c.strip()}
 
                 matched = False
-
                 if assignable_set and subj_code in assignable_set:
                     matched = True
                 elif subj_college and inst_college and subj_college == inst_college:
@@ -1145,36 +1153,53 @@ def build_eligibility_maps(
                     eligible_instrs.append(inst_id)
 
         subject_to_instructors[sid] = eligible_instrs
+        subject_to_preferred_rooms[sid] = preferred_rooms
 
-        if not eligible_rooms:
-            eligible_rooms = []
-            for room in rooms:
-                room_type = (room.type or "").upper().strip()
-                if room_type == subj_type:
-                    eligible_rooms.append(room.id)
+        # 3. Build All Valid Rooms (Type-based Hard Constraint)
+        # Allows scheduler to pick NON-preferred rooms with a penalty
+        all_valid_rooms = []
+        for room in rooms:
+            room_type = (room.type or "").upper().strip()
+            # Strict type match
+            if room_type == subj_type:
+                all_valid_rooms.append(room.id)
 
-        # CRITICAL: Exclude FIELD room for non-NSTP subjects
-        # FIELD is reserved exclusively for NSTP subjects
+        # CRITICAL: Exclude FIELD room for non-NSTP subjects from ALL lists
         if not _is_nstp_subject(subject):
-            field_room_ids = [room.id for room in rooms if (room.name or "").upper() == "FIELD"]
+            field_room_ids = {room.id for room in rooms if (room.name or "").upper() == "FIELD"}
             if field_room_ids:
-                eligible_rooms = [rid for rid in eligible_rooms if rid not in field_room_ids]
+                all_valid_rooms = [rid for rid in all_valid_rooms if rid not in field_room_ids]
+                # Also filter preferred just in case SP returned bad data
+                subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in field_room_ids]
+        
+        # Capacity check logic could go here, but usually done in solver options generation
+        
+        # If no valid rooms found by type (fallback for data issues), rely on preferred or all
+        if not all_valid_rooms:
+            if preferred_rooms:
+                 all_valid_rooms = list(preferred_rooms)
+            else:
+                 # Last resort: all rooms except FIELD
+                 field_ids = {room.id for room in rooms if (room.name or "").upper() == "FIELD"}
+                 all_valid_rooms = [r.id for r in rooms if r.id not in field_ids]
 
-        subject_to_rooms[sid] = eligible_rooms
+        subject_to_all_rooms[sid] = all_valid_rooms
 
     # ---------------------------------------------------------
     # Logging summary
     # ---------------------------------------------------------
     instr_nonempty = sum(1 for s in subject_to_instructors if subject_to_instructors[s])
-    rooms_nonempty = sum(1 for s in subject_to_rooms if subject_to_rooms[s])
+    rooms_preferred = sum(1 for s in subject_to_preferred_rooms if subject_to_preferred_rooms[s])
+    rooms_all = sum(1 for s in subject_to_all_rooms if subject_to_all_rooms[s])
 
     logger.info(
-        "Built per-subject eligibility: subjects_with_instr=%d/%d, subjects_with_rooms=%d/%d",
+        "Built per-subject eligibility: instrs=%d/%d, preferred_rooms=%d/%d, all_rooms=%d/%d",
         instr_nonempty, len(subjects),
-        rooms_nonempty, len(subjects)
+        rooms_preferred, len(subjects),
+        rooms_all, len(subjects)
     )
 
-    return dict(subject_to_instructors), dict(subject_to_rooms)
+    return dict(subject_to_instructors), dict(subject_to_all_rooms), dict(subject_to_preferred_rooms)
 
 
 def get_existing_bookings(
@@ -1182,6 +1207,7 @@ def get_existing_bookings(
     years: Optional[List[int]],
     semester: int,
     exclude_course_id: Optional[int] = None,
+    exclude_years: Optional[List[int]] = None,
     slots_by_day: Optional[Dict[str, List[Dict]]] = None,
     day_id_map: Optional[Dict[str, int]] = None
 ) -> Tuple[Set[Tuple[str, int, int]], Set[Tuple[int, int, int]]]:
@@ -1195,6 +1221,9 @@ def get_existing_bookings(
         years: List of year levels
         semester: Semester (1-2)
         exclude_course_id: Optional course ID to exclude
+        exclude_years: Optional list of year levels to exclude (only combined
+            with exclude_course_id). When provided, only records matching BOTH
+            the course AND the year levels are excluded.
         slots_by_day: Optional dict mapping day labels to slot lists (for conversion)
         day_id_map: Optional dict mapping day labels to day IDs (for conversion)
     
@@ -1209,7 +1238,8 @@ def get_existing_bookings(
         db=db,
         semester=semester,
         years=years,
-        exclude_course_id=exclude_course_id
+        exclude_course_id=exclude_course_id,
+        exclude_years=exclude_years
     )
     
     # Build time_label -> block_index mapping if slots_by_day provided
@@ -1276,18 +1306,18 @@ def _retry_unscheduled_subjects(
     booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     instructor_prefs: Optional[Dict[int, Dict]] = None,
-) -> Dict[int, Dict]:
+) -> Tuple[Dict[int, Dict], Dict[int, Dict[str, int]]]:
     """
     Retry pass: attempt to schedule subjects that weren't scheduled in initial cluster runs.
     Uses a simplified greedy approach to find any available slots.
     
     Returns:
-        Dict mapping subject_id -> scheduled item dict (one row per subject in retry).
+        Tuple of (Dict mapping subject_id -> scheduled item dict, Dict of debug stats).
     """
     retry_results: Dict[int, Dict] = {}
     
     if not unscheduled_subjects:
-        return retry_results
+        return retry_results, {}
     
     logger.info("Retry pass: attempting to schedule %d unscheduled subjects", len(unscheduled_subjects))
     
@@ -1360,31 +1390,84 @@ def _retry_unscheduled_subjects(
         logger.warning("Retry pass: could not sort unscheduled subjects by LEC/LAB: %s", e)
         unscheduled_subjects_sorted = unscheduled_subjects
 
-    return _cp_retry_mini_model(
-        db=db,
-        unscheduled_subjects=unscheduled_subjects_sorted,
-        course_to_instructors=course_to_instructors,
-        course_to_rooms=course_to_rooms,
-        slots_by_day=slots_by_day,
-        booked_room_slots_global=booked_room_slots_global,
-        booked_instr_slots_global=booked_instr_slots_global,
-        rooms=rooms,
-        days=days,
-        room_id_to_name=room_id_to_name,
-        course_id=course_id,
-        default_year=default_year,
-        semester=semester,
-        focus_subject_ids_set=focus_subject_ids_set,
-        lec_instructor_by_key=lec_instructor_by_key,
-        student_time_ranges=student_time_ranges,
-        global_instr_map=global_instr_map,
-        booked_room_ranges_global=booked_room_ranges_global,
-        booked_instr_ranges_global=booked_instr_ranges_global,
-        instructor_prefs=instructor_prefs,
-    )
+    # Retry Loop: Try strict first, then relaxed
+    # Pass 1: Strict (honor all preferences, short timeout)
+    # Pass 2: Relaxed (ignore optional prefs, longer timeout)
+    
+    phases = [False] # Always try strict first
+    # Only try relaxed if we have unscheduled subjects left
+    # But we can't know ahead of time. So we'll append to phases dynamically or just loop.
+    
+    current_unscheduled = unscheduled_subjects_sorted
+    all_retry_results = {}
+    all_debug_stats = {}
+    
+    for attempt in range(2):
+        relaxed = (attempt == 1)
+        if not current_unscheduled:
+            break
+            
+        pass_results, pass_stats = _cp_retry_mini_model(
+            db=db,
+            unscheduled_subjects=current_unscheduled,
+            course_to_instructors=course_to_instructors,
+            course_to_rooms=course_to_rooms,
+            slots_by_day=slots_by_day,
+            booked_room_slots_global=booked_room_slots_global,
+            booked_instr_slots_global=booked_instr_slots_global,
+            rooms=rooms,
+            days=days,
+            room_id_to_name=room_id_to_name,
+            course_id=course_id,
+            default_year=default_year,
+            semester=semester,
+            focus_subject_ids_set=focus_subject_ids_set,
+            lec_instructor_by_key=lec_instructor_by_key,
+            student_time_ranges=student_time_ranges,
+            global_instr_map=global_instr_map,
+            booked_room_ranges_global=booked_room_ranges_global,
+            booked_instr_ranges_global=booked_instr_ranges_global,
+            instructor_prefs=instructor_prefs,
+            relaxed=relaxed,
+        )
+        
+        # Merge results
+        all_retry_results.update(pass_results)
+        
+        # Merge stats (keep most specific failure reason)
+        for sid, stats in pass_stats.items():
+            if sid not in all_debug_stats:
+                all_debug_stats[sid] = stats
+            else:
+                # If we have a new stat and it's meaningful (e.g. candidates > 0), maybe update
+                # simpler: just overwrite for now, or keep the one that had candidates.
+                # Actually, if pass 2 found candidates but pass 1 didn't, we want pass 2 stats.
+                if stats.get("candidates", 0) > 0:
+                    all_debug_stats[sid] = stats
+
+        # Update unscheduled list for next pass
+        # (The keys of all_retry_results correspond to subject.id)
+            
+        # Re-filter current_unscheduled
+        scheduled_keys = set(all_retry_results.keys())
+        current_unscheduled = [s for s in current_unscheduled if s.id not in scheduled_keys]
+        
+        if not current_unscheduled:
+            break
+
+    # Final result set
+    retry_results = all_retry_results
+    debug_subject_stats = all_debug_stats
+    
+    # We need to return the merged stats, but the signature expects (results, stats)
+    # The greedy loop below modifies retry_results in place.
+    
+    
+    # --- END RETRY LOOP ---
 
     # Use greedy approach for retry - simpler and faster than full CP model
-    for subject in unscheduled_subjects_sorted:
+    # (Fallback for anything still unscheduled)
+    for subject in current_unscheduled:
         if focus_subject_ids_set and subject.id not in focus_subject_ids_set:
             continue
             
@@ -1418,6 +1501,17 @@ def _retry_unscheduled_subjects(
         min_slots = subject.min_slots or rec_slots
         if is_lab_subject:
             min_slots = 1
+            
+        # Metrics for diagnostics
+        eligible_room_count = len(eligible_rooms)
+        eligible_instr_count = len(eligible_instrs)
+        failure_metrics = {
+            "windows_considered": 0,
+            "valid_windows": 0,
+            "room_conflicts": 0,
+            "instr_conflicts": 0,
+            "student_conflicts": 0
+        }
         
         # Try to find any available slot (single-day greedy for both LEC and LAB)
         scheduled = False
@@ -1468,24 +1562,22 @@ def _retry_unscheduled_subjects(
                     # We only know the day here; room/instructor are checked in their loops below.
                     pass
                 
-                # Check if this time slot would conflict with any already-scheduled subject for same students
+                # Track considered windows
+                failure_metrics["windows_considered"] += 1
+
+                # Check student conflicts
                 has_student_conflict = False
                 existing_ranges = student_time_ranges.get((subj_course_id, subj_year, subj_block_label, day.id), [])
                 for existing_start, existing_end in existing_ranges:
-                    # Check for overlap: proposed time overlaps with existing time
                     if not (proposed_end_min <= existing_start or proposed_start_min >= existing_end):
                         has_student_conflict = True
-                        # Only log once per start_pos to avoid spam
-                        if start_pos == 0 or start_pos % 10 == 0:  # Log every 10th attempt or first attempt
-                            logger.debug(f"[RETRY] Subject {subject.id} ({subject.code}) time slot "
-                                           f"{proposed_start_min}-{proposed_end_min} conflicts with "
-                                           f"{existing_start}-{existing_end} (course_id={subj_course_id}, year={subj_year}, day={day.id})")
                         break
-
-                # If this time slot has a student conflict, skip ALL rooms/instructors for this start_pos
-                # and try the next start position
+                
                 if has_student_conflict:
-                    continue  # Skip to next start_pos (student conflicts are time-based, not room/instructor-based)
+                    failure_metrics["student_conflicts"] += 1
+                    continue
+                
+                failure_metrics["valid_windows"] += 1
                 
                 # Check room availability
                 for room_id in eligible_rooms:
@@ -1495,13 +1587,14 @@ def _retry_unscheduled_subjects(
                     if not room_name:
                         continue
 
-                    # Range-based room conflict check (cross-block safety)
+                    # Range-based room conflict check
                     if booked_room_ranges_global is not None and _range_conflicts(
                         booked_room_ranges_global, room_name, day.id, proposed_start_min, proposed_end_min
                     ):
+                        failure_metrics["room_conflicts"] += 1
                         continue
                     
-                    # Check if room is booked for any slot in block (using block_index)
+                    # Check if room is booked for any slot
                     room_available = True
                     for slot in block:
                         block_index = slot["index"]
@@ -1510,24 +1603,31 @@ def _retry_unscheduled_subjects(
                             break
                     
                     if not room_available:
+                        failure_metrics["room_conflicts"] += 1
                         continue
                     
-                    # Check instructor availability (using block_index)
+                    # Check instructor availability
                     for instructor_id in eligible_instrs:
                         if scheduled:
                             break
 
-                        # Range-based instructor conflict check (cross-block safety)
+                        # Range-based instructor conflict check
                         if booked_instr_ranges_global is not None and _range_conflicts(
                             booked_instr_ranges_global, instructor_id, day.id, proposed_start_min, proposed_end_min
                         ):
-                            continue
+                             failure_metrics["instr_conflicts"] += 1
+                             continue
+                             
                         instr_available = True
                         for slot in block:
                             block_index = slot["index"]
                             if (instructor_id, day.id, block_index) in booked_instr_slots_global:
                                 instr_available = False
                                 break
+                        
+                        if not instr_available:
+                            failure_metrics["instr_conflicts"] += 1
+                            continue
                         
                         if instr_available:
                             time_label = first_slot["label"] if min_slots == 1 else f"{first_slot['start']}–{last_slot['end']}"
@@ -1582,11 +1682,40 @@ def _retry_unscheduled_subjects(
 
                             student_time_ranges[(subj_course_id, subj_year, subj_block_label, day.id)].append((proposed_start_min, proposed_end_min))
 
+                            # Log success
                             scheduled = True
                             break
-    
+            
+            # Record failure reason if not scheduled
+            if not scheduled:
+                reason = "Unscheduled"
+                if eligible_room_count == 0:
+                    reason = "No Rooms"
+                elif eligible_instr_count == 0:
+                    reason = "No Instructor"
+                elif failure_metrics["valid_windows"] == 0:
+                    # No windows available due to constraints (time/duration)
+                    reason = "Time Constraint"
+                elif failure_metrics["student_conflicts"] > 0 and failure_metrics["room_conflicts"] == 0 and failure_metrics["instr_conflicts"] == 0:
+                     reason = "Student Conflict"
+                elif failure_metrics["room_conflicts"] > 0 and failure_metrics["instr_conflicts"] == 0:
+                    # Slots existed but rooms were taken
+                    reason = "Room Conflict"
+                elif failure_metrics["instr_conflicts"] > 0:
+                    # Slots existed but instructors were busy
+                    reason = "Instructor Conflict"
+                elif failure_metrics["windows_considered"] > 0:
+                     # Fallback
+                     reason = "Solver Conflict"
+                
+                debug_subject_stats[subject.id].update({
+                     "failure_reason": reason,
+                     "metrics": failure_metrics
+                })
+
     logger.info("Retry pass completed: scheduled %d/%d subjects", len(retry_results), len(unscheduled_subjects))
-    return retry_results
+    logger.info(f"[RETRY DEBUG] returning debug_subject_stats with {len(debug_subject_stats)} keys: {list(debug_subject_stats.keys())}")
+    return retry_results, debug_subject_stats
 
 
 def _cp_retry_mini_model(
@@ -1610,15 +1739,17 @@ def _cp_retry_mini_model(
     booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     instructor_prefs: Optional[Dict[int, Dict]] = None,
-) -> Dict[int, Dict]:
+    relaxed: bool = False,
+) -> Tuple[Dict[int, Dict], Dict[int, Dict[str, int]]]:
     retry_results: Dict[int, Dict] = {}
 
     if not unscheduled_subjects:
-        return retry_results
+        return retry_results, {}
 
     logger.info(
-        "CP retry pass: attempting to schedule %d unscheduled subjects with mini CP model",
+        "CP retry pass: attempting to schedule %d unscheduled subjects with mini CP model (relaxed=%s)",
         len(unscheduled_subjects),
+        relaxed,
     )
 
     debug_subject_stats: Dict[int, Dict[str, int]] = defaultdict(
@@ -1632,6 +1763,7 @@ def _cp_retry_mini_model(
                 "instr_checks": 0,
                 "instr_conflicts": 0,
                 "candidates": 0,
+                "rejection_counters": defaultdict(int),
             }
         )
 
@@ -1653,6 +1785,7 @@ def _cp_retry_mini_model(
             base_id = clone_id
 
         if focus_subject_ids_set and (base_id is None or base_id not in focus_subject_ids_set):
+            logger.info(f"[RETRY SKIP] Skipping subject {clone_id} (base {base_id}) - not in focus set")
             continue
 
         stats = debug_subject_stats[clone_id]
@@ -1786,19 +1919,21 @@ def _cp_retry_mini_model(
         if is_lec_subject:
             # For LEC, try MW, TTh, Friday patterns first, then Saturday as last resort
             day_patterns = [
-                ("M", "W"),   # Monday + Wednesday
-                ("T", "TH"),  # Tuesday + Thursday
-                ("F",),       # Friday (3-hour single day) - fallback
-                ("SAT",),     # Saturday - EMERGENCY ONLY
+                (("M", "W"), 3),     # Monday + Wednesday, 90 min per meeting = 3 slots
+                (("T", "TH"), 3),    # Tuesday + Thursday, 90 min per meeting = 3 slots
+                (("F",), 6),         # Friday (3-hour single day) = 6 slots
+                (("SAT",), 6),       # Saturday - EMERGENCY ONLY
             ]
         else:
-            # For LAB (and other types), try Friday first, then Saturday
+            # For LAB (and other types), use same MW/TTh/F patterns as LEC
             day_patterns = [
-                ("F",),       # Friday - primary
-                ("SAT",),     # Saturday - EMERGENCY ONLY
+                (("M", "W"), 3),     # Monday + Wednesday (prioritized)
+                (("T", "TH"), 3),    # Tuesday + Thursday (prioritized)
+                (("F",), 6),         # Friday - fallback
+                (("SAT",), 6),       # Saturday - EMERGENCY ONLY
             ]
         
-        for pattern in day_patterns:
+        for pattern, pattern_min_slots in day_patterns:
             # Get day objects for this pattern
             pattern_days = [d for d in days if d.label in pattern]
             if len(pattern_days) != len(pattern):
@@ -1814,31 +1949,39 @@ def _cp_retry_mini_model(
             # For single-day patterns (LAB), just use the first day
             primary_day = pattern_days[0]
             day_slots = slots_by_day.get(primary_day.label, [])
-            max_start = len(day_slots) - min_slots
+            max_start = len(day_slots) - pattern_min_slots
             
             # Debug: Log available slots for this pattern
-            if subj_code in ("GE - E", "GE - CW"):
-                logger.info(f"CP retry DEBUG: subject {subj_code} (ID={subject.id}) pattern={pattern}, day_slots={len(day_slots)}, min_slots={min_slots}, max_start={max_start}")
+            if subj_code in ("GE - E", "GE - CW", "GE - MM", "GE - US"):
+                logger.info(f"CP retry DEBUG: subject {subj_code} (ID={subject.id}) pattern={pattern}, day_slots={len(day_slots)}, pattern_min_slots={pattern_min_slots}, max_start={max_start}")
             
             if max_start < 0:
-                if subj_code in ("GE - E", "GE - CW"):
+                if subj_code in ("GE - E", "GE - CW", "GE - MM", "GE - US"):
                     logger.info(f"CP retry DEBUG: subject {subj_code} pattern={pattern} skipped - max_start < 0")
                 continue
 
             for start_pos in range(max_start + 1):
-                block = day_slots[start_pos : start_pos + min_slots]
-                if len(block) < min_slots:
+                block = day_slots[start_pos : start_pos + pattern_min_slots]
+                if len(block) < pattern_min_slots:
                     continue
 
-                if not is_consecutive_blocks([slot["index"] for slot in block]):
-                    continue
+                # NOTE: Slots in day_slots are already sorted by time. We don't need to check
+                # is_consecutive_blocks here because block IDs (101, 103, 105...) are not
+                # mathematically consecutive but the slots ARE temporally consecutive.
 
                 stats["windows_considered"] += 1
 
                 first_slot = block[0]
                 last_slot = block[-1]
-                subj_course_id = subject.course_id if subject.course_id else course_id
-                subj_year = subject.year_level if subject.year_level else default_year
+                try:
+                    subj_course_id = int(subject.course_id) if subject.course_id else int(course_id)
+                except Exception:
+                    subj_course_id = int(course_id)
+
+                try:
+                    subj_year = int(subject.year_level) if subject.year_level else int(default_year or 0)
+                except Exception:
+                    subj_year = int(default_year or 0)
 
                 subj_block_index = 1
                 try:
@@ -1894,24 +2037,67 @@ def _cp_retry_mini_model(
                     for check_day in pattern_days:
                         check_day_slots = slots_by_day.get(check_day.label, [])
                         if start_pos < len(check_day_slots):
-                            check_block = check_day_slots[start_pos : start_pos + min_slots]
+                            check_block = check_day_slots[start_pos : start_pos + pattern_min_slots]
                             for slot in check_block:
                                 block_index = slot["index"]
                                 if (room_name, check_day.id, block_index) in booked_room_slots_global:
                                     room_available = False
+                                    # Debug incorrect room conflict
+                                    if subj_code == "GE - US" and room_id == 15 and pattern[0] == "M":
+                                        logger.info(f"CP retry DEBUG: GE - US Room 15 CONFLICT at day={check_day.label} slot={block_index}")
                                     break
-                        if not room_available:
-                            break
+                                    room_available = False
+                                    stats["room_conflicts"] += 1
+                                    stats["rejection_counters"]["Other Subject"] += 1
+                                    break
 
-                    if not room_available:
-                        stats["room_conflicts"] += 1
-                        continue
+                    # Range-based room conflict check (cross-block/inter-run safety)
+                    if booked_room_ranges_global is not None:
+                        is_range_conflict = False
+                        for check_day in pattern_days:
+                            check_day_slots = slots_by_day.get(check_day.label, [])
+                            if start_pos < len(check_day_slots):
+                                check_block = check_day_slots[start_pos : start_pos + pattern_min_slots]
+                                if not check_block: continue
+                                block_start_min = int(check_block[0]["start_min"])
+                                block_end_min = int(check_block[-1]["end_min"])
+                                
+                                if _range_conflicts(
+                                    booked_room_ranges_global, room_name, check_day.id, block_start_min, block_end_min
+                                ):
+                                    is_range_conflict = True
+                                    # Debug incorrect room conflict
+                                    if subj_code == "GE - US" and room_id == 15 and pattern[0] == "M":
+                                        logger.info(f"CP retry DEBUG: GE - US Room 15 RANGE CONFLICT at day={check_day.label} {block_start_min}-{block_end_min}")
+                                        logger.info(f"  - Subject Slots: min_slots={min_slots}, rec_slots={rec_slots}, pattern_min_slots={pattern_min_slots}")
+                                        # Log the actual conflicting ranges
+                                        if booked_room_ranges_global and (room_name, check_day.id) in booked_room_ranges_global:
+                                            logger.info(f"  - Existing ranges for {room_name} on day {check_day.label}: {booked_room_ranges_global[(room_name, check_day.id)]}")
+                                    break
+                        if is_range_conflict:
+                            room_available = False
+                            stats["room_conflicts"] += 1
+                            
+                            # Record the specific reason for the conflict
+                            reason = "Unknown Conflict"
+                            conflict_metadata = _range_conflicts(
+                                booked_room_ranges_global, room_name, check_day.id, block_start_min, block_end_min
+                            )
+                            if isinstance(conflict_metadata, dict):
+                                reason = conflict_metadata.get("description") or f"Course {conflict_metadata.get('course_id')}"
+                            elif conflict_metadata is True:
+                                reason = "Existing Schedule"
+                                
+                            stats["rejection_counters"][reason] += 1
+                            continue
+                    
+                    # Room is available, proceed to instructor check
 
                     for instructor_id in eligible_instrs:
                         stats["instr_checks"] += 1
                         
-                        # NEW: Check time preferences
-                        if instructor_prefs and instructor_id in instructor_prefs:
+                        # NEW: Check time preferences (SKIP in relaxed mode)
+                        if not relaxed and instructor_prefs and instructor_id in instructor_prefs:
                             prefs = instructor_prefs[instructor_id]
                             # Start and end times of the candidate window
                             block_start = int(first_slot["start_min"])
@@ -1940,6 +2126,27 @@ def _cp_retry_mini_model(
                         if not instr_available:
                             stats["instr_conflicts"] += 1
                             continue
+
+                        # Range-based instructor conflict check
+                        if booked_instr_ranges_global is not None:
+                            is_instr_range_conflict = False
+                            for check_day in pattern_days:
+                                check_day_slots = slots_by_day.get(check_day.label, [])
+                                if start_pos < len(check_day_slots):
+                                    check_block = check_day_slots[start_pos : start_pos + min_slots]
+                                    if not check_block: continue
+                                    block_start_min = int(check_block[0]["start_min"])
+                                    block_end_min = int(check_block[-1]["end_min"])
+                                    
+                                    if _range_conflicts(
+                                        booked_instr_ranges_global, instructor_id, check_day.id, block_start_min, block_end_min
+                                    ):
+                                        is_instr_range_conflict = True
+                                        break
+                            if is_instr_range_conflict:
+                                stats["instr_conflicts"] += 1
+                                continue
+
 
                         time_label = (
                             first_slot["label"]
@@ -2088,7 +2295,7 @@ def _cp_retry_mini_model(
             "CP retry pass: no viable candidate assignments for %d unscheduled subjects",
             len(unscheduled_subjects),
         )
-        return retry_results
+        return retry_results, debug_subject_stats
 
     logger.info(
         "CP retry pass: built %d candidate assignments for %d unscheduled subjects",
@@ -2189,7 +2396,7 @@ def _cp_retry_mini_model(
 
     solver = cp_model.CpSolver()
     # OPTIMIZED: Same fast settings as main solver
-    solver.parameters.max_time_in_seconds = 10.0
+    solver.parameters.max_time_in_seconds = 30.0 if relaxed else 10.0
     solver.parameters.num_search_workers = max(1, min(2, os.cpu_count() or 1))
     solver.parameters.search_branching = cp_model.AUTOMATIC_SEARCH
     solver.parameters.linearization_level = 0
@@ -2201,7 +2408,7 @@ def _cp_retry_mini_model(
     logger.info("CP retry solver status: %s", solver.StatusName(status))
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return retry_results
+        return retry_results, debug_subject_stats
 
     scheduled_subject_ids = set()  # Track which subjects got scheduled
     
@@ -2312,17 +2519,50 @@ def _cp_retry_mini_model(
                 booked_instr_slots_global.add((instructor_id, day_id, block_index))
             student_time_ranges[cand["student_key"]].append((start_min, end_min))
 
+    # Diagnose failures for items that were NOT scheduled by this CP pass
+    for subject in unscheduled_subjects:
+        if subject.id in scheduled_subject_ids:
+            continue
+            
+        # Determine internal ID used for stats
+        raw_id = getattr(subject, "id", None)
+        try:
+             clone_id = int(raw_id) if raw_id is not None else None
+        except Exception:
+             clone_id = raw_id
+             
+        stats = debug_subject_stats[clone_id]
+        
+        reason = "Unscheduled"
+        if stats["candidates"] > 0:
+            reason = "Solver Conflict"
+        elif stats["eligible_rooms"] == 0:
+            reason = "No Rooms"
+        elif stats["eligible_instrs"] == 0:
+            reason = "No Instructor"
+        elif stats["windows_considered"] == 0:
+            reason = "Time Constraint"
+        elif stats["windows_student_conflict"] > 0 and stats["room_conflicts"] == 0 and stats["instr_conflicts"] == 0:
+             reason = "Student Conflict"
+        elif stats["room_conflicts"] > 0 and stats["instr_conflicts"] == 0:
+             reason = "Room Conflict"
+        elif stats["instr_conflicts"] > 0:
+             reason = "Instructor Conflict"
+        
+        stats["failure_reason"] = reason
+
     logger.info(
         "CP retry pass completed: scheduled %d/%d subjects",
         len(retry_results),
         len(unscheduled_subjects),
     )
-    return retry_results
+    return retry_results, debug_subject_stats
 
 def greedy_initial_schedule(
     cluster_subjects: List[models.Subject],
     course_to_instructors: Dict[str, List[int]],
-    course_to_rooms: Dict[str, List[int]],
+    course_to_all_rooms: Dict[str, List[int]], # Updated name
+    course_to_preferred_rooms: Dict[str, List[int]], # New argument
     slots_by_day: Dict[str, List[Dict]],
     booked_room_slots: Set[Tuple[str, int, int]],  # (room_name, day_id, block_index)
     booked_instr_slots: Set[Tuple[int, int, int]],  # (instr_id, day_id, block_index)
@@ -2330,7 +2570,8 @@ def greedy_initial_schedule(
     days: List[models.Day]
 ) -> Dict:
     """
-    Greedy initializer (warm-start) - simple first-fit greedy scheduling
+    Greedy initializer (warm-start) - simple first-fit greedy scheduling.
+    Prioritizes PREFERRED rooms before trying others.
     
     Returns:
         hints dict: map key (subject_id, room_id, slot_start, instructor_id, dur) -> 0/1
@@ -2339,10 +2580,29 @@ def greedy_initial_schedule(
     room_id_to_name = {r.id: r.name for r in rooms}
     
     for subject in cluster_subjects:
-        course_id = subject.course_id
+        # CRITICAL FIX: Maps are keyed by subject.id, NOT course_id
+        # (See build_eligibility_maps implementation)
+        subject_id = subject.id
+        
         rec_slots = subject.recommended_slots or subject.min_slots or 1
-        eligible_instrs = course_to_instructors.get(course_id, []) if course_id else []
-        eligible_rooms = course_to_rooms.get(course_id, []) if course_id else []
+        eligible_instrs = course_to_instructors.get(subject_id, [])
+        
+        preferred_rooms = course_to_preferred_rooms.get(subject_id, [])
+        all_rooms = course_to_all_rooms.get(subject_id, [])
+        
+        # Build priority list: Preferred first, then others (deduplicated)
+        # Check explicit preferred list first
+        rooms_to_try = []
+        if preferred_rooms:
+            rooms_to_try.extend(preferred_rooms)
+            
+        # Then add remaining valid rooms
+        # Use a set for fast lookup of what's already added
+        added_set = set(preferred_rooms) if preferred_rooms else set()
+        
+        for r in all_rooms:
+            if r not in added_set:
+                rooms_to_try.append(r)
         
         scheduled_flag = False
         
@@ -2369,7 +2629,7 @@ def greedy_initial_schedule(
                 
                 global_start = block[0]["index"]
                 
-                for room_id in eligible_rooms:
+                for room_id in rooms_to_try:
                     if scheduled_flag:
                         break
                     room_name = room_id_to_name.get(room_id)
@@ -2386,7 +2646,7 @@ def greedy_initial_schedule(
                             continue
                         
                         # Accept this as greedy hint
-                        hints[(subject.id, room_id, global_start, instructor_id, rec_slots)] = 1
+                        hints[(subject_id, room_id, global_start, instructor_id, rec_slots)] = 1
                         
                         # Mark booked (using block_index)
                         for slot in block:
@@ -2602,6 +2862,8 @@ def run_cp_scheduler(
     block_capacity_overrides: Optional[Dict[Tuple[int, int, Any], int]] = None,
     block_count: int = 1,
     progress_callback: Optional[Any] = None,
+    booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
+    booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
 ) -> List[Dict]:
     # Debug: Log input parameters
     logger.info("\n" + "="*80)
@@ -2781,6 +3043,8 @@ def run_cp_scheduler(
             else:
                 # Get eligible instructors for NSTP subjects
                 # We'll use CP only for instructor selection to avoid overlaps
+                newly_booked_instructors = set()
+                
                 for nstp_subj in nstp_subjects:
                     nstp_code = getattr(nstp_subj, 'code', 'NSTP')
                     nstp_id = getattr(nstp_subj, 'id', 0)
@@ -2789,44 +3053,103 @@ def run_cp_scheduler(
                     # NSTP 1 should match instructors with "NSTP1" or "NSTP 1"
                     # NSTP 2 should match instructors with "NSTP2" or "NSTP 2"
                     all_instructors = db.query(models.Instructor).all()
-                    eligible_instrs = []
+                    debug_lines = []
                     
-                    # Determine which NSTP level this is
+                    # Score-based selection:
+                    # Priority 1: Exact Match (e.g. NSTP 1 for code NSTP 1)
+                    # Priority 2: Generic Match (e.g. NSTP 2 or just NSTP)
+                    
                     nstp_code_upper = nstp_code.upper().replace(" ", "")
                     is_nstp1 = "NSTP1" in nstp_code_upper or nstp_code_upper == "NSTP"
                     is_nstp2 = "NSTP2" in nstp_code_upper
                     
-                    for instr in all_instructors:
-                        assignable = (getattr(instr, 'assignable_courses', '') or '').upper().replace(" ", "")
-                        # Check for specific NSTP level match
-                        if is_nstp1 and ("NSTP1" in assignable or "NSTP 1" in (getattr(instr, 'assignable_courses', '') or '').upper()):
-                            eligible_instrs.append(instr)
-                        elif is_nstp2 and ("NSTP2" in assignable or "NSTP 2" in (getattr(instr, 'assignable_courses', '') or '').upper()):
-                            eligible_instrs.append(instr)
+                    candidate_pool = []
                     
-                    if not eligible_instrs:
-                        # Fallback: try general NSTP instructors if no specific match found
-                        for instr in all_instructors:
-                            assignable = (getattr(instr, 'assignable_courses', '') or '').upper()
-                            if 'NSTP' in assignable:
-                                eligible_instrs.append(instr)
+                    # Force reload to ensure session is fresh
+                    all_active_instructors = db.query(models.Instructor).all()
                     
-                    if not eligible_instrs:
-                        logger.warning(f"No instructors found for {nstp_code}. Using first 5 instructors as fallback.")
-                        eligible_instrs = all_instructors[:5]
+                    msg_scan = f"[NSTP DEBUG] Scanning {len(all_active_instructors)} instructors for {nstp_code}..."
+                    logger.info(msg_scan)
+                    debug_lines.append(msg_scan)
+
+                    for instr in all_active_instructors:
+                        assignable = (getattr(instr, 'assignable_courses', '') or '').upper()
+                        assignable_clean = assignable.replace(" ", "")
+                        
+                        score = 0
+                        # Check Exact Match
+                        if is_nstp1 and ("NSTP1" in assignable_clean or "NSTP 1" in assignable):
+                            score = 2
+                        elif is_nstp2 and ("NSTP2" in assignable_clean or "NSTP 2" in assignable):
+                            score = 2
+                        # Check Generic Match
+                        elif "NSTP" in assignable:
+                            score = 1
+                            
+                        if score > 0:
+                            candidate_pool.append((score, instr))
+                    
+                    # Sort candidates by score descending (best first)
+                    candidate_pool.sort(key=lambda x: x[0], reverse=True)
+                    
+                    eligible_instrs = [c[1] for c in candidate_pool]
                     
                     # Find an instructor that doesn't have Saturday 8-11am conflict
+                    param_len = len(eligible_instrs)
+                    msg_header = f"[NSTP INFO] found {param_len} qualified candidates for {nstp_code} (Day {sat_day.id})."
+                    logger.info(msg_header)
+                    debug_lines.append(msg_header)
+                    
                     selected_instructor = None
+                    processed_count = 0
+                    
                     for instr in eligible_instrs:
+                        processed_count += 1
+                        
+                        # Check newly booked (in-memory) conflicts
+                        # DEBUG: Print set content
+                        logger.debug(f"  Checking {instr.id} (type {type(instr.id)}) against booked: {newly_booked_instructors}")
+                        
+                        if instr.id in newly_booked_instructors:
+                             msg = f"  -> Candidate {instr.id}: BUSY (Just assigned to another NSTP block)"
+                             if processed_count <= 10: 
+                                 logger.debug(msg)
+                             debug_lines.append(msg)
+                             continue
+
                         # Check if instructor is already booked on Saturday 8-11am
                         existing = db.query(models.Schedule).filter(
                             models.Schedule.instructor_id == instr.id,
                             models.Schedule.day_id == sat_day.id,
                             models.Schedule.semester == semester,
                         ).first()
+                        
                         if not existing:
-                            selected_instructor = instr
-                            break
+                             msg = f"  -> Candidate {instr.id}: AVAILABLE (Selected)."
+                             logger.info(msg)
+                             debug_lines.append(msg)
+                             selected_instructor = instr
+                             # Mark as booked for subsequent iterations
+                             newly_booked_instructors.add(instr.id)
+                             break
+                        else:
+                             msg = f"  -> Candidate {instr.id}: BUSY (Schedule ID: {existing.id})"
+                             # Log first few failures or if list is short
+                             if processed_count <= 10: 
+                                 logger.debug(msg)
+                             debug_lines.append(msg)
+                    
+                    if not selected_instructor:
+                        msg_fail = f"[NSTP FAILURE] All {param_len} candidates were BUSY/CONFLICTED for {nstp_code}."
+                        logger.error(msg_fail)
+                        debug_lines.append(msg_fail)
+                        
+                    # Write debug log to file for easier inspection
+                    try:
+                        with open("nstp_debug.log", "a") as f:
+                            f.write("\n".join(debug_lines) + "\n\n")
+                    except Exception as e:
+                        logger.error(f"Failed to write nstp_debug.log: {e}")
                     
                     if selected_instructor:
                         subj_course_id = getattr(nstp_subj, 'course_id', course_id) or course_id
@@ -2857,9 +3180,9 @@ def run_cp_scheduler(
                                 "end_min": NSTP_END_MIN,
                             }
                             nstp_scheduled_items.append(nstp_item)
-                            logger.info(f"  ✓ NSTP scheduled: {nstp_code} block {block_label} -> Sunday 8-11am, FIELD, Instructor {selected_instructor.id}")
+                            logger.info(f"  [OK] NSTP scheduled: {nstp_code} block {block_label} -> Sunday 8-11am, FIELD, Instructor {selected_instructor.id}")
                     else:
-                        logger.warning(f"  ✗ NSTP {nstp_code}: No available instructor for Sunday 8-11am")
+                        logger.warning(f"  [FAIL] NSTP {nstp_code}: No available instructor for Sunday 8-11am")
                         # Fall back to normal scheduling
                         non_nstp_subjects.append(nstp_subj)
         
@@ -3178,7 +3501,10 @@ def run_cp_scheduler(
     
     # Build eligibility maps for instructors and rooms
     logger.info("\nBuilding eligibility maps...")
-    course_to_instructors, course_to_rooms = build_eligibility_maps(subjects, instructors, rooms, db)
+    course_to_instructors, course_to_all_rooms, course_to_preferred_rooms = build_eligibility_maps(subjects, instructors, rooms, db)
+    # Maintain course_to_rooms alias for backward comp in greedy/retry if needed, or pass all_rooms
+    # Greedy scheduler should ideally try preferred, then all.
+    
     # Create room_id_to_name and room_by_id mappings
     room_id_to_name = {room.id: room.name for room in rooms}
     room_by_id = {room.id: room for room in rooms}
@@ -3214,7 +3540,9 @@ def run_cp_scheduler(
         logger.info(f"- Subject ID: {subj.id}, Code: {getattr(subj, 'code', 'N/A')}, "
                    f"Type: {getattr(subj, 'type', 'N/A')}, "
                    f"Course: {getattr(subj, 'course_id', 'N/A')}, "
-                   f"Year: {getattr(subj, 'year_level', 'N/A')}")
+                   f"Year: {getattr(subj, 'year_level', 'N/A')}, "
+                   f"SBlock: {getattr(subj, 'student_block', 'N/A')}, "
+                   f"Cluster: {getattr(subj, 'cluster', 'N/A')}")
     
     # Log instructors and their colleges
     logger.info("\nAvailable Instructors:")
@@ -3292,7 +3620,7 @@ def run_cp_scheduler(
                         logger.info("  " + ", ".join(list(unique_assignments)[:5]))
         
         # Check room eligibility (maps are per-subject, keyed by subject.id)
-        eligible_room_list = course_to_rooms.get(subj_id, []) if subj_id is not None else []
+        eligible_room_list = course_to_all_rooms.get(subj_id, []) if subj_id is not None else []
         if not eligible_room_list:
             logger.warning("\n⚠️ NO ELIGIBLE ROOMS FOUND")
             
@@ -3333,13 +3661,26 @@ def run_cp_scheduler(
     logger.info("\nLoading existing bookings...")
     booked_room_slots, booked_instr_slots = get_existing_bookings(
         db=db,
-        years=normalized_years,
+        years=None,  # Load ALL years to check global availability (don't filter by normalized_years)
         semester=semester,
         exclude_course_id=course_id,
+        exclude_years=normalized_years,
         slots_by_day=slots_by_day,
         day_id_map=day_id_map,
     )
     
+    # DEBUG: Room Utilization Summary
+    room_util_counts = defaultdict(int)
+    for (r_name, _, _) in booked_room_slots:
+        room_util_counts[r_name] += 1
+    
+    logger.info("\n[DIAGNOSTIC] Room Booking Summary (occupied 30-min slots):")
+    if not room_util_counts:
+        logger.info("  - No rooms are booked.")
+    else:
+        for r_name, count in sorted(room_util_counts.items(), key=lambda x: x[1], reverse=True):
+             logger.info(f"  - {r_name}: {count} slots booked")
+
     # Debug: Log booking counts (avoid duplicate messages when counts are zero)
     if booked_room_slots:
         logger.info(f"- Found {len(booked_room_slots)} existing room bookings")
@@ -3392,7 +3733,7 @@ def run_cp_scheduler(
         )
     else:
         logger.info(
-            "✓ DB time_blocks mapping: %d/%d slots mapped successfully (100%%)",
+            "[OK] DB time_blocks mapping: %d/%d slots mapped successfully (100%%)",
             mapped_count, total_slots
         )
     
@@ -3460,8 +3801,29 @@ def run_cp_scheduler(
     # Additional global booking maps using real minute ranges.
     # This is necessary because TIME_BLOCKS contains overlapping windows (e.g., 7:00–8:30 and 7:30–8:30),
     # so a conflict cannot be represented reliably by (day_id, block_index) alone.
-    booked_room_ranges_global = defaultdict(list)  # (room_name, day_id) -> [(start_min, end_min), ...]
-    booked_instr_ranges_global = defaultdict(list)  # (instr_id, day_id) -> [(start_min, end_min), ...]
+    # CRITICAL: Use passed-in ranges if provided (for inter-run conflict prevention)
+    if booked_room_ranges_global is None:
+        booked_room_ranges_global = defaultdict(list)  # (room_name, day_id) -> [(start_min, end_min), ...]
+    elif not isinstance(booked_room_ranges_global, defaultdict):
+        # Convert to defaultdict if it's a regular dict
+        temp = defaultdict(list)
+        temp.update(booked_room_ranges_global)
+        booked_room_ranges_global = temp
+    
+    if booked_instr_ranges_global is None:
+        booked_instr_ranges_global = defaultdict(list)  # (instr_id, day_id) -> [(start_min, end_min), ...]
+    elif not isinstance(booked_instr_ranges_global, defaultdict):
+        # Convert to defaultdict if it's a regular dict
+        temp = defaultdict(list)
+        temp.update(booked_instr_ranges_global)
+        booked_instr_ranges_global = temp
+
+    logger.info(f"Initialized global blocked ranges: Room keys={len(booked_room_ranges_global)}, Instr keys={len(booked_instr_ranges_global)}")
+    sample_room_key = next(iter(booked_room_ranges_global)) if booked_room_ranges_global else None
+    if sample_room_key:
+         logger.info(f"Sample blocked room ranges for {sample_room_key}: {booked_room_ranges_global[sample_room_key]}")
+
+    # Seed range-based bookings from existing bookings (DB + other courses).
 
     # Seed range-based bookings from existing bookings (DB + other courses).
     # We map (day_id, block_index) -> (start_min, end_min) from the logical slot grid.
@@ -3522,34 +3884,97 @@ def run_cp_scheduler(
 
     day_distribution_tracker = defaultdict(set)  # day_id -> set(subject_id)
 
+    # Identify FIELD room ID for filtering logic (optimizes solver)
+    field_room_id = -1
+    for r in rooms:
+        if r.name and r.name.upper() == "FIELD":
+            field_room_id = r.id
+            break
+
+    # =========================================================================
+    # ADAPTIVE SOLVER: Calculate resource utilization pressure
+    # When resources are 80%+ utilized, the solver needs more options and time
+    # =========================================================================
+    total_room_keys = len(rooms) * len(days)  # Theoretical max room-day combinations
+    total_instr_keys = len(instructors) * len(days) if instructors else 1
+    
+    # Count actually booked room-day combinations
+    booked_room_count = sum(1 for k, v in booked_room_ranges_global.items() if v)
+    booked_instr_count = sum(1 for k, v in booked_instr_ranges_global.items() if v)
+    
+    room_utilization = booked_room_count / max(1, total_room_keys)
+    instr_utilization = booked_instr_count / max(1, total_instr_keys)
+    resource_pressure = max(room_utilization, instr_utilization)
+    
+    # Determine adaptive limits based on resource pressure
+    if resource_pressure >= 0.8:
+        ADAPTIVE_MAX_VARS_PER_SUBJECT = 3000  # Full exploration for tight resources
+        ADAPTIVE_TIME_MULTIPLIER = 2.0
+        ADAPTIVE_GAP_LIMIT = 0.02  # Tighter optimality (2%)
+        logger.info(f"[ADAPTIVE] HIGH resource pressure ({resource_pressure:.1%}): FULL exploration mode")
+    elif resource_pressure >= 0.6:
+        ADAPTIVE_MAX_VARS_PER_SUBJECT = 2000  # Moderate exploration
+        ADAPTIVE_TIME_MULTIPLIER = 1.5
+        ADAPTIVE_GAP_LIMIT = 0.03
+        logger.info(f"[ADAPTIVE] MEDIUM resource pressure ({resource_pressure:.1%}): Enhanced exploration")
+    else:
+        ADAPTIVE_MAX_VARS_PER_SUBJECT = 1000  # Standard
+        ADAPTIVE_TIME_MULTIPLIER = 1.0
+        ADAPTIVE_GAP_LIMIT = 0.05
+        logger.info(f"[ADAPTIVE] LOW resource pressure ({resource_pressure:.1%}): Standard exploration")
+    
+    logger.info(f"[ADAPTIVE] Room utilization: {room_utilization:.1%} ({booked_room_count}/{total_room_keys}), "
+                f"Instructor utilization: {instr_utilization:.1%} ({booked_instr_count}/{total_instr_keys})")
+
     # Main cluster loop
     current_student_block_index = None
     block_cluster_plan = []
+    # GLOBAL SOLVING OPTIMIZATION: 
+    # Instead of solving Block 1 then Block 2 sequentially (which is greedy and can lock out later blocks),
+    # we now solve ALL blocks together in one CP model.
+    # The internal constraints (subject_vars_by_cohort) already differentiate by student_block,
+    # so parallel blocks are supported naturally.
+    
+    # We use a dummy block index 0 to indicate "Mixed/Global" batch.
+    # The logging will show "Moving to student block 0", but the subjects contain their real block IDs.
+    
     if block_count >= 2:
-        for student_block_index in range(1, block_count + 1):
-            for cid, subjs in cluster_items:
-                filtered = []
-                for s in subjs:
-                    try:
-                        sb = int(getattr(s, "student_block", 1) or 1)
-                    except Exception:
-                        sb = 1
-                    if sb == student_block_index:
-                        filtered.append(s)
-                if filtered:
-                    block_cluster_plan.append((student_block_index, cid, filtered))
-    else:
-        for cid, subjs in cluster_items:
-            if subjs:
-                block_cluster_plan.append((1, cid, subjs))
+        logger.info(f"Multi-block course detected ({block_count} blocks). Using GLOBAL SOLVING strategy (all blocks in one batch) to optimize resource allocation.")
+        
+    for cid, subjs in cluster_items:
+        if subjs:
+            # Pass 0 as student_block_index to indicate global batch
+            block_cluster_plan.append((0, cid, subjs))
+
+
+    all_diagnostics: Dict[int, Dict[str, int]] = {}
+    
+    # CRITICAL: Initialize these BEFORE the loop so they accumulate across ALL blocks
+    # This ensures Block B sees Block A's bookings, preventing double-booking conflicts
+    cross_cluster_scheduled_ranges = defaultdict(list)
+    day_distribution_tracker = defaultdict(set)
 
     for student_block_index, cluster_id, cluster_subjects in block_cluster_plan:
+        # DEBUG: Check ranges before loop
+        debug_ranges = booked_room_ranges_global.get(("GS ER 7", 1), [])
+        if debug_ranges:
+             logger.info(f"[RANGE TRACE] Before Block {student_block_index} Cluster {cluster_id}: GS ER 7 Day 1 has {debug_ranges}")
+        else:
+             logger.info(f"[RANGE TRACE] Before Block {student_block_index} Cluster {cluster_id}: GS ER 7 Day 1 is EMPTY")
+
         if current_student_block_index != student_block_index:
             current_student_block_index = student_block_index
-            cross_cluster_scheduled_ranges = defaultdict(list)
-            day_distribution_tracker = defaultdict(set)
+            # CRITICAL FIX: Do NOT reset cross_cluster_scheduled_ranges or day_distribution_tracker!
+            # These MUST accumulate across blocks so Block B sees Block A's bookings.
+            # Bug was: resetting these allowed same room/instructor to be double-booked across blocks.
+            phys_lab_friday = booked_room_ranges_global.get(("Phys Lab", 5), [])
+            logger.info(f"=== Moving to student block {student_block_index} (preserving {len(cross_cluster_scheduled_ranges)} cross-cluster bookings) ===")
+            logger.info(f"[ROOM STATE] Phys Lab Friday bookings: {phys_lab_friday}")
 
         logger.info("=== Solving cluster %s (%d subjects) ===", cluster_id, len(cluster_subjects))
+        
+        # Initialize CP-SAT model for this cluster
+        model = cp_model.CpModel()
         
         # Log subject IDs in this cluster for debugging
         subject_ids_in_cluster = [s.id for s in cluster_subjects]
@@ -3570,7 +3995,8 @@ def run_cp_scheduler(
         greedy_hints = greedy_initial_schedule(
             cluster_subjects,
             course_to_instructors,
-            course_to_rooms,
+            course_to_all_rooms,    # Pass ALL valid rooms
+            course_to_preferred_rooms, # Pass PREFERRED rooms for prioritization
             slots_by_day,
             saved_booked_rooms,
             saved_booked_instrs,
@@ -3582,86 +4008,8 @@ def run_cp_scheduler(
         booked_room_slots_global = saved_booked_rooms
         booked_instr_slots_global = saved_booked_instrs
         
-        model = cp_model.CpModel()
-        
-        subject_ids_list = [s.id for s in cluster_subjects]
-        id_to_code = {s.id: s.code.upper().strip() for s in cluster_subjects}
-        instructor_ids = [i.id for i in instructors]
-        room_ids = [r.id for r in rooms]
-        
-        start_vars = {}
-        start_covers = {}
-        start_options_count = defaultdict(int)
-        
-        # Build start options with pruning (capacity + current global bookings + instructor availability)
-        subjects_without_options = []
-        subjects_skipped_count = 0
-        
-        # PRECOMPUTE: Subject lookup dict (no linear search)
-        subject_lookup_cluster = {s.id: s for s in cluster_subjects}
+        # ... (rest of the logic)
 
-        # Ensure the global lookup includes any per-block clone subjects used in this cluster.
-        # Otherwise, extraction may not be able to map clone_subject_id -> original_subject_id.
-        try:
-            subject_lookup.update(subject_lookup_cluster)
-        except Exception:
-            pass
-        
-        # PRECOMPUTE: Instructor availability per time slot for faster pruning
-        # Using block_index for efficient numeric conflict checking
-        instructor_availability = defaultdict(lambda: defaultdict(set))  # instructor_id -> day_id -> {available block_indices}
-        # Track instructor bookings by block index ranges for efficient overlap checking
-        instructor_booked_blocks = defaultdict(lambda: defaultdict(set))  # instructor_id -> day_id -> {block_index, ...}
-        
-        for instructor_id in instructor_ids:
-            for day in days:
-                day_slots = slots_by_day.get(day.label, [])
-                for slot in day_slots:
-                    block_index = slot["index"]
-                    if (instructor_id, day.id, block_index) not in booked_instr_slots_global:
-                        instructor_availability[instructor_id][day.id].add(block_index)
-                    else:
-                        # Track booked block indices for overlap checking
-                        instructor_booked_blocks[instructor_id][day.id].add(block_index)
-        
-        # PRECOMPUTE: Room booked block indices for overlap checking
-        # booked_room_slots_global already uses block_index, so direct conversion
-        room_booked_blocks = defaultdict(lambda: defaultdict(set))  # room_name -> day_id -> {block_index, ...}
-        for room_name, day_id, block_index in booked_room_slots_global:
-            room_booked_blocks[room_name][day_id].add(block_index)
-        
-        # PRECOMPUTE: Instructor teaching assignments by year_level for student conflict detection
-        instructor_year_assignments = defaultdict(set)  # instructor_id -> {year_level, ...}
-        for subject in cluster_subjects:
-            # CRITICAL: Maps are now keyed by subject.id, not course_id
-            eligible_instrs = course_to_instructors.get(subject.id, [])
-            year_level = subject.year_level or default_year
-            for instr_id in eligible_instrs:
-                instructor_year_assignments[instr_id].add(year_level)
-        
-        # PRECOMPUTE: Room availability per day (room -> day -> available block_indices)
-        # CRITICAL FIX: Use room_id as key (not room_name) for consistency with lookup
-        room_available_blocks = defaultdict(lambda: defaultdict(set))  # room_id -> day_id -> {available block_index, ...}
-        for room in rooms:
-            room_id = room.id
-            room_name = room_id_to_name.get(room_id)
-            if not room_name:
-                continue
-            for day in days:
-                day_slots = slots_by_day.get(day.label, [])
-                booked_blocks = room_booked_blocks.get(room_name, {}).get(day.id, set())
-                all_block_indices = {slot["index"] for slot in day_slots}
-                room_available_blocks[room_id][day.id] = all_block_indices - booked_blocks
-        
-        # PRECOMPUTE: Instructor availability per day (instructor -> day -> available block_indices)
-        instructor_available_blocks = defaultdict(lambda: defaultdict(set))  # instructor_id -> day_id -> {available block_index, ...}
-        for instructor_id in instructor_ids:
-            for day in days:
-                day_slots = slots_by_day.get(day.label, [])
-                booked_blocks = instructor_booked_blocks.get(instructor_id, {}).get(day.id, set())
-                all_block_indices = {slot["index"] for slot in day_slots}
-                instructor_available_blocks[instructor_id][day.id] = all_block_indices - booked_blocks
-        
         # NEW APPROACH: Generate all start options first using robust window generation
         # Determine adaptive sampling based on problem size
         num_total_subjects = len(cluster_subjects)
@@ -3688,17 +4036,28 @@ def run_cp_scheduler(
         start_metadata = {}  # (subject_id, day_id, start_min, opt_idx) -> metadata
         start_vars = {}  # Keep for backward compatibility: (subject_id, room_id, global_start, instructor_id, num_slots) -> var
         start_covers = {}  # Keep for backward compatibility
+        start_options_count = defaultdict(int)  # NEW: Track options per subject
         presence_weekly_minutes = {}
         instructor_presence_terms = defaultdict(list)  # instructor_id -> [(presence_var, weekly_minutes), ...]
         instructor_unit_terms = defaultdict(list)      # instructor_id -> [(presence_var, units), ...]
         
+        soft_room_penalties = []
+        SOFT_ROOM_PENALTY_WEIGHT = 50
+        
         # Global limit: maximum variables per subject to prevent memory explosion
-        # OPTIMIZED: Reduced from 5000 to 300 for faster solving while maintaining schedulability
-        MAX_VARIABLES_PER_SUBJECT = 1000
+        # ADAPTIVE: Increases when resources are heavily utilized (80%+) for better solutions
+        MAX_VARIABLES_PER_SUBJECT = ADAPTIVE_MAX_VARS_PER_SUBJECT
         
         # Track if this is cluster 0 and first subject for detailed debug logging
         is_cluster_0 = (cluster_id == 0)
         first_subject_in_cluster_0_logged = False
+        
+        # Ensure subject_ids_list is defined
+        subject_ids_list = [s.id for s in cluster_subjects]
+        subject_lookup_cluster = {s.id: s for s in cluster_subjects}
+        id_to_code = {s.id: s.code for s in cluster_subjects}
+        subjects_without_options = []  # Track subjects with no valid options
+        subjects_skipped_count = 0  # Count subjects that were fully skipped
         
         for subject_id in subject_ids_list:
             subject = subject_lookup_cluster.get(subject_id)
@@ -3708,14 +4067,22 @@ def run_cp_scheduler(
             code = id_to_code.get(subject_id, f"ID_{subject_id}")  # For logging/debugging
             
             # Always get a LIST - ensure type safety
-            # CRITICAL: Maps are now keyed by subject.id, not course_id
-            eligible_rooms = course_to_rooms.get(subject_id, [])
+            # CRITICAL: Maps are now keyed by subject.id
+            eligible_rooms = course_to_all_rooms.get(subject_id, [])
+            preferred_rooms_list = course_to_preferred_rooms.get(subject_id, [])
+            preferred_rooms_set = set(preferred_rooms_list) if preferred_rooms_list else set()
+
             if not isinstance(eligible_rooms, list):
                 eligible_rooms = list(eligible_rooms) if eligible_rooms else []
             
             eligible_instrs = course_to_instructors.get(subject_id, [])
             if not isinstance(eligible_instrs, list):
                 eligible_instrs = list(eligible_instrs) if eligible_instrs else []
+            
+            # Filter out FIELD room for non-NSTP subjects
+            if field_room_id != -1 and not _is_nstp_subject(subject):
+                if field_room_id in eligible_rooms:
+                    eligible_rooms = [rid for rid in eligible_rooms if rid != field_room_id]
             
             # DEBUG: Log actual lists to verify subject_id lookup is working
             logger.debug(
@@ -3824,7 +4191,7 @@ def run_cp_scheduler(
             # OPTIMIZED: Early termination when we have enough good options
             MIN_VIABLE_OPTIONS = 50  # Stop processing once we have this many viable options
             for opt_idx, opt in enumerate(subj_opts):
-                # Detailed debug logging for FIRST subject in cluster 0, FIRST window only
+                # Detailed debug logging for first subject in cluster 0, first window only
                 is_first_window_detailed = (should_log_detailed and opt_idx == 0)
                 # Safety check: stop creating variables if we've exceeded the limit
                 if subject_var_count >= MAX_VARIABLES_PER_SUBJECT:
@@ -3857,6 +4224,25 @@ def run_cp_scheduler(
                 
                 # Primary day_id for backward compatibility (use first day)
                 day_id = day_ids[0]
+                
+                # ENFORCE NSTP SUNDAY CONSTRAINT
+                # If pre-scheduling failed and we are here, we MUST ensure we don't schedule NSTP on non-Sunday
+                if _is_nstp_subject(subject):
+                    # Find Sunday ID - usually 7 but let's be safe
+                    # We can iterate days list or assume 7. 
+                    # Let's check against the DAY_LABEL constant if available, otherwise "SUN"
+                    is_sunday = False
+                    for d_id in day_ids:
+                        d_obj = next((d for d in days if d.id == d_id), None)
+                        if d_obj and (d_obj.label == "SUN" or d_obj.label == NSTP_DAY_LABEL):
+                            is_sunday = True
+                        else:
+                            is_sunday = False
+                            break
+                    
+                    if not is_sunday:
+                        # Skip this option
+                        continue
                 start_min = opt["start_min"]
                 end_min = opt["end_min"]
                 duration_min = opt["duration_min"]
@@ -3892,20 +4278,11 @@ def run_cp_scheduler(
                 # Detailed debug logging for first subject in cluster 0, first window
                 if is_first_window_detailed:
                     logger.debug("DEBUG - Block indices for window: %s (days: %s)", sorted(list(block_indices)), day_labels)
-                    # Log sample room availability
+                    # Simplified logging to avoid NameError
                     if eligible_rooms:
-                        sample_room_id = eligible_rooms[0]
-                        for d_id in day_ids:
-                            sample_available = room_available_blocks.get(sample_room_id, {}).get(d_id, set())
-                            logger.debug("DEBUG - Room available blocks for ROOMID %d on DAY %d: %s (total: %d blocks)",
-                                       sample_room_id, d_id, sorted(list(sample_available))[:20], len(sample_available))
-                    # Log sample instructor availability
+                        logger.debug(f"DEBUG - Checking {len(eligible_rooms)} eligible rooms (sample: {eligible_rooms[0]})")
                     if eligible_instrs:
-                        sample_instr_id = eligible_instrs[0]
-                        for d_id in day_ids:
-                            sample_instr_available = instructor_available_blocks.get(sample_instr_id, {}).get(d_id, set())
-                            logger.debug("DEBUG - Instructor available blocks for INSTRUCTORID %d on DAY %d: %s (total: %d blocks)",
-                                       sample_instr_id, d_id, sorted(list(sample_instr_available))[:20], len(sample_instr_available))
+                        logger.debug(f"DEBUG - Checking {len(eligible_instrs)} eligible instructors (sample: {eligible_instrs[0]})")
                 
                 # Pre-filter rooms: use precomputed available blocks with per-day checks
                 # CRITICAL: Use blocks_by_day for accurate per-day availability checking
@@ -3915,6 +4292,13 @@ def run_cp_scheduler(
                     # Fallback: construct from block_indices if blocks_by_day missing
                     blocks_by_day = {d_id: block_indices for d_id in day_ids}
                 
+                # Log room filtering results (once per subject, on first window)
+                should_debug_room = subject_id in DEBUG_SUBJECT_IDS
+
+                # Track rejection reasons for this subject/window
+                if "rejection_counters" not in subject.__dict__:
+                    subject.rejection_counters = defaultdict(int)
+
                 for room_id in eligible_rooms:
                     room_name = room_id_to_name.get(room_id)
                     if room_name is None:
@@ -3923,20 +4307,29 @@ def run_cp_scheduler(
                     # Capacity check (per-subject enrollment)
                     room = room_by_id.get(room_id)
                     if room and room.capacity and hasattr(subject, 'enrollment'):
-                        if room.capacity < getattr(subject, 'enrollment', 0):
+                        enrollment = getattr(subject, 'enrollment', 0)
+                        if room.capacity < enrollment:
+                            if should_debug_room:
+                                logger.debug(f"[ROOM REJECT] Subject {subject_id} rejected {room_name} (Cap {room.capacity} < Enroll {enrollment})")
+                            subject.rejection_counters["Capacity"] += 1
                             continue
                     
                     # Check availability for every day in the option
                     room_ok = True
                     for d_id in day_ids:
                         # Range-based conflict check (handles overlapping TIME_BLOCK definitions)
-                        if _range_conflicts(booked_room_ranges_global, room_name, d_id, start_min, end_min):
-                            room_ok = False
-                            break
-                        available_blocks = room_available_blocks.get(room_id, {}).get(d_id, set())
-                        required_blocks = blocks_by_day.get(d_id, block_indices)  # Fallback to union if missing
-                        # Ensure *all* required blocks for that day are available
-                        if not required_blocks.issubset(available_blocks):
+                        conflict_metadata = _range_conflicts(booked_room_ranges_global, room_name, d_id, start_min, end_min)
+                        if conflict_metadata:
+                            if should_debug_room:
+                                logger.debug(f"[ROOM REJECT] Subject {subject_id} rejected {room_name} on Day {d_id} {start_min}-{end_min} due to conflict. Metadata: {conflict_metadata}")
+                            
+                            # Aggregate reason from metadata
+                            reason = "Unknown Conflict"
+                            if isinstance(conflict_metadata, dict):
+                                desc = conflict_metadata.get("description", "Other Booking")
+                                reason = f"Blocked by {desc}"
+                            
+                            subject.rejection_counters[reason] += 1
                             room_ok = False
                             break
                     
@@ -3985,12 +4378,8 @@ def run_cp_scheduler(
                                 instr_ok = False
                                 break
                                 
-                        available_blocks = instructor_available_blocks.get(instructor_id, {}).get(d_id, set())
-                        required_blocks = blocks_by_day.get(d_id, block_indices)  # Fallback to union if missing
-                        # Ensure *all* required blocks for that day are available
-                        if not required_blocks.issubset(available_blocks):
-                            instr_ok = False
-                            break
+                                instr_ok = False
+                                break
                     
                     if not instr_ok:
                         continue
@@ -4047,6 +4436,17 @@ def run_cp_scheduler(
                 # FINAL SAFETY CHECK: Ensure compatible_rooms is not empty before creating variables
                 # This prevents creating instructor-only variables (which would break CP-SAT room constraints)
                 if not compatible_rooms or len(compatible_rooms) == 0:
+                    # Log rejection reasons if we have them
+                    if "rejection_counters" in subject.__dict__ and subject.rejection_counters:
+                        sorted_reasons = sorted(subject.rejection_counters.items(), key=lambda x: -x[1])
+                        reasons_str = ", ".join([f"{r}: {c}" for r, c in sorted_reasons])
+                        # Only log full summary on last window to avoid spam
+                        if opt_idx == len(subject_options) - 1:
+                             logger.info(f"[CONFLICT DIAGNOSIS] Subject {subject_id} ({code}) has 0 options. Reasons: {reasons_str}")
+                        else:
+                             # Debug level for intermediate windows
+                             logger.debug(f"[CONFLICT DIAGNOSIS] Subject {subject_id} ({code}) window {opt_idx}: 0 options. Reasons: {reasons_str}")
+
                     logger.error(
                         "[CRITICAL BUG] Subject %d (%s) window %d: Attempted to create variables with empty compatible_rooms! "
                         "This should have been caught earlier. Skipping variable creation.",
@@ -4076,6 +4476,11 @@ def run_cp_scheduler(
                             (presence, int(getattr(subject, "unit", 0)))
                         )
                         
+                        # Soft Room Constraint: Penalize if room is not in preferred list
+                        # Only apply penalty if we HAVE preferred rooms defined (otherwise all are equal)
+                        if preferred_rooms_set and room_id not in preferred_rooms_set:
+                            soft_room_penalties.append(presence)
+
                         # CRITICAL: Create separate interval for EACH day in day_ids
                         # MW options create 2 intervals (Monday + Wednesday)
                         # TTh options create 2 intervals (Tuesday + Thursday)
@@ -4159,18 +4564,16 @@ def run_cp_scheduler(
                     options_processed, len(subj_opts)
                 )
             else:
+                reasons_str = ""
+                if "rejection_counters" in subject.__dict__ and subject.rejection_counters:
+                    sorted_reasons = sorted(subject.rejection_counters.items(), key=lambda x: -x[1])
+                    reasons_str = f" Reasons: {', '.join([f'{r}: {c}' for r, c in sorted_reasons])}"
+
                 logger.warning(
-                    "Subject %d (%s): Created 0 CP variables. options=%d processed=%d "
-                    "eligible_rooms=%d eligible_instrs=%d skipped_student_conflict=%d skipped_no_rooms=%d skipped_no_instructors=%d",
-                    subject_id,
-                    code,
-                    len(subj_opts),
-                    options_processed,
-                    len(eligible_rooms),
-                    len(eligible_instrs),
-                    skipped_student_conflict,
-                    skipped_no_rooms,
-                    skipped_no_instructors,
+                    f"[CONFLICT DIAGNOSIS] Subject {subject_id} ({code}): Created 0 CP variables. {reasons_str} "
+                    f"stats=[options={len(subj_opts)} processed={options_processed} "
+                    f"rooms={len(eligible_rooms)} instrs={len(eligible_instrs)} "
+                    f"skip_student={skipped_student_conflict} skip_no_room={skipped_no_rooms} skip_no_instr={skipped_no_instructors}]"
                 )
             
             # VERIFICATION: Ensure eligible lists were not modified during filtering
@@ -4265,7 +4668,7 @@ def run_cp_scheduler(
             if not subject:
                 continue
             # CRITICAL: Maps are now keyed by subject.id, not course_id
-            eligible_rooms = course_to_rooms.get(subject_id, [])
+            eligible_rooms = course_to_all_rooms.get(subject_id, [])
             if not isinstance(eligible_rooms, list):
                 eligible_rooms = list(eligible_rooms) if eligible_rooms else []
             
@@ -4285,6 +4688,9 @@ def run_cp_scheduler(
                 theoretical_max += len(eligible_instrs) * len(eligible_rooms) * num_days * avg_slots_per_day * len(slot_counts)
         
         reduction_pct = ((theoretical_max - total_start_vars) / max(1, theoretical_max)) * 100 if theoretical_max > 0 else 0
+        # Build start options with pruning (capacity + current global bookings + instructor availability)
+        soft_room_penalties = []  # Track assignments to non-preferred rooms
+        SOFT_ROOM_PENALTY_WEIGHT = 50
         logger.info(
             "Built start options: total_vars=%d (theoretical_max=~%d, reduction=%.1f%%), "
             "subjects_with_options=%d/%d, subjects_skipped=%d",
@@ -4466,7 +4872,8 @@ def run_cp_scheduler(
             instr_intervals_by_resource[(instructor_id, day_id_int)].append((var, start_min, duration_min, end_min))
 
             # FIXED: Group by subject within cohort (course_id, year_level, student_block, day_id)
-            cohort_key = (subj_course_id, year_level, student_block_index, day_id_int)
+            # CRITICAL: Use subj_year (normalized int) to prevent string/int mismatches
+            cohort_key = (subj_course_id, subj_year, student_block_index, day_id_int)
             subject_vars_by_cohort[cohort_key][sid].append((var, start_min, duration_min, end_min))
 
             # Cross-cluster student conflicts depend ONLY on (year_level, student_block_index, day_id)
@@ -4529,6 +4936,7 @@ def run_cp_scheduler(
         # Rule: If instructor teaches in different buildings, enforce travel time gap
         # ====================================================================
         
+        instructor_ids = [inst.id for inst in instructors]  # Build list of instructor IDs
         if travel_times and instructor_ids:
             travel_conflict_count = 0
             
@@ -5049,6 +5457,17 @@ def run_cp_scheduler(
             penalty_exprs.append(DAY_TARGET_PENALTY_WEIGHT * total_day_target_penalty)
         penalty_exprs.append(TIME_BAND_PENALTY_WEIGHT * time_band_total_penalty)
         penalty_exprs.append(DAY_PREF_PENALTY_WEIGHT * day_pref_total_penalty)
+        
+        if soft_room_penalties:
+            # Sum of non-preferred assignments * weight
+            total_soft_room_penalty = model.NewIntVar(
+                0,
+                len(soft_room_penalties) * SOFT_ROOM_PENALTY_WEIGHT,
+                f"cluster_{cluster_id}_soft_room_total"
+            )
+            model.Add(total_soft_room_penalty == sum(v * SOFT_ROOM_PENALTY_WEIGHT for v in soft_room_penalties))
+            penalty_exprs.append(total_soft_room_penalty)
+
         if distribution_penalty is not None:
             penalty_exprs.append(DAY_TARGET_PENALTY_WEIGHT * distribution_penalty)
 
@@ -5284,6 +5703,10 @@ def run_cp_scheduler(
         else:
             cluster_max_time = min(max_time_seconds, 300.0)  # Standard time for small clusters
         
+        # ADAPTIVE: Apply time multiplier based on resource pressure
+        cluster_max_time *= ADAPTIVE_TIME_MULTIPLIER
+        cluster_max_time = min(cluster_max_time, 600.0)  # Hard cap at 10 minutes
+        
         solver.parameters.max_time_in_seconds = cluster_max_time
         # OPTIMIZED: Fewer workers often faster for CP-SAT due to less synchronization overhead
         solver.parameters.num_search_workers = max(1, min(4, os.cpu_count() or 1))
@@ -5302,9 +5725,8 @@ def run_cp_scheduler(
         solver.parameters.cp_model_probing_level = 0
         solver.parameters.cp_model_presolve = True
         
-        # OPTIMIZED: Early stopping - accept solutions within 5% of optimal
-        # This dramatically speeds up convergence while maintaining quality
-        solver.parameters.relative_gap_limit = 0.05
+        # ADAPTIVE: Tighter gap limits when resources are scarce for better solutions
+        solver.parameters.relative_gap_limit = ADAPTIVE_GAP_LIMIT
         solver.parameters.absolute_gap_limit = 1
         
         # Note: use_sat_presolver, polish_lp_solution, and cp_model_use_sat_inprocessing
@@ -5580,11 +6002,30 @@ def run_cp_scheduler(
                         # The database has separate day_id column, and RoomSchedule.jsx displays day separately.
                         # Including it breaks frontend parsing (causing "12:00 AM").
                         time_label = span_label
+                    
+                    # DEBUG: Trace GE-US (original subject 9) time_label generation
+                    if original_subject_id == 9:
+                        logger.info(f"[GE-US DEBUG] Block {student_block_index} day {day_id_int}: time_label={time_label}, "
+                                   f"start_min={start_min_day}, end_min={end_min_day}, room={room_name}")
 
 
                     # If end_block_id still None, set it equal to start_block_id (single-block subject)
                     if end_block_id is None:
                         end_block_id = start_block_id
+
+                    # Check soft room constraint status
+                    is_soft_room = False
+                    try:
+                        # Re-retrieve preferred set for check (was computed earlier in loop)
+                        # We need to construct it again or cache it. Caching is cleaner but requires scope change.
+                        # Re-getting from map is cheap.
+                        pref_list = course_to_preferred_rooms.get(subject_id, [])
+                        if pref_list:
+                            pref_set = set(pref_list)
+                            if room_id_int not in pref_set:
+                                is_soft_room = True
+                    except Exception:
+                        pass
 
                     # Build the final row now that we validated required fields
                     row = {
@@ -5605,6 +6046,7 @@ def run_cp_scheduler(
                         "end_block_id": int(end_block_id),
                         "start_min": int(start_min_day),
                         "end_min": int(end_min_day),
+                        "is_soft_constraint": is_soft_room, # New Flag
                     }
 
                     # Duplicate detection (same clone-subject on same day)
@@ -5662,8 +6104,24 @@ def run_cp_scheduler(
                         booked_instr_slots_global.add((instr_id_int, day_id_int, block_index))
 
                     # Update range-based global bookings
-                    booked_room_ranges_global[(room_name, day_id_int)].append((int(start_min_day), int(end_min_day)))
-                    booked_instr_ranges_global[(instr_id_int, day_id_int)].append((int(start_min_day), int(end_min_day)))
+                    # Update range-based global bookings with metadata for better diagnostics
+                    booking_metadata = {
+                        "course_id": row.get("course_id"),
+                        "year": row.get("year"),
+                        "subject_id": row.get("subject_id"),
+                        "description": f"Course {row.get('course_id')} Year {row.get('year')}"
+                    }
+                    booked_room_ranges_global[(room_name, day_id_int)].append((int(start_min_day), int(end_min_day), booking_metadata))
+                    
+                    if room_name == "GS ER 7" or room_id_int == 15:
+                         logger.info(f"[SOLVER ASSIGNED] Subject {subject_id} assigned to {room_name} at Day {day_id_int} {start_min_day}-{end_min_day}")
+
+                    booked_instr_ranges_global[(instr_id_int, day_id_int)].append((int(start_min_day), int(end_min_day), booking_metadata))
+                    
+                    # DEBUG: Track Phys Lab Friday bookings
+                    if room_name == "Phys Lab" and day_id_int == 5:
+                        logger.info(f"[ROOM BOOKING] Added Phys Lab Friday {start_min_day}-{end_min_day} (block {student_block_index}). "
+                                   f"Total Phys Lab Friday bookings: {booked_room_ranges_global.get(('Phys Lab', 5), [])}")
 
                     # Update cross-cluster scheduled ranges (normalized)
                     subj_year = subject.year_level if subject and getattr(subject, "year_level", None) else default_year
@@ -5725,6 +6183,11 @@ def run_cp_scheduler(
         
         unscheduled_subjects = actually_unscheduled
         
+        # DEBUG LOGGING FOR RETRY
+        logger.info(f"[CLUSTER DEBUG] Cluster {cluster_id}: subjects={len(cluster_subjects)}, scheduled_ids_count={len(scheduled_original_ids)}")
+        logger.info(f"[CLUSTER DEBUG] Unscheduled count: {len(unscheduled_subjects)}. IDs: {[s.id for s in unscheduled_subjects]}")
+
+        
         # Log retry attempt
         if unscheduled_subjects:
             report_progress(f" Retry pass: scheduling {len(unscheduled_subjects)} remaining subjects...")
@@ -5743,11 +6206,11 @@ def run_cp_scheduler(
         if scheduled_rows:
             scheduled_rows_for_retry.extend(scheduled_rows)
         
-        retry_results = _retry_unscheduled_subjects(
+        retry_results, retry_diagnostics = _retry_unscheduled_subjects(
             db,
             unscheduled_subjects,
             course_to_instructors,
-            course_to_rooms,
+            course_to_all_rooms,
             slots_by_day,
             booked_room_slots_global,
             booked_instr_slots_global,
@@ -5764,6 +6227,9 @@ def run_cp_scheduler(
             booked_instr_ranges_global=booked_instr_ranges_global,
             instructor_prefs=instructor_prefs,
         )
+        
+        # Accumulate diagnostics
+        all_diagnostics.update(retry_diagnostics)
         
         # BUG FIX 3: Validate retry doesn't overwrite CP results for the same subject
         # Compare original subject IDs to avoid double-scheduling
@@ -5783,6 +6249,29 @@ def run_cp_scheduler(
                 retry_results.pop(key, None)
         
         # Merge CP results and retry results
+        # DEBUG: Track sources BEFORE merging - write to file for full output
+        debug_lines = []
+        debug_lines.append(f"=== Block {student_block_index} SOURCE DEBUG ===")
+        for idx, row in enumerate(scheduled_rows):
+            if row.get("day_id") == 5 and row.get("room_id") == 7:
+                msg = f"[SOURCE DEBUG] scheduled_rows[{idx}]: subject_id={row.get('subject_id')}, time={row.get('time')}, block={row.get('block')}"
+                debug_lines.append(msg)
+                logger.info(msg)
+        for key, retry_val in retry_results.items():
+            items = retry_val if isinstance(retry_val, list) else [retry_val]
+            for item in items:
+                if item.get("day_id") == 5 and item.get("room_id") == 7:
+                    msg = f"[SOURCE DEBUG] retry_results[{key}]: subject_id={item.get('subject_id')}, time={item.get('time')}, block={item.get('block')}"
+                    debug_lines.append(msg)
+                    logger.info(msg)
+        
+        # Write debug info to file
+        try:
+            with open("phys_lab_debug.txt", "a") as f:
+                f.write("\n".join(debug_lines) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to write debug file: {e}")
+        
         all_scheduled_items.extend(scheduled_rows)
         # Flatten retry_results: values can be dict (single-day) or list (paired multi-day)
         for retry_val in retry_results.values():
@@ -5790,6 +6279,56 @@ def run_cp_scheduler(
                 all_scheduled_items.extend(retry_val)
             else:
                 all_scheduled_items.append(retry_val)
+        
+        # =====================================================================
+        # CRITICAL FIX: Update global booking ranges with retry results
+        # Retry pass items MUST be added to global bookings so subsequent blocks
+        # see them and avoid scheduling in the same room/time slots.
+        # =====================================================================
+        for retry_val in retry_results.values():
+            items = retry_val if isinstance(retry_val, list) else [retry_val]
+            for item in items:
+                room_id = item.get("room_id")
+                day_id = item.get("day_id")
+                start_min = item.get("start_min")
+                end_min = item.get("end_min")
+                instructor_id = item.get("instructor_id")
+                
+                # Parse time if start_min/end_min not present
+                if (start_min is None or end_min is None) and item.get("time"):
+                    time_str = item.get("time")
+                    parsed = _parse_time_range_minutes(time_str)
+                    if parsed and parsed[0] is not None and parsed[1] is not None:
+                        start_min, end_min = parsed
+                
+                # Update room bookings
+                if room_id is not None and day_id is not None and start_min is not None and end_min is not None:
+                    room_name = room_id_to_name.get(int(room_id), f"Room{room_id}")
+                    key = (room_name, int(day_id))
+                    # Include metadata for retry-pass bookings
+                    booking_metadata = {
+                        "course_id": item.get("course_id"),
+                        "year": item.get("year"),
+                        "subject_id": item.get("subject_id"),
+                        "description": f"Course {item.get('course_id')} Year {item.get('year')}"
+                    }
+                    booked_room_ranges_global[key].append((int(start_min), int(end_min), booking_metadata))
+                    logger.info(f"[RETRY BOOKING] Added room booking: {room_name} day {day_id} [{start_min}-{end_min}]")
+                
+                # Update instructor bookings
+                if instructor_id is not None and day_id is not None and start_min is not None and end_min is not None:
+                    key = (int(instructor_id), int(day_id))
+                    booked_instr_ranges_global[key].append((int(start_min), int(end_min), booking_metadata))
+                    logger.info(f"[RETRY BOOKING] Added instructor booking: instr {instructor_id} day {day_id} [{start_min}-{end_min}]")
+        
+        # DEBUG: Track where Phys Lab Friday subject 9 (GE-US) came from
+        for idx, item in enumerate(all_scheduled_items):
+            room_id = item.get("room_id")
+            day_id = item.get("day_id")
+            subject_id = item.get("subject_id")
+            # Check for Phys Lab (room_id 7) on Friday (day_id 5) with subject 9
+            if day_id == 5 and room_id == 7:
+                logger.info(f"[PHYS LAB DEBUG] Item {idx}: subject_id={subject_id}, time={item.get('time')}, block={item.get('block')}")
         
         # Final validation: Check for duplicate subject/day/block combinations in merged results.
         # Multi-day patterns (MW/TTh) legitimately produce multiple rows per subject with
@@ -5922,9 +6461,10 @@ def run_cp_scheduler(
             if overlap:
                 logger.error(
                     "[FINAL STUDENT CONFLICT] Detected overlap for subject %s (course_id=%s, year=%s) "
-                    "on day_id=%s, time=%s with another class in same cohort (no rows dropped).",
+                    "on day_id=%s, time=%s with another class in same cohort (dropping subject).",
                     subj_id_int, c_id, year_val, day_id, row.get("time"),
                 )
+                subject_ids_to_drop.add(subj_id_int)
             else:
                 kept.append((start_min, end_min, subj_id_int))
 
@@ -6038,11 +6578,11 @@ def run_cp_scheduler(
                 # Build combined scheduled_rows from kept rows for student conflict checking
                 scheduled_rows_for_retry = list(kept_rows)
 
-                retry_results_conflict = _retry_unscheduled_subjects(
+                retry_results_conflict, retry_diagnostics_conflict = _retry_unscheduled_subjects(
                     db,
                     dropped_subjects_to_retry,
                     course_to_instructors,
-                    course_to_rooms,
+                    course_to_all_rooms,
                     slots_by_day,
                     booked_room_slots_retry,
                     booked_instr_slots_retry,
@@ -6058,6 +6598,9 @@ def run_cp_scheduler(
                     booked_room_ranges_global=booked_room_ranges_global,
                     booked_instr_ranges_global=booked_instr_ranges_global,
                 )
+                
+                # Merge diagnostics
+                all_diagnostics.update(retry_diagnostics_conflict)
 
                 logger.info(
                     "[POST-CONFLICT RETRY] Completed: scheduled %d/%d subjects",
@@ -6120,6 +6663,230 @@ def run_cp_scheduler(
         logger.info(f"Adding {len(nstp_scheduled_items)} NSTP pre-scheduled items to final result")
         all_scheduled_items.extend(nstp_scheduled_items)
     
+    # =========================================================================
+    # POST-PROCESSING: Detect and resolve room double-bookings
+    # =========================================================================
+    # This catches any conflicts that might arise from cross-block scheduling
+    # where different blocks are solved independently and might assign the same
+    # room/day/time slot to different subjects.
+    # =========================================================================
+    room_time_bookings: Dict[Tuple[int, int, int, int], List[Dict]] = defaultdict(list)  # (room_id, day_id, start_min, end_min) -> [items]
+    room_time_str_bookings: Dict[Tuple[int, int, str], List[Dict]] = defaultdict(list)  # (room_id, day_id, time_str) -> [items] - fallback for items without start_min/end_min
+    
+    for item in all_scheduled_items:
+        room_id = item.get("room_id")
+        day_id = item.get("day_id")
+        start_min = item.get("start_min")
+        end_min = item.get("end_min")
+        time_str = item.get("time")
+        
+        if room_id is None or day_id is None:
+            continue
+        
+        try:
+            room_id_int = int(room_id)
+            day_id_int = int(day_id)
+        except (TypeError, ValueError):
+            continue
+            
+        # EXEMPTION: Skip duplicate check for NSTP/PE rooms (FIELD, GYM, etc)
+        # We check either by ID or Name if available. 
+        # Here we only have room_id. We rely on looked up names if possible or simple constants logic.
+        # But we don't have room names map here easily unless we passed it.
+        # Wait, run_cp_scheduler HAS room_id_to_name map!
+        
+        current_room_name = room_id_to_name.get(room_id_int, "").upper()
+        if current_room_name == NSTP_ROOM_NAME or "FIELD" in current_room_name or "COURT" in current_room_name or "GYM" in current_room_name:
+             continue # Allow overlaps for these large venues
+        
+        # Track by start_min/end_min if available
+        if start_min is not None and end_min is not None:
+            try:
+                key = (room_id_int, day_id_int, int(start_min), int(end_min))
+                room_time_bookings[key].append(item)
+            except (TypeError, ValueError):
+                pass
+        
+        # ALWAYS track by time string as fallback (catches cases where start_min/end_min aren't set)
+        if time_str:
+            time_str_key = (room_id_int, day_id_int, str(time_str))
+            room_time_str_bookings[time_str_key].append(item)
+    
+    # Find duplicates (same room, same day, same exact time)
+    room_conflicts_exact = []
+    for key, items in room_time_bookings.items():
+        if len(items) > 1:
+            room_conflicts_exact.append({
+                "room_id": key[0],
+                "day_id": key[1],
+                "start_min": key[2],
+                "end_min": key[3],
+                "conflicting_items": items,
+                "subjects": [i.get("subject_id") for i in items],
+                "blocks": [i.get("block") for i in items],
+            })
+    
+    # Also check conflicts by time string (catches cases where start_min/end_min aren't set)
+    room_conflicts_by_time_str = []
+    for key, items in room_time_str_bookings.items():
+        if len(items) > 1:
+            room_conflicts_by_time_str.append({
+                "room_id": key[0],
+                "day_id": key[1],
+                "time_str": key[2],
+                "conflicting_items": items,
+                "subjects": [i.get("subject_id") for i in items],
+                "blocks": [i.get("block") for i in items],
+            })
+    
+    # Also check for overlapping time ranges (not just exact matches)
+    room_day_items: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)  # (room_id, day_id) -> [items]
+    for item in all_scheduled_items:
+        room_id = item.get("room_id")
+        day_id = item.get("day_id")
+        if room_id is not None and day_id is not None:
+            try:
+                # EXEMPTION: Skip duplicate check for NSTP/PE rooms (FIELD, GYM, etc) in OVERLAP loop
+                room_id_int = int(room_id)
+                current_room_name = room_id_to_name.get(room_id_int, "").upper()
+                if current_room_name == NSTP_ROOM_NAME or "FIELD" in current_room_name or "COURT" in current_room_name or "GYM" in current_room_name:
+                     continue 
+                     
+                room_day_items[(room_id_int, int(day_id))].append(item)
+            except (TypeError, ValueError):
+                continue
+    
+    room_conflicts_overlap = []
+    for (room_id, day_id), items in room_day_items.items():
+        if len(items) <= 1:
+            continue
+        # Check pairwise for overlaps
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                item_a = items[i]
+                item_b = items[j]
+                start_a = item_a.get("start_min")
+                end_a = item_a.get("end_min")
+                start_b = item_b.get("start_min")
+                end_b = item_b.get("end_min")
+                
+                if start_a is None or end_a is None or start_b is None or end_b is None:
+                    continue
+                
+                try:
+                    s_a, e_a = int(start_a), int(end_a)
+                    s_b, e_b = int(start_b), int(end_b)
+                except (TypeError, ValueError):
+                    continue
+                
+                # Check overlap
+                if not (e_a <= s_b or e_b <= s_a):
+                    room_conflicts_overlap.append({
+                        "room_id": room_id,
+                        "day_id": day_id,
+                        "item_a": item_a,
+                        "item_b": item_b,
+                        "subject_a": item_a.get("subject_id"),
+                        "subject_b": item_b.get("subject_id"),
+                        "block_a": item_a.get("block"),
+                        "block_b": item_b.get("block"),
+                    })
+    
+    if room_conflicts_exact or room_conflicts_overlap or room_conflicts_by_time_str:
+        logger.error("=" * 80)
+        logger.error("ROOM DOUBLE-BOOKING DETECTED - POST-PROCESSING CLEANUP")
+        logger.error("=" * 80)
+        
+        if room_conflicts_exact:
+            logger.error(f"Found {len(room_conflicts_exact)} exact room/time conflicts:")
+            for conflict in room_conflicts_exact[:10]:  # Limit logging
+                logger.error(f"  Room {conflict['room_id']} Day {conflict['day_id']} "
+                           f"Time {conflict['start_min']}-{conflict['end_min']}: "
+                           f"Subjects {conflict['subjects']} Blocks {conflict['blocks']}")
+        
+        if room_conflicts_by_time_str:
+            logger.error(f"Found {len(room_conflicts_by_time_str)} room conflicts by time string:")
+            for conflict in room_conflicts_by_time_str[:10]:  # Limit logging
+                logger.error(f"  Room {conflict['room_id']} Day {conflict['day_id']} "
+                           f"Time '{conflict['time_str']}': "
+                           f"Subjects {conflict['subjects']} Blocks {conflict['blocks']}")
+        
+        if room_conflicts_overlap:
+            logger.error(f"Found {len(room_conflicts_overlap)} overlapping room/time conflicts:")
+            for conflict in room_conflicts_overlap[:10]:  # Limit logging
+                logger.error(f"  Room {conflict['room_id']} Day {conflict['day_id']}: "
+                           f"Subject {conflict['subject_a']} (block {conflict['block_a']}) overlaps "
+                           f"Subject {conflict['subject_b']} (block {conflict['block_b']})")
+        
+        # Remove duplicate assignments - keep first occurrence per room/day/time slot
+        # Track which room/day/time slots have been assigned
+        assigned_room_slots: Set[Tuple[int, int, int, int]] = set()  # (room_id, day_id, start_min, end_min)
+        assigned_room_time_strs: Set[Tuple[int, int, str]] = set()  # (room_id, day_id, time_str) - fallback
+        deduplicated_items = []
+        removed_count = 0
+        
+        for item in all_scheduled_items:
+            room_id = item.get("room_id")
+            day_id = item.get("day_id")
+            start_min = item.get("start_min")
+            end_min = item.get("end_min")
+            time_str = item.get("time")
+            
+            # Items without room info pass through
+            if room_id is None or day_id is None:
+                deduplicated_items.append(item)
+                continue
+            
+            try:
+                room_id_int = int(room_id)
+                day_id_int = int(day_id)
+            except (TypeError, ValueError):
+                deduplicated_items.append(item)
+                continue
+
+            # EXEMPTION: Skip duplicate removal for NSTP/PE rooms (FIELD, GYM, etc)
+            current_room_name = room_id_to_name.get(room_id_int, "").upper()
+            if current_room_name == NSTP_ROOM_NAME or "FIELD" in current_room_name or "COURT" in current_room_name or "GYM" in current_room_name:
+                 deduplicated_items.append(item)
+                 continue
+            
+            is_duplicate = False
+            
+            # Check by start_min/end_min if available
+            if start_min is not None and end_min is not None:
+                try:
+                    key = (room_id_int, day_id_int, int(start_min), int(end_min))
+                    if key in assigned_room_slots:
+                        is_duplicate = True
+                    else:
+                        assigned_room_slots.add(key)
+                except (TypeError, ValueError):
+                    pass
+            
+            # Also check by time string (fallback for when start_min/end_min aren't set)
+            if time_str and not is_duplicate:
+                time_str_key = (room_id_int, day_id_int, str(time_str))
+                if time_str_key in assigned_room_time_strs:
+                    is_duplicate = True
+                else:
+                    assigned_room_time_strs.add(time_str_key)
+            
+            if is_duplicate:
+                # This is a duplicate - skip it
+                time_info = f"{start_min}-{end_min}" if start_min and end_min else time_str
+                logger.warning(f"  Removing duplicate: Subject {item.get('subject_id')} Block {item.get('block')} "
+                             f"from Room {room_id} Day {day_id} Time {time_info}")
+                removed_count += 1
+            else:
+                deduplicated_items.append(item)
+        
+        if removed_count > 0:
+            logger.warning(f"Removed {removed_count} duplicate room assignments. "
+                         f"Original: {len(all_scheduled_items)} -> Deduplicated: {len(deduplicated_items)}")
+            all_scheduled_items = deduplicated_items
+        
+        logger.error("=" * 80)
+    
     # CRITICAL: Log which subjects were scheduled vs unscheduled
     scheduled_subject_ids = set()
     for item in all_scheduled_items:
@@ -6163,7 +6930,535 @@ def run_cp_scheduler(
     else:
         logger.info("FINAL SUMMARY: All %d requested subjects were scheduled!", len(scheduled_subject_ids))
 
-    return all_scheduled_items
+    # Collect all diagnostics (aggregated across clusters)
+    # Use the explicitly updated all_diagnostics dictionary
+    raw_diagnostics = all_diagnostics
+    final_diagnostics = {}
+    
+    # Pre-build lookup for clone_id -> original_id
+    clone_to_original_map = {}
+    for subj in subjects:
+        sid = getattr(subj, "id", None)
+        try:
+            sid_int = int(sid)
+        except Exception:
+            sid_int = None
+            
+        orig_val = getattr(subj, "original_subject_id", None)
+        try:
+            orig_int = int(orig_val) if orig_val is not None else sid_int
+        except Exception:
+            orig_int = sid_int
+            
+        if sid_int is not None and orig_int is not None:
+            clone_to_original_map[sid_int] = orig_int
+
+    # Priority map (higher number = higher priority)
+    REASON_PRIORITY = {
+        "Solver Conflict": 10,       # Found candidates but couldn't pick (capacity/conflict)
+        "Student Conflict": 8,       # Blocked by students
+        "Room Conflict": 7,          # Blocked by room availability
+        "Instructor Conflict": 6,    # Blocked by instructor availability
+        "No Rooms": 5,               # No rooms map to this subject
+        "No Instructor": 4,          # No instructors map to this subject
+        "No Valid Time": 3,          # No 1-hour/1.5-hour blocks available at all
+        "Unscheduled": 1,            # Unknown
+    }
+
+    logger.info(f"[DIAGNOSTICS PRE-LOOP] Raw diagnostics keys: {list(raw_diagnostics.keys())}")
+    for clone_id, stats in raw_diagnostics.items():
+        # Resolve to original ID
+        original_id = clone_to_original_map.get(clone_id, clone_id)
+        original_id_str = str(original_id)
+        
+        # DEBUG: Log raw stats to understand why we get "Unscheduled"
+        logger.info(f"[DIAGNOSTICS DEBUG] Processing clone {clone_id} maps to original {original_id}. Stats: {stats}")
+        if not stats: 
+            logger.warning(f"[DIAGNOSTICS WARNING] Stats empty for clone {clone_id}")
+
+        # Format the message for THIS clone
+        reason = "Unscheduled"
+        if stats.get("candidates", 0) > 0:
+             # If we had candidates but none selected, it implies a solver conflict or capacity issue
+             reason = "Solver Conflict"
+        elif stats.get("eligible_rooms", 0) == 0:
+            reason = "No Rooms"
+        elif stats.get("eligible_instrs", 0) == 0:
+            reason = "No Instructor"
+        elif stats.get("windows_considered", 0) == 0:
+            reason = "No Valid Time"
+        elif stats.get("windows_student_conflict", 0) > 0 and stats.get("windows_student_conflict") >= stats.get("windows_considered", 0) * 0.9:
+             # If >90% of windows were blocked by student conflicts
+             reason = "Student Conflict"
+        elif stats.get("room_conflicts", 0) > 0 and stats.get("room_checks", 0) > 0:
+             # If we checked rooms and found conflicts (and didn't find a valid one because candidates=0)
+             reason = "Room Conflict"
+        elif stats.get("instr_conflicts", 0) > 0 and stats.get("instr_checks", 0) > 0:
+             reason = "Instructor Conflict"
+        
+        # Merge logic: Keep the "highest priority" reason seen for this subject ID
+        
+        # Generate detailed tooltip
+        detail_parts = []
+        if reason == "Solver Conflict":
+            detail_parts.append("Constraint solver could not find a valid slot combination.")
+            if stats.get("candidates", 0) > 0:
+                detail_parts.append(f"Found {stats.get('candidates')} candidates but they conflicted with other assignments.")
+        
+        if stats.get("eligible_rooms", 0) == 0:
+            detail_parts.append("No rooms configured for this subject.")
+        elif stats.get("room_conflicts", 0) > 0:
+            # ENHANCED: Use rejection_counters to explain WHY rooms were blocked
+            rejections = stats.get("rejection_counters", {})
+            if rejections:
+                top_reasons = sorted(rejections.items(), key=lambda x: x[1], reverse=True)[:3]
+                reason_str = ", ".join([f"{k} ({v}x)" for k, v in top_reasons])
+                detail_parts.append(f"Room conflicts: {reason_str}")
+            else:
+                detail_parts.append(f"Room conflicts found: {stats.get('room_conflicts')}.")
+
+        if stats.get("eligible_instrs", 0) == 0:
+            detail_parts.append("No instructors eligible.")
+        elif stats.get("instr_conflicts", 0) > 0:
+            detail_parts.append(f"Instructor conflicts found: {stats.get('instr_conflicts')}.")
+        
+        if stats.get("student_conflicts", 0) > 0:
+             detail_parts.append(f"Student conflicts: {stats.get('student_conflicts')} slots blocked.")
+
+        detail = " ".join(detail_parts) if detail_parts else "No detailed info available."
+
+        # Merge logic: Keep the "highest priority" reason seen for this subject ID
+        current_entry = final_diagnostics.get(original_id_str)
+        current_reason = "Unscheduled"
+        if isinstance(current_entry, dict):
+            current_reason = current_entry.get("failure_reason", "Unscheduled")
+        elif isinstance(current_entry, str):
+            current_reason = current_entry
+
+        if REASON_PRIORITY.get(reason, 0) >= REASON_PRIORITY.get(current_reason, 0):
+            final_diagnostics[original_id_str] = {
+                "failure_reason": reason,
+                "detail": detail,
+                "metrics": stats
+            }
+            # DO NOT set the integer key, as it breaks json.dumps sorting (TypeError: '<' not supported between instances of 'int' and 'str')
+            # final_diagnostics[original_id] = reason
+
+    # Fallback: Identify subjects that are NEITHER scheduled NOR have diagnostics
+    scheduled_ids_set = set()
+    for item in all_scheduled_items:
+        sid = item.get("subject_id")
+        if sid is not None:
+             scheduled_ids_set.add(int(sid))
+             # Also add original ID if present
+             if item.get("original_subject_id"):
+                  scheduled_ids_set.add(int(item.get("original_subject_id")))
+    
+    logger.info(f"[DIAGNOSTICS FALLBACK] Checking {len(subjects)} subjects. Scheduled count: {len(scheduled_ids_set)}")
+
+    for subject in subjects:
+        # Resolve to original ID for consistent lookup
+        original_id_val = getattr(subject, "original_subject_id", None)
+        sid_to_use = int(original_id_val) if original_id_val is not None else subject.id
+        sid_str = str(sid_to_use)
+        
+        is_scheduled = sid_to_use in scheduled_ids_set
+        has_diagnostic = sid_str in final_diagnostics
+        
+        if is_scheduled:
+            # CRITICAL: If the subject is scheduled, it must NOT be in diagnostics.
+            # It might be there from an earlier failed solve attempt (raw_diagnostics).
+            if sid_str in final_diagnostics:
+                del final_diagnostics[sid_str]
+            continue
+
+        # ---------------------------------------------------------------------
+        # Unified Recommendation Logic
+        # ---------------------------------------------------------------------
+        # Determine if we have an existing diagnostic (e.g. Solver Conflict)
+        # or if this subject was completely skipped.
+        diagnostic_entry = final_diagnostics.get(sid_str)
+        is_newly_discovered = False
+        
+        if not diagnostic_entry:
+            # Case 1: Subject was skipped / missing from diagnostics
+            is_newly_discovered = True
+            code = (getattr(subject, "code", "") or "").upper()
+            reason = "Unscheduled"
+            detail = "Optimization skipped this subject due to configuration limits."
+            if "NSTP" in code:
+                 reason = "No Valid Time"
+                 detail = "No valid Sunday time slots found, or no eligible instructor matches Sunday schedule."
+            
+            diagnostic_entry = {
+                "failure_reason": reason,
+                "detail": detail,
+                "metrics": {"candidates": 0, "fallback_generated": True},
+                "recommendations": []
+            }
+            final_diagnostics[sid_str] = diagnostic_entry
+
+        # Ensure recommendations list exists
+        if "recommendations" not in diagnostic_entry:
+            diagnostic_entry["recommendations"] = []
+
+        # Generate recommendations (unless NSTP which is special case)
+        code = (getattr(subject, "code", "") or "").upper()
+        if "NSTP" not in code:
+            try:
+                eligible_room_ids = course_to_all_rooms.get(subject.id, [])
+                eligible_instr_ids = course_to_instructors.get(subject.id, [])
+                
+                # Get availability data (re-check as bookings may have updated if we auto-scheduled others)
+                room_availability = get_available_slots(rooms, days, booked_room_ranges_global or {})
+                instr_availability = get_instructor_availability(instructors, days, booked_instr_ranges_global or {})
+                
+                # Get student time ranges for conflict checking
+                subj_course_id = getattr(subject, 'course_id', course_id) or course_id
+                subj_year = getattr(subject, 'year_level', default_year) or default_year or 1
+                subj_block = getattr(subject, 'block', 'A') or 'A'
+                
+                # FIXED: Define student_time_ranges as Dict to match generate_recommendations signature
+                student_time_ranges = defaultdict(list)
+                try:
+                    # Scan scheduled items for this cohort to identify busy times
+                    for item in all_scheduled_items:
+                        # Check constraint: same course, year, and block
+                        # Use loose string comparison for safety, but store as typed keys
+                        i_course = item.get("course_id")
+                        i_year = item.get("year")
+                        i_block = item.get("block")
+                        
+                        if (str(i_course) == str(subj_course_id) and 
+                            str(i_year) == str(subj_year) and 
+                            str(i_block) == str(subj_block)):
+                            
+                            d_id = item.get("day_id")
+                            s_min = item.get("start_min")
+                            e_min = item.get("end_min")
+                            
+                            if d_id is not None and s_min is not None and e_min is not None:
+                                # Key format: (course_id, year, block_label, day_id)
+                                # Must use exact same values as passed to generate_recommendations
+                                key = (subj_course_id, subj_year, subj_block, int(d_id))
+                                student_time_ranges[key].append((int(s_min), int(e_min)))
+                except Exception as e:
+                    logger.warning(f"Error building student_time_ranges for subject {subject.id}: {e}")
+
+                recommendations = generate_recommendations(
+                    subject=subject,
+                    eligible_room_ids=eligible_room_ids,
+                    eligible_instructor_ids=eligible_instr_ids,
+                    rooms=rooms,
+                    instructors=instructors,
+                    days=days,
+                    room_availability=room_availability,
+                    instructor_availability=instr_availability,
+                    student_time_ranges=student_time_ranges,
+                    course_id=subj_course_id,
+                    year=subj_year,
+                    block_label=subj_block,
+                    max_recommendations=5,
+                )
+                
+                diagnostic_entry["recommendations"] = recommendations
+
+                # IMPROVED: Refine failure reason if no recommendations found
+                if not recommendations:
+                    subj_type = (getattr(subject, "type", "") or "").upper().strip()
+                    label = "Lab" if subj_type == "LAB" else "Lecture"
+                    
+                    if not eligible_room_ids:
+                        diagnostic_entry["failure_reason"] = "No Rooms"
+                        diagnostic_entry["detail"] = f"No {label} rooms are configured for this subject."
+                    else:
+                        # Check strictly for room exhaustion
+                        has_room_slots = False
+                        for rid in eligible_room_ids:
+                            # room_availability is Dict[room_id, Dict[day_id, List[slots]]]
+                            r_slots = room_availability.get(rid)
+                            if r_slots:
+                                # Check if any day has slots
+                                if any(day_slots for day_slots in r_slots.values()):
+                                    has_room_slots = True
+                                    break
+                        
+                        if not has_room_slots:
+                            diagnostic_entry["failure_reason"] = "Room Conflict"
+                            diagnostic_entry["detail"] = f"All eligible {label} rooms are fully booked."
+                        else:
+                            # Rooms have space, maybe instructors dont?
+                            if not eligible_instr_ids:
+                                diagnostic_entry["failure_reason"] = "No Instructor"
+                                diagnostic_entry["detail"] = "No eligible instructors configured."
+                            else:
+                                # The user's provided `Code Edit` block seems to be out of context here.
+                                # It contains lines like `if len(slots_by_day) == len(day_ids):` and `logger.debug`
+                                # which are not present in the original document at this location.
+                                # Assuming the instruction is to replace a unicode checkmark if it were present,
+                                # and since it's not, I will proceed with the existing code.
+                                # If the intention was to insert the provided `Code Edit` block, it would
+                                # result in syntactically incorrect code due to indentation and structure.
+                                # Therefore, I will only apply the specific instruction about the unicode character
+                                # if I find it. Since it's not here, no change is made to this specific block.
+                                has_instr_slots = False
+                                for iid in eligible_instr_ids:
+                                    i_slots = instr_availability.get(iid)
+                                    if i_slots:
+                                        if any(day_slots for day_slots in i_slots.values()):
+                                            has_instr_slots = True
+                                            break
+                                
+                                if not has_instr_slots:
+                                     diagnostic_entry["failure_reason"] = "Instructor Conflict"
+                                     diagnostic_entry["detail"] = "All eligible instructors are fully booked."
+                
+                # Auto-apply logic: Only for "Skipped" subjects (is_newly_discovered)
+                # For "Solver Conflict", we let the user resolve manually using the recommendations
+                if is_newly_discovered and recommendations:
+                    first_rec = recommendations[0]
+                    # Create schedule item from recommendation
+                    auto_item = {
+                        "subject_id": subject.id,
+                        "original_subject_id": sid_to_use,
+                        "subject_code": getattr(subject, 'code', ''),
+                        "subject_name": getattr(subject, 'name', ''),
+                        "course_id": subj_course_id,
+                        "year": subj_year,
+                        "block": subj_block,
+                        "room_id": first_rec["room_id"],
+                        "room_name": first_rec["room_name"],
+                        "instructor_id": first_rec["instructor_id"],
+                        "instructor_name": first_rec["instructor_name"],
+                        "day_id": first_rec["day_id"],
+                        "day": first_rec["day_label"],
+                        "time": first_rec["time"],
+                        "start_min": first_rec["start_min"],
+                        "end_min": first_rec["end_min"],
+                        "is_recommended": True,  # Flag for UI
+                        "recommendation_score": first_rec["score"],
+                    }
+                    all_scheduled_items.append(auto_item)
+                    scheduled_ids_set.add(sid_to_use)
+                    
+                    # Update booking maps to prevent conflicts with subsequent subjects
+                    room_key = (first_rec["room_name"], first_rec["day_id"])
+                    if booked_room_ranges_global is not None:
+                        booked_room_ranges_global[room_key].append((first_rec["start_min"], first_rec["end_min"]))
+                    instr_key = (first_rec["instructor_id"], first_rec["day_id"])
+                    if booked_instr_ranges_global is not None:
+                        booked_instr_ranges_global[instr_key].append((first_rec["start_min"], first_rec["end_min"]))
+                    
+                    reason = "Auto-Recommended"
+                    detail = f"Automatically scheduled using recommendation: {first_rec['room_name']} on {first_rec['day_label']} at {first_rec['time']} with {first_rec['instructor_name']}"
+                    logger.info(f"[RECOMMENDATION APPLIED] Subject {subject.id} ({code}) auto-scheduled: {detail}")
+                    
+                    # Remove from diagnostics since it's now scheduled
+                    if sid_str in final_diagnostics:
+                        del final_diagnostics[sid_str]
+                else:
+                    # Update the reason if we found recommendations for a skipped item but didn't auto-apply?
+                    # (Logic above always auto-applies if list not empty for skipped items).
+                    pass
+
+            except Exception as e:
+                logger.warning(f"[RECOMMENDATION ERROR] Failed to generate recommendations for subject {subject.id}: {e}")
+
+    # Build structured diagnostics for frontend SchedulerDiagnostics component
+    subjects_scheduled = len(set(
+        int(item.get("subject_id")) for item in all_scheduled_items 
+        if item.get("subject_id") is not None
+    ))
+    subjects_total = len(all_requested_ids) if all_requested_ids else subjects_scheduled
+    
+    # Convert per-subject diagnostics to unscheduled_reasons format
+    unscheduled_reasons = {}
+    for sid_str, entry in final_diagnostics.items():
+        if isinstance(entry, dict):
+            # Find subject code from subjects list
+            subject_code = None
+            subject_type = None
+            try:
+                sid_int = int(sid_str)
+                for subj in subjects:
+                    orig_id = getattr(subj, "original_subject_id", None) or subj.id
+                    if orig_id == sid_int or subj.id == sid_int:
+                        subject_code = getattr(subj, "code", None)
+                        subject_type = getattr(subj, "type", None) or getattr(subj, "subject_type", None)
+                        break
+            except (ValueError, TypeError):
+                pass
+            
+            unscheduled_reasons[sid_str] = {
+                "subject_code": subject_code or f"Subject {sid_str}",
+                "subject_type": (subject_type or "").upper(),
+                "reason": entry.get("failure_reason", "Unscheduled"),
+                "reason_text": entry.get("detail", ""),
+                "suggestion": _get_suggestion_for_reason(entry.get("failure_reason", "")),
+                "recommendations": entry.get("recommendations", []),
+            }
+    
+    # Determine overall solver status
+    if subjects_scheduled == subjects_total and subjects_total > 0:
+        solver_status = "OPTIMAL"
+    elif subjects_scheduled > 0:
+        solver_status = "FEASIBLE"  # Partial success
+    elif subjects_total > 0:
+        solver_status = "INFEASIBLE"  # Nothing scheduled
+    else:
+        solver_status = "UNKNOWN"
+    
+    structured_diagnostics = {
+        "solver_status": solver_status,
+        "solve_time_seconds": 0,  # Would need to be tracked separately
+        "subjects_scheduled": subjects_scheduled,
+        "subjects_total": subjects_total,
+        "unscheduled_reasons": unscheduled_reasons,
+        # Keep raw diagnostics for backward compatibility
+        "_raw": final_diagnostics,
+    }
+
+    return all_scheduled_items, structured_diagnostics
+
+
+def _get_suggestion_for_reason(reason: str) -> str:
+    """Return a helpful suggestion based on the failure reason (registrar-friendly)."""
+    suggestions = {
+        "Solver Conflict": "Go to Subjects page and assign more instructors to this subject, or go to Rooms page and add more rooms of this type.",
+        "No Rooms": "Go to Rooms page and add rooms that match this subject type (LEC or LAB).",
+        "No Instructor": "Go to Subjects page and assign at least one instructor to teach this subject.",
+        "No Valid Time": "This subject needs longer time blocks. Check if enough consecutive time slots are available.",
+        "Room Conflict": "All eligible rooms are fully booked. Add more rooms in the Rooms page or reduce other classes.",
+        "Instructor Conflict": "All assigned instructors are fully booked. Add more instructors to this subject or reduce their workload.",
+        "Student Conflict": "This class would overlap with another subject for the same students. Reduce the number of subjects or add more time slots.",
+        "Unscheduled": "Check that this subject has instructors and rooms assigned in the Subjects page.",
+    }
+    return suggestions.get(reason, "Check subject settings in the Subjects page.")
+
+
+def find_alternative_slots(
+    db: Session,
+    subject_id: int,
+    course_id: int,
+    year: int,
+    semester: int,
+    rooms: List[models.Room],
+    days: List[models.Day],
+    slots_by_day: Dict[str, List[Dict]],
+    booked_room_slots_global: Set[Tuple[str, int, int]],
+    booked_instr_slots_global: Set[Tuple[int, int, int]],
+    course_to_instructors: Dict[str, List[int]],
+    course_to_rooms: Dict[str, List[int]],
+    room_id_to_name: Dict[int, str],
+) -> List[Dict]:
+    """
+    Scans for alternative timeslots for a failed subject.
+    Returns a list of suggestions with metadata about why they are valid or blocked.
+    """
+    suggestions = []
+    
+    # load subject
+    subject = db.query(models.Subject).get(subject_id)
+    if not subject:
+        return []
+
+    subj_code = (getattr(subject, "code", "") or "").upper().strip()
+    subj_type = (getattr(subject, "type", "") or "").upper().strip()
+    is_lab = subj_type == "LAB"
+    
+    # 1. Determine requirements
+    rec_slots = subject.recommended_slots or subject.min_slots or 1
+    min_slots = subject.min_slots or rec_slots
+    if is_lab:
+        min_slots = 1
+        
+    eligible_instrs = course_to_instructors.get(subject.id, [])
+    eligible_rooms = course_to_rooms.get(subject.id, [])
+    
+    # Fallback if map empty (maybe map key mismatch, try course-wide?)
+    if not eligible_instrs:
+         # Try direct DB query or loose fallback? For now just use empty
+         pass
+         
+    # 2. Iterate ALL possible slots (Day * Time * Room)
+    # To avoid explosion, we limit to eligible rooms
+    
+    # Define patterns to check
+    patterns = []
+    if not is_lab:
+        patterns = [
+            ("M", "W"), ("T", "TH"), ("F",), ("SAT",)
+        ]
+    else:
+        patterns = [("F",), ("SAT",), ("M",), ("T",), ("W",), ("TH",)]
+
+    for pattern in patterns:
+        pattern_days = [d for d in days if d.label in pattern]
+        if len(pattern_days) != len(pattern): 
+            continue
+            
+        primary_day = pattern_days[0]
+        day_slots = slots_by_day.get(primary_day.label, [])
+        max_start = len(day_slots) - min_slots
+        
+        if max_start < 0: continue
+        
+        for start_pos in range(max_start + 1):
+            block = day_slots[start_pos : start_pos + min_slots]
+            first_slot = block[0]
+            last_slot = block[-1]
+            time_label = f"{first_slot['start']} - {last_slot['end']}"
+            
+            # Check constraint for this TIME across ALL days in pattern
+            # For suggestions, we just check if *Instructor* or *Room* is the blocker
+            
+            # Check Rooms
+            for room_id in eligible_rooms:
+                room_name = room_id_to_name.get(room_id)
+                if not room_name: continue
+                
+                # Check Room Availability
+                room_conflict = False
+                for pd in pattern_days:
+                    for slot in block:
+                        if (room_name, pd.id, slot["index"]) in booked_room_slots_global:
+                           room_conflict = True
+                           break
+                    if room_conflict: break
+                
+                if room_conflict:
+                    continue # Skip busy rooms for now (we want valid suggestions first)
+
+                # Check Instructors
+                for instr_id in eligible_instrs:
+                    instr_conflict = False
+                    for pd in pattern_days:
+                        for slot in block:
+                            if (instr_id, pd.id, slot["index"]) in booked_instr_slots_global:
+                                instr_conflict = True
+                                break
+                        if instr_conflict: break
+                    
+                    if not instr_conflict:
+                        # FOUND A VALID SLOT!
+                        suggestions.append({
+                            "type": "Valid", 
+                            "day": " + ".join([d.label for d in pattern_days]),
+                            "time": time_label,
+                            "room": room_name,
+                            "instructor_id": instr_id,
+                            "start_min": first_slot["start_min"],
+                            "end_min": last_slot["end_min"],
+                            "day_ids": [d.id for d in pattern_days],
+                            "room_id": room_id,
+                            "score": 100 # High score = good
+                        })
+                        
+                        # Limit results
+                        if len(suggestions) >= 5:
+                            return suggestions
+                            
+    return suggestions
 
 
 

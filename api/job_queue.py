@@ -134,7 +134,7 @@ class QueueManager:
                     def progress_callback(message: str) -> None:
                         job.status_message = message
 
-                    result = run_scheduler(
+                    items, diagnostics = run_scheduler(
                         db=db,
                         course_id=job.payload["course_id"],
                         year=year_value,
@@ -151,8 +151,8 @@ class QueueManager:
                         blocks_count=job.payload.get("blocks_count"),
                         progress_callback=progress_callback,
                     )
-                    job.result = {"items": result, "count": len(result)}
-                    job.status_message = f"Completed! Scheduled {len(result)} items."
+                    job.result = {"items": items, "count": len(items), "diagnostics": diagnostics}
+                    job.status_message = f"Completed! Scheduled {len(items)} items."
                     
                     # Note: Schedule is NOT automatically saved - user must click "Save" button
                     # to persist it to the database. This allows users to regenerate if needed.
