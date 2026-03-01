@@ -2,7 +2,7 @@
 from typing import List, Dict, Optional, Set, Tuple, Any
 from collections import defaultdict
 from api import models
-from .timeslots import TIME_BLOCKS, time_to_minutes
+from .timeslots import TIME_BLOCKS, time_to_minutes, minutes_to_time_str
 
 
 def _ranges_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
@@ -124,13 +124,13 @@ def run_greedy_scheduler(
                         used.add(inst_key)
                         
                         # Update local tracking ranges
-                        room_ranges[(room_name, day.id)].append((start_min, end_min))
+                        room_ranges[(room_name, day_id)].append((start_min, end_min))
                         instr_ranges[(instructor.id, day.id)].append((start_min, end_min))
                         
                         schedule.append({
                             "subject_id": subject.id,
                             "day_id": day.id,
-                            "time": block["label"],
+                            "time": f"{minutes_to_time_str(start_min)} - {minutes_to_time_str(end_min)}",
                             "room_id": room.id,
                             "instructor_id": instructor.id,
                             "start_min": start_min,
@@ -139,14 +139,4 @@ def run_greedy_scheduler(
                         placed = True
                         break
         
-        if not placed:
-            # Add unplaced subject
-            schedule.append({
-                "subject_id": subject.id,
-                "day_id": None,
-                "time": None,
-                "room_id": None,
-                "instructor_id": None,
-            })
-    
     return schedule

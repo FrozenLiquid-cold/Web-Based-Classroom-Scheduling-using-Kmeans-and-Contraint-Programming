@@ -10,6 +10,20 @@ class UserLogin(BaseModel):
     password: str
 
 
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str  # 'admin', 'registrar', 'instructor'
+    instructor_id: Optional[int] = None
+
+
+class UserUpdate(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+    instructor_id: Optional[int] = None
+
+
 class UserResponse(BaseModel):
     id: int
     username: str

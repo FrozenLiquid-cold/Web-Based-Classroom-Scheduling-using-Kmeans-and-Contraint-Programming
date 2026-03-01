@@ -544,6 +544,7 @@ def run_scheduler(
                 for sid in allowed_subject_ids:
                     expected_pairs.add((sid, "A"))
 
+
             missing_pairs = expected_pairs - scheduled_pairs
             if missing_pairs:
                 missing_subjects = {sid for (sid, _) in missing_pairs}
@@ -560,6 +561,9 @@ def run_scheduler(
                 # ensures the user always sees all requested subjects.
                 for sid, block_label in sorted(missing_pairs, key=lambda x: (x[0], str(x[1]))):
                     subj = course_subject_lookup.get(sid)
+                    if subj is None:
+                         continue
+                         
                     deduped_results.append({
                         "subject_id": sid,
                         "course_id": subj.course_id if subj is not None and subj.course_id is not None else course_id,
@@ -571,6 +575,7 @@ def run_scheduler(
                         "instructor_id": None,
                         "block": block_label,
                     })
+
 
             return deduped_results, scheduling_diagnostics
         except ImportError as err:

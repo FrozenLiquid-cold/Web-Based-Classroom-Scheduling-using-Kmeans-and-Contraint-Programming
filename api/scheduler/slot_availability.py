@@ -3,7 +3,7 @@ from typing import List, Dict, Tuple, Optional, Any, Set
 from collections import defaultdict
 from sqlalchemy.orm import Session
 from api import models
-from .timeslots import TIME_BLOCKS, time_to_minutes
+from .timeslots import TIME_BLOCKS, time_to_minutes, minutes_to_time_str
 
 
 def get_available_slots(
@@ -127,111 +127,165 @@ def generate_recommendations(
     """
     Generate scheduling recommendations for a subject that couldn't be scheduled.
     
-    Args:
-        subject: The Subject model to schedule
-        eligible_room_ids: List of room IDs suitable for this subject
-        eligible_instructor_ids: List of instructor IDs who can teach this subject
-        rooms: All rooms
-        instructors: All instructors
-        days: All days
-        room_availability: Pre-computed room availability from get_available_slots()
-        instructor_availability: Pre-computed instructor availability
-        student_time_ranges: Existing student schedule ranges
-        course_id: Course ID for student conflict checking
-        year: Year level for student conflict checking
-        block_label: Student block label (A, B, C, etc.)
-        max_recommendations: Maximum number of recommendations to return
+    For LEC subjects: generates M-W and T-TH paired-day options + Friday single-day.
+    For LAB subjects: generates single-day options only.
     
-    Returns:
-        List of recommendations, sorted by preference:
-        [{"room_id": x, "room_name": "Room 101", "instructor_id": y, 
-          "instructor_name": "Prof. X", "day_id": z, "day_label": "M",
-          "time": "7:00-8:30", "start_min": 420, "end_min": 510, "score": 100}]
+    For paired patterns, checks that the room AND instructor are free on BOTH days
+    at the same time, and that no student conflict exists on either day.
     """
     recommendations = []
     
     room_lookup = {r.id: r for r in rooms}
     instructor_lookup = {i.id: i for i in instructors}
     day_lookup = {d.id: d for d in days}
+    day_by_label = {d.label.upper(): d for d in days}
     
     subj_type = (getattr(subject, "type", "") or "").upper().strip()
     is_lab = subj_type == "LAB"
     
-    # For each eligible room, find slots where both room AND an instructor are free
-    for room_id in eligible_room_ids:
-        room = room_lookup.get(room_id)
-        if not room:
-            continue
+    # Define day patterns based on subject type
+    PAIRED_PATTERNS = [
+        ("M-W", ["M", "W"]),
+        ("T-TH", ["T", "TH"]),
+    ]
+    SINGLE_PATTERNS = [("F", ["F"])]
+    
+    if is_lab:
+        # LAB: paired M-W / T-TH patterns + all available single days
+        patterns_to_try = PAIRED_PATTERNS + [(d.label, [d.label]) for d in days]
+    else:
+        # LEC: paired M-W / T-TH patterns + Friday single-day
+        patterns_to_try = PAIRED_PATTERNS + SINGLE_PATTERNS
+
+    def _check_slot_on_day(room_id, day_id, start_min, end_min):
+        """Check if room is free for the given time range on the given day."""
+        room_slots = room_availability.get(room_id, {}).get(day_id, [])
+        for slot in room_slots:
+            # The slot must fully cover the requested range
+            if slot["start_min"] <= start_min and slot["end_min"] >= end_min:
+                return True
+        return False
+
+    def _check_instr_on_day(instr_id, day_id, start_min, end_min):
+        """Check if instructor is free for the given time range on the given day."""
+        instr_slots = instructor_availability.get(instr_id, {}).get(day_id, [])
+        for slot in instr_slots:
+            if slot["start_min"] <= start_min and slot["end_min"] >= end_min:
+                return True
+        return False
+
+    def _check_student_conflict(day_id, start_min, end_min):
+        """Check if this timeslot conflicts with existing student schedule."""
+        student_key = (course_id, year, block_label, day_id)
+        student_ranges = student_time_ranges.get(student_key, [])
+        for s_start, s_end in student_ranges:
+            if not (end_min <= s_start or start_min >= s_end):
+                return True  # conflict found
+        return False
+
+    for pattern_label, day_labels in patterns_to_try:
+        # Resolve day objects for this pattern
+        pattern_days = []
+        for dl in day_labels:
+            d = day_by_label.get(dl.upper())
+            if d:
+                pattern_days.append(d)
         
-        room_slots = room_availability.get(room_id, {})
+        if len(pattern_days) != len(day_labels):
+            continue  # skip if any day not found in DB
         
-        for day_id, slots in room_slots.items():
-            day = day_lookup.get(day_id)
-            if not day:
+        is_paired = len(pattern_days) == 2
+        
+        for room_id in eligible_room_ids:
+            room = room_lookup.get(room_id)
+            if not room:
                 continue
             
-            for slot in slots:
-                # For LAB subjects, prefer LAB slots
+            # Use first day's available slots as the candidate time windows
+            first_day = pattern_days[0]
+            room_slots = room_availability.get(room_id, {}).get(first_day.id, [])
+            
+            for slot in room_slots:
+                # For LAB subjects, only consider LAB-flagged slots
                 if is_lab and not slot.get("is_lab", False):
                     continue
                 
                 start_min = slot["start_min"]
                 end_min = slot["end_min"]
                 
-                # Check student conflict
-                student_key = (course_id, year, block_label, day_id)
-                student_ranges = student_time_ranges.get(student_key, [])
-                has_student_conflict = False
-                for s_start, s_end in student_ranges:
-                    if not (end_min <= s_start or start_min >= s_end):
-                        has_student_conflict = True
+                # For paired patterns, check room availability AND student conflicts
+                # on ALL days of the pattern
+                all_days_ok = True
+                for pd in pattern_days:
+                    if not _check_slot_on_day(room_id, pd.id, start_min, end_min):
+                        all_days_ok = False
+                        break
+                    if _check_student_conflict(pd.id, start_min, end_min):
+                        all_days_ok = False
                         break
                 
-                if has_student_conflict:
+                if not all_days_ok:
                     continue
                 
-                # Find available instructors for this slot
+                # Find an instructor who is free on ALL days at this time
                 for instr_id in eligible_instructor_ids:
                     instructor = instructor_lookup.get(instr_id)
                     if not instructor:
                         continue
                     
-                    instr_slots = instructor_availability.get(instr_id, {}).get(day_id, [])
-                    
-                    # Check if instructor is free at this time
-                    instr_free = False
-                    for instr_slot in instr_slots:
-                        if instr_slot["start_min"] == start_min and instr_slot["end_min"] == end_min:
-                            instr_free = True
+                    instr_ok = True
+                    for pd in pattern_days:
+                        if not _check_instr_on_day(instr_id, pd.id, start_min, end_min):
+                            instr_ok = False
                             break
                     
-                    if instr_free:
-                        # Calculate preference score (higher = better)
-                        score = 100
-                        # Prefer morning slots
-                        if start_min < 720:  # Before noon
-                            score += 20
-                        # Prefer non-evening slots
-                        if end_min > 1080:  # After 6 PM
-                            score -= 30
-                        
-                        recommendations.append({
-                            "room_id": room_id,
-                            "room_name": room.name,
-                            "instructor_id": instr_id,
-                            "instructor_name": getattr(instructor, "name", f"Instructor {instr_id}"),
-                            "day_id": day_id,
-                            "day_label": day.label,
-                            "time": slot["label"],
-                            "start_min": start_min,
-                            "end_min": end_min,
-                            "score": score,
-                            "is_lab_slot": slot.get("is_lab", False),
-                        })
+                    if not instr_ok:
+                        continue
+                    
+                    # Calculate preference score (higher = better)
+                    score = 100
+                    if start_min < 720:   # Before noon
+                        score += 20
+                    if end_min > 1080:    # After 6 PM
+                        score -= 30
+                    if is_paired:
+                        score += 10       # Prefer proper paired patterns over single-day
+                    
+                    day_ids = [pd.id for pd in pattern_days]
+                    
+                    recommendations.append({
+                        "room_id": room_id,
+                        "room_name": room.name,
+                        "instructor_id": instr_id,
+                        "instructor_name": getattr(instructor, "name", f"Instructor {instr_id}"),
+                        "day_id": pattern_days[0].id,
+                        "day_ids": day_ids,
+                        "day_label": pattern_label,
+                        "time": f"{minutes_to_time_str(start_min)} - {minutes_to_time_str(end_min)}",
+                        "start_min": start_min,
+                        "end_min": end_min,
+                        "score": score,
+                        "is_lab_slot": slot.get("is_lab", False),
+                        "is_paired": is_paired,
+                    })
+    
+    # Deduplicate: keep only the best instructor per unique (room, pattern, time)
+    # This prevents identical-looking entries when multiple instructors are free
+    best_by_slot = {}
+    for rec in recommendations:
+        slot_key = (rec["room_id"], rec["day_label"], rec["start_min"], rec["end_min"])
+        existing = best_by_slot.get(slot_key)
+        if existing is None or rec["score"] > existing["score"]:
+            best_by_slot[slot_key] = rec
+    
+    deduped = list(best_by_slot.values())
     
     # Sort by score (highest first) and limit
-    recommendations.sort(key=lambda x: -x["score"])
-    return recommendations[:max_recommendations]
+    deduped.sort(key=lambda x: -x["score"])
+    
+    # User requested more alternatives, so let's allow up to 15 if max is set small
+    actual_max = max(max_recommendations, 15)
+    return deduped[:actual_max]
 
 
 def diagnose_scheduling_failure(

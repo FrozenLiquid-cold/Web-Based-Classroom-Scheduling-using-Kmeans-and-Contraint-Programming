@@ -283,7 +283,7 @@ def list_instructors():
 
 @entities_bp.route("/instructors", methods=["POST"])
 def create_instructor():
-    """Create a new instructor."""
+    """Create a new instructor (without auto-creating a user account)."""
     logger.info("Creating new instructor")
     data = request.get_json()
     if not data:
@@ -299,58 +299,22 @@ def create_instructor():
 
     try:
         with _get_session() as db:
-            # Derive a base username from first and last name if none is provided.
-            first = (instructor_data.first_name or "").strip()
-            last = (instructor_data.last_name or "").strip()
-            # Optional override from payload, otherwise use "firstname.lastname" style.
-            base_username = (instructor_data.username or f"{first} {last}").strip()
-            # Normalize: lowercase and replace spaces with dots
-            base_username = base_username.lower().replace(" ", ".")
-
-            # Ensure username is unique across users; add numeric suffix if needed.
-            candidate = base_username or "instructor"
-            suffix = 1
-            while (
-                db.query(models.User)
-                .filter(models.User.username == candidate)
-                .first()
-            ) is not None:
-                suffix += 1
-                candidate = f"{base_username}{suffix}"
-
-            # Prepare instructor payload (exclude password, which belongs to User)
+            # Prepare instructor payload (exclude password and username since accounts are managed separately)
             instructor_payload = instructor_data.model_dump(exclude={"password", "username"})
-            instructor_payload["username"] = candidate
 
             # Create new instructor
             db_instructor = models.Instructor(**instructor_payload)
             db.add(db_instructor)
-            db.flush()  # Assign ID without committing yet
-
-            # Always create a linked User account with default credentials.
-            # Default username: derived candidate above
-            # Default password: instructor's last name (as provided)
-            default_password = last or first or candidate
-            password_hash = hashlib.sha256(default_password.encode()).hexdigest()
-
-            db_user = models.User(
-                username=candidate,
-                password_hash=password_hash,
-                role="instructor",
-                instructor_id=db_instructor.id,
-            )
-            db.add(db_user)
-
             db.commit()
             db.refresh(db_instructor)
             logger.info(
-                "Created instructor with ID: %s and default login username=%s password=<last_name>",
+                "Created instructor with ID: %s (no auto-account created)",
                 db_instructor.id,
-                candidate,
             )
             return jsonify(_serialize(db_instructor, schemas.InstructorResponse)), 201
     except Exception as e:
         logger.error(f"Error creating instructor: {e}", exc_info=True)
+        return jsonify({"error": "Failed to create instructor", "details": str(e)}), 500
 
 @entities_bp.route("/instructors/<int:instructor_id>", methods=["GET"])
 def get_instructor(instructor_id: int):
@@ -575,6 +539,131 @@ def delete_instructor(instructor_id: int):
 			f"Error deleting instructor {instructor_id}: {e}", exc_info=True
 		)
 		return jsonify({"detail": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# User account routes (Admin-managed)
+# ---------------------------------------------------------------------------
+@entities_bp.route("/users", methods=["GET"])
+def list_users():
+    """List all user accounts, enriched with instructor name if linked."""
+    with _get_session() as db:
+        users = db.query(models.User).all()
+        result = []
+        for u in users:
+            row = {
+                "id": u.id,
+                "username": u.username,
+                "role": u.role,
+                "instructor_id": u.instructor_id,
+                "instructor_name": None,
+            }
+            if u.instructor_id:
+                instr = db.query(models.Instructor).get(u.instructor_id)
+                if instr:
+                    parts = [instr.first_name or ""]
+                    if instr.middle_name:
+                        parts.append(instr.middle_name)
+                    parts.append(instr.last_name or "")
+                    row["instructor_name"] = " ".join(p for p in parts if p)
+            result.append(row)
+        return jsonify(result)
+
+
+@entities_bp.route("/users", methods=["POST"])
+def create_user():
+    """Create a new user account."""
+    payload = request.get_json(force=True) or {}
+    try:
+        user_data = schemas.UserCreate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    if user_data.role not in {"admin", "registrar", "instructor"}:
+        return jsonify({"detail": "Role must be 'admin', 'registrar', or 'instructor'"}), 400
+
+    with _get_session() as db:
+        # Ensure username is unique
+        existing = db.query(models.User).filter(models.User.username == user_data.username).first()
+        if existing:
+            return jsonify({"detail": "Username already exists"}), 400
+
+        # If instructor role, validate instructor_id
+        if user_data.role == "instructor":
+            if not user_data.instructor_id:
+                return jsonify({"detail": "instructor_id is required for instructor accounts"}), 400
+            instr = db.query(models.Instructor).get(user_data.instructor_id)
+            if not instr:
+                return jsonify({"detail": "Instructor not found"}), 404
+            # Check no account already linked to this instructor
+            existing_link = db.query(models.User).filter(models.User.instructor_id == user_data.instructor_id).first()
+            if existing_link:
+                return jsonify({"detail": "This instructor already has a linked account"}), 400
+
+        password_hash = hashlib.sha256(user_data.password.encode()).hexdigest()
+        db_user = models.User(
+            username=user_data.username,
+            password_hash=password_hash,
+            role=user_data.role,
+            instructor_id=user_data.instructor_id if user_data.role == "instructor" else None,
+        )
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        return jsonify(_serialize(db_user, schemas.UserResponse)), 201
+
+
+@entities_bp.route("/users/<int:user_id>", methods=["PUT"])
+def update_user(user_id: int):
+    """Update an existing user account."""
+    payload = request.get_json(force=True) or {}
+    try:
+        user_update = schemas.UserUpdate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            return jsonify({"detail": "User not found"}), 404
+
+        data = user_update.model_dump(exclude_unset=True)
+
+        if "username" in data and data["username"]:
+            existing = db.query(models.User).filter(
+                models.User.username == data["username"],
+                models.User.id != user_id,
+            ).first()
+            if existing:
+                return jsonify({"detail": "Username already exists"}), 400
+            user.username = data["username"]
+
+        if "password" in data and data["password"]:
+            user.password_hash = hashlib.sha256(data["password"].encode()).hexdigest()
+
+        if "role" in data and data["role"]:
+            if data["role"] not in {"admin", "registrar", "instructor"}:
+                return jsonify({"detail": "Invalid role"}), 400
+            user.role = data["role"]
+
+        if "instructor_id" in data:
+            user.instructor_id = data["instructor_id"]
+
+        db.commit()
+        db.refresh(user)
+        return jsonify(_serialize(user, schemas.UserResponse))
+
+
+@entities_bp.route("/users/<int:user_id>", methods=["DELETE"])
+def delete_user(user_id: int):
+    """Delete a user account."""
+    with _get_session() as db:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            return jsonify({"detail": "User not found"}), 404
+        db.delete(user)
+        db.commit()
+        return "", 204
 
 
 # ---------------------------------------------------------------------------

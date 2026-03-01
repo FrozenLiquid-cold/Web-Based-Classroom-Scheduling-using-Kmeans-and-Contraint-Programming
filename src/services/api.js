@@ -8,6 +8,7 @@ const ENTITY_MAP = {
   day: 'days',
   subject: 'subjects',
   room: 'rooms',
+  user: 'users',
 }
 
 const TIMEOUTS = {
@@ -365,8 +366,8 @@ export async function getSwapRequestPendingCount(instructorId) {
   return apiCall(`/swap-requests/pending-count?instructor_id=${instructorId}`)
 }
 
-export async function getAdminStats(semester = 1) {
-  return apiCall(`/stats/admin?semester=${semester}`)
+export async function getAdminStats(semester = 1, departmentId = "") {
+  return apiCall(`/stats/admin?semester=${semester}${departmentId ? `&department_id=${departmentId}` : ""}`)
 }
 
 export async function getSchedulingSuggestions(subjectId, courseId, year, semester) {

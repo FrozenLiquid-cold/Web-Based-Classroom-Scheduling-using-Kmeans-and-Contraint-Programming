@@ -653,7 +653,9 @@ export default function RegistrarSchedule() {
       }
     });
 
-    return conflicts;
+    // Deduplicate conflict messages (multi-day subjects like T-TH produce
+    // one message per day row, but the messages are identical)
+    return [...new Set(conflicts)];
   }
 
   // Parse "HH:MM" or "H:MM AM/PM" to minutes from midnight
@@ -692,7 +694,7 @@ export default function RegistrarSchedule() {
     if (!timeStr) return null;
 
     // Normalize dashes
-    const normalized = timeStr.replace(/[â€“â€”]/g, "-");
+    const normalized = timeStr.replace(/[â€“—]/g, "-");
     const parts = normalized.split("-");
 
     if (parts.length >= 2) {
@@ -1164,9 +1166,11 @@ export default function RegistrarSchedule() {
 
 
     // Try multiple lookup strategies to handle type mismatches
-    const diagEntry = diagnostics[subjectId] ||
-      diagnostics[String(subjectId)] ||
-      diagnostics[Number(subjectId)];
+    // Backend nests per-subject diagnostics inside diagnostics.unscheduled_reasons
+    const diagReasons = diagnostics?.unscheduled_reasons || diagnostics?._raw || diagnostics || {};
+    const diagEntry = diagReasons[subjectId] ||
+      diagReasons[String(subjectId)] ||
+      diagReasons[Number(subjectId)];
 
     let failureReason = null;
     let failureDetail = null;
@@ -1241,9 +1245,10 @@ export default function RegistrarSchedule() {
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    // Get recommendations from diagnostics
-                    const diagEntry = diagnostics[slot.subject_id] || diagnostics[String(slot.subject_id)];
-                    const alternatives = diagEntry?.recommendations || [];
+                    // Get recommendations from slot (auto-applied) or diagnostics (unscheduled)
+                    const diagReasonsAlt = diagnostics?.unscheduled_reasons || diagnostics?._raw || diagnostics || {};
+                    const diagEntry = diagReasonsAlt[slot.subject_id] || diagReasonsAlt[String(slot.subject_id)];
+                    const alternatives = slot.alternatives || diagEntry?.recommendations || [];
                     setRecommendationModalItem({ ...slot, alternatives });
                   }}
                   className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-amber-700 bg-amber-100 border border-amber-200 rounded-full hover:bg-amber-200 transition-colors cursor-pointer"
@@ -1775,7 +1780,7 @@ export default function RegistrarSchedule() {
                   <label className="block text-xs font-bold text-gray-500 uppercase mb-1.5">Instructor</label>
                   <select
                     name="_instructorId"
-                    value={editingItem._instructorId}
+                    value={editingItem._instructorId !== null && editingItem._instructorId !== undefined ? String(editingItem._instructorId) : ""}
                     onChange={handleEditChange}
                     className={`w-full p-2.5 border rounded-lg focus:ring-2 outline-none bg-white ${validationResult.messages.length > 0 ? 'border-red-300 focus:ring-red-500 text-red-900' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'
                       }`}
@@ -1786,22 +1791,15 @@ export default function RegistrarSchedule() {
                         // Filter: Only show eligible instructors if a restriction list exists
                         if (availableResources.eligibleInstructors && availableResources.eligibleInstructors.length > 0) {
                           const isEligible = availableResources.eligibleInstructors.includes(i.id);
-                          return isEligible;
+                          // ALWAYS show the currently assigned instructor so the value bindings work!
+                          return isEligible || String(i.id) === String(editingItem._instructorId);
                         }
-                        // If no restriction list (e.g. backend returned empty for some reason, or no subject_id),
-                        // we might normally show all. But for "Smart Override" with subject_id, 
-                        // empty eligible list means NO ONE is eligible. 
-                        if (availableResources.eligibleInstructors) {
-                          console.log("Eligible list exists but empty -> Hiding all");
-                          return false;
-                        }
-
                         return true;
                       })
                       .map(i => {
                         const isAvail = availableResources.instructors.includes(i.id);
                         return (
-                          <option key={i.id} value={i.id} className={!isAvail ? "text-gray-400 bg-gray-50" : "font-medium"}>
+                          <option key={i.id} value={String(i.id)} className={!isAvail ? "text-gray-400 bg-gray-50" : "font-medium"}>
                             {i.last_name}, {i.first_name} {!isAvail ? "(Busy)" : ""}
                           </option>
                         );
@@ -1906,16 +1904,10 @@ export default function RegistrarSchedule() {
                           // Typically such items have NO day_id and NO time/room
                           const isUnscheduledItem = !itemDayId && !item.time && !item.room_id;
 
-                          // If current item is unscheduled, AND we were editing an unscheduled item (originalDayIds has a null/empty),
-                          // this is the one to remove.
+                          // If current item is unscheduled, we are replacing it, so remove it.
+                          // It's a placeholder, and we now have actual scheduled items for this subject+block.
                           if (isUnscheduledItem) {
-                            // Check if we started editing an unscheduled item
-                            // OriginalDayIds for unscheduled is usually [undefined] or [null] or []
-                            const wasUnscheduled = originalDayIds.length === 0 || originalDayIds.some(d => !d);
-                            if (wasUnscheduled) {
-                              // console.log("Removing unscheduled item during override:", item);
-                              return false;
-                            }
+                            return false;
                           }
 
                           if (originalDayIds.includes(itemDayId)) return false;
@@ -1971,7 +1963,7 @@ export default function RegistrarSchedule() {
             <div className="px-6 py-4 bg-gradient-to-r from-amber-500 to-orange-500 flex justify-between items-center">
               <div>
                 <h3 className="font-bold text-xl text-white tracking-wide">
-                  ðŸ“‹ Scheduling Alternatives
+                  &#x1F4CB; Scheduling Alternatives
                 </h3>
                 <p className="text-white/80 text-sm mt-0.5">
                   This slot was auto-suggested. Choose a different option if preferred.
@@ -2015,26 +2007,31 @@ export default function RegistrarSchedule() {
                       <button
                         key={idx}
                         onClick={() => {
-                          // Apply this alternative
-                          setSchedule(prev => prev.map(item => {
-                            if ((item._uiId && item._uiId === recommendationModalItem._uiId) ||
-                              (item.subject_id === recommendationModalItem.subject_id && item.block === recommendationModalItem.block)) {
-                              return {
-                                ...item,
-                                room_id: alt.room_id,
-                                room_name: alt.room_name,
-                                instructor_id: alt.instructor_id,
-                                instructor_name: alt.instructor_name,
-                                day_id: alt.day_id,
-                                day: alt.day_label,
-                                time: alt.time,
-                                start_min: alt.start_min,
-                                end_min: alt.end_min,
-                                is_recommended: true,
-                              };
-                            }
-                            return item;
-                          }));
+                          // Apply this alternative - handle paired days (M-W, T-TH)
+                          const altDayIds = alt.day_ids || [alt.day_id];
+                          setSchedule(prev => {
+                            // Remove existing items for this subject+block
+                            const filtered = prev.filter(item => {
+                              const matchUi = item._uiId && item._uiId === recommendationModalItem._uiId;
+                              const matchSubjBlock = item.subject_id === recommendationModalItem.subject_id && item.block === recommendationModalItem.block;
+                              return !(matchUi || matchSubjBlock);
+                            });
+                            // Add one item per day
+                            const newItems = altDayIds.map(dayId => ({
+                              ...recommendationModalItem,
+                              room_id: alt.room_id,
+                              room_name: alt.room_name,
+                              instructor_id: alt.instructor_id,
+                              instructor_name: alt.instructor_name,
+                              day_id: dayId,
+                              day: alt.day_label,
+                              time: alt.time,
+                              start_min: alt.start_min,
+                              end_min: alt.end_min,
+                              is_recommended: true,
+                            }));
+                            return [...filtered, ...newItems];
+                          });
                           setRecommendationModalItem(null);
                         }}
                         className="w-full text-left p-3 border border-blue-100 bg-blue-50 hover:bg-blue-100 rounded-lg text-sm flex justify-between items-center group transition-colors"
@@ -2045,11 +2042,11 @@ export default function RegistrarSchedule() {
                           </div>
                           <div>
                             <div className="font-semibold text-gray-800">{alt.day_label} @ {alt.time}</div>
-                            <div className="text-xs text-gray-600">{alt.room_name} â€¢ {alt.instructor_name || 'TBA'}</div>
+                            <div className="text-xs text-gray-600">{alt.room_name} &bull; {alt.instructor_name || 'TBA'}</div>
                           </div>
                         </div>
                         <div className="flex items-center gap-2">
-                          <span className="text-xs text-gray-500">Score: {alt.score || 'â€”'}</span>
+                          <span className="text-xs text-gray-500">Score: {alt.score || '—'}</span>
                           <span className="opacity-0 group-hover:opacity-100 text-blue-600 font-medium text-xs bg-white px-2 py-1 rounded shadow-sm transition-opacity">
                             Apply
                           </span>
@@ -2107,7 +2104,7 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
         ...r,
         room: r.room_name,
         day: r.day_label || r.day,
-        day_ids: [r.day_id]
+        day_ids: r.day_ids || [r.day_id]
       }));
       setSuggestions(mappedRecs);
       setLoading(false);
@@ -2211,16 +2208,19 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
                     key={idx}
                     onClick={() => {
                       setResolvingItem(null);
-                      // Pre-fill edit modal - construct object compatible with openEditModal/editingItem
+                      // Map recommendation fields to what openEditModal reads
                       const overrideItem = {
                         ...resolvingItem,
-                        _roomId: s.room_id,
-                        _instructorId: s.instructor_id,
-                        _dayIds: s.day_ids, // array
-                        _startTime: minutesToTimeString(s.start_min),
-                        _endTime: minutesToTimeString(s.end_min),
-                        // For display:
-                        _combinedDaysLabel: s.day,
+                        // These are the fields openEditModal uses to detect day pattern:
+                        _combinedDaysLabel: s.day_label || s.day,
+                        _dayIds: s.day_ids || [s.day_id],
+                        // These are read directly by openEditModal as slot.room_id, slot.instructor_id:
+                        room_id: s.room_id,
+                        instructor_id: s.instructor_id,
+                        // Time fields read by openEditModal:
+                        start_min: s.start_min,
+                        end_min: s.end_min,
+                        time: s.time,
                       };
                       openEditModal(overrideItem);
                     }}
@@ -2228,7 +2228,7 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
                   >
                     <div>
                       <div className="font-semibold">{s.day} @ {s.time}</div>
-                      <div className="text-xs text-green-700">{s.room} • {s.instructor_id ? "Instructor Avail" : "No Instr"}</div>
+                      <div className="text-xs text-green-700">{s.room || s.room_name} • {s.instructor_name || (s.instructor_id ? `Instructor #${s.instructor_id}` : "No Instructor")}</div>
                     </div>
                     <span className="opacity-0 group-hover:opacity-100 text-green-600 font-medium text-xs bg-white px-2 py-1 rounded shadow-sm">
                       Apply
@@ -2254,7 +2254,19 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
             <button
               onClick={() => {
                 setResolvingItem(null);
-                openEditModal(resolvingItem);
+                // Pre-fill from first suggestion if available
+                const first = suggestions && suggestions.length > 0 ? suggestions[0] : null;
+                const overrideItem = first ? {
+                  ...resolvingItem,
+                  _combinedDaysLabel: first.day_label || first.day,
+                  _dayIds: first.day_ids || [first.day_id],
+                  room_id: first.room_id,
+                  instructor_id: first.instructor_id,
+                  start_min: first.start_min,
+                  end_min: first.end_min,
+                  time: first.time,
+                } : resolvingItem;
+                openEditModal(overrideItem);
               }}
               className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-md flex items-center gap-2"
             >

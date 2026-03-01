@@ -120,3 +120,17 @@ def get_slots_by_day(days: List[str]) -> Dict[str, Dict]:
     """
     return {day: create_time_slots_for_day(day) for day in days}
 
+
+def minutes_to_time_str(total_minutes: int) -> str:
+    """Convert minutes since midnight to human-readable 12-hour format (H:MM AM/PM)."""
+    if total_minutes is None:
+        return ""
+    h_24 = total_minutes // 60
+    m = total_minutes % 60
+    
+    # 12-hour format with AM/PM
+    ampm = "AM" if h_24 < 12 else "PM"
+    h_12 = h_24 if 1 <= h_24 <= 12 else (h_24 - 12 if h_24 > 12 else 12)
+    
+    return f"{h_12}:{m:02d} {ampm}"
+

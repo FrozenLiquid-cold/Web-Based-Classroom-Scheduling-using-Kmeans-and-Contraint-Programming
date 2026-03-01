@@ -16,6 +16,7 @@ def get_admin_stats():
     db = _get_session()
     try:
         semester = request.args.get("semester", default=1, type=int)
+        department_id = request.args.get("department_id", default=None, type=int)
         
         # 1. Room Availability / Utilization
         # Capacity per room: 12 hours (7am-7pm) * 6 days (M-S) = 72 hours = 4320 mins
@@ -26,7 +27,12 @@ def get_admin_stats():
         
         # Calculate usage per room
         room_usage = {} # room_id -> used_mins
-        schedules = db.query(models.Schedule).filter(models.Schedule.semester == semester).all()
+        
+        schedules_query = db.query(models.Schedule).filter(models.Schedule.semester == semester)
+        if department_id:
+            schedules_query = schedules_query.join(models.Course).filter(models.Course.college_id == department_id)
+            
+        schedules = schedules_query.all()
         
         scheduled_subject_ids = set()
         
@@ -89,7 +95,11 @@ def get_admin_stats():
             avg_utilization = (total_used_mins / total_capacity) * 100 if total_capacity > 0 else 0
 
         # 2. Instructor Availability / Load
-        instructors = db.query(models.Instructor).all()
+        instructors_query = db.query(models.Instructor)
+        if department_id:
+            instructors_query = instructors_query.filter(models.Instructor.college_id == department_id)
+            
+        instructors = instructors_query.all()
         total_instructors = len(instructors)
         
         active_instructor_ids = set(s.instructor_id for s in schedules if s.instructor_id)
@@ -97,6 +107,9 @@ def get_admin_stats():
         
         # 3. Unscheduled Subjects
         subjects_total_query = db.query(models.Subject).filter(models.Subject.semester == semester)
+        if department_id:
+            subjects_total_query = subjects_total_query.join(models.Course).filter(models.Course.college_id == department_id)
+            
         total_subjects = subjects_total_query.count()
         unscheduled_count = total_subjects - len(scheduled_subject_ids)
         if unscheduled_count < 0: unscheduled_count = 0 
@@ -104,10 +117,14 @@ def get_admin_stats():
         # Fetch a few unscheduled for display
         unscheduled_sample = []
         if unscheduled_count > 0:
-             unscheduled_objs = db.query(models.Subject).filter(
+             unscheduled_query = db.query(models.Subject).filter(
                  models.Subject.semester == semester,
                  models.Subject.id.notin_(scheduled_subject_ids)
-             ).limit(5).all()
+             )
+             if department_id:
+                 unscheduled_query = unscheduled_query.join(models.Course).filter(models.Course.college_id == department_id)
+             
+             unscheduled_objs = unscheduled_query.limit(5).all()
              unscheduled_sample = [{"code": s.code, "description": s.description} for s in unscheduled_objs]
 
         # 4. Recommendations

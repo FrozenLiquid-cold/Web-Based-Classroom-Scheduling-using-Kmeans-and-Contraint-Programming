@@ -13,6 +13,7 @@ from api.scheduler.timeslots import (
     time_to_minutes,
     is_consecutive_blocks,
     get_all_time_slots,
+    minutes_to_time_str as _minutes_to_time_str,
 )
 from api.scheduler.slot_availability import (
     get_available_slots,
@@ -24,7 +25,7 @@ from api.scheduler.slot_availability import (
 logger = logging.getLogger(__name__)
 
 # Add file handler to capture all logs to file for debugging
-_file_handler = logging.FileHandler("scheduler_debug.log", mode="w")
+_file_handler = logging.FileHandler("scheduler_debug.log", mode="a")
 _file_handler.setLevel(logging.DEBUG)
 _file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(_file_handler)
@@ -106,16 +107,7 @@ def _time_str_to_minutes(value: str) -> Optional[int]:
     return hour * 60 + minute
 
 
-def _minutes_to_time_str(total_minutes: int) -> str:
-    """Convert minutes since midnight to HH:MM format."""
-    if total_minutes is None:
-        return ""
-    h = total_minutes // 60
-    m = total_minutes % 60
-    # Handle AM/PM logic if needed to match frontend expectations?
-    # Frontend handles 24h format (e.g. 13:00) correctly.
-    # 7:00 -> "7:00", 13:00 -> "13:00"
-    return f"{h}:{m:02d}"
+
 
 
 def is_time_within_preference(start_min: int, end_min: int, pref_start: Optional[int], pref_end: Optional[int]) -> bool:
@@ -610,6 +602,76 @@ def _find_matching_slot(day_slots: List[Dict[str, Any]], template_slot: Dict[str
     return None
 
 
+def _log_slot_mismatch_diagnosis(subject, slots_by_day, days, logger):
+    """Log detailed diagnosis of why a subject has no valid start options.
+    
+    Checks MW and TTh slot pairing and reports mismatches.
+    """
+    if not logger:
+        return
+    
+    subj_type = str(getattr(subject, 'type', '')).upper().strip()
+    subj_code = getattr(subject, 'code', '?')
+    subj_id = getattr(subject, 'id', '?')
+    
+    logger.warning(f"  [SLOT DIAGNOSIS] Subject {subj_code} (ID={subj_id}, Type={subj_type}):")
+    
+    # Log slot counts per day
+    for day_label in ['M', 'T', 'W', 'TH', 'F']:
+        day_slots = slots_by_day.get(day_label, [])
+        if day_slots:
+            times = [f"{s.get('start_min')}-{s.get('end_min')}" for s in day_slots[:3]]
+            logger.warning(f"    {day_label}: {len(day_slots)} slots (e.g. {', '.join(times)})")
+        else:
+            logger.warning(f"    {day_label}: 0 slots")
+    
+    if subj_type == 'LEC':
+        # Check MW pairing
+        mon_slots = slots_by_day.get('M', [])
+        wed_slots = slots_by_day.get('W', [])
+        if mon_slots and wed_slots:
+            wed_set = {(s.get('start_min'), s.get('end_min')) for s in wed_slots}
+            unmatched = []
+            for ms in mon_slots:
+                key = (ms.get('start_min'), ms.get('end_min'))
+                if key not in wed_set:
+                    unmatched.append(f"{ms.get('start_min')}-{ms.get('end_min')}")
+            if unmatched:
+                logger.warning(f"    MW MISMATCH: Mon has {len(unmatched)} slots with no Wed match: {', '.join(unmatched[:5])}")
+            else:
+                logger.warning(f"    MW pairing OK ({len(mon_slots)} matched)")
+        elif not mon_slots:
+            logger.warning(f"    MW FAIL: No Monday slots available")
+        elif not wed_slots:
+            logger.warning(f"    MW FAIL: No Wednesday slots available")
+        
+        # Check TTh pairing
+        tue_slots = slots_by_day.get('T', [])
+        thu_slots = slots_by_day.get('TH', [])
+        if tue_slots and thu_slots:
+            thu_set = {(s.get('start_min'), s.get('end_min')) for s in thu_slots}
+            unmatched = []
+            for ts in tue_slots:
+                key = (ts.get('start_min'), ts.get('end_min'))
+                if key not in thu_set:
+                    unmatched.append(f"{ts.get('start_min')}-{ts.get('end_min')}")
+            if unmatched:
+                logger.warning(f"    TTh MISMATCH: Tue has {len(unmatched)} slots with no Thu match: {', '.join(unmatched[:5])}")
+            else:
+                logger.warning(f"    TTh pairing OK ({len(tue_slots)} matched)")
+        elif not tue_slots:
+            logger.warning(f"    TTh FAIL: No Tuesday slots available")
+        elif not thu_slots:
+            logger.warning(f"    TTh FAIL: No Thursday slots available")
+    
+    elif subj_type == 'LAB':
+        # LAB needs any single day with a slot
+        any_day_with_slots = [d for d in ['M', 'T', 'W', 'TH', 'F'] if slots_by_day.get(d)]
+        if not any_day_with_slots:
+            logger.warning(f"    LAB FAIL: No day has any time slots")
+        else:
+            logger.warning(f"    LAB: Slots available on {any_day_with_slots} but still no options (check slot duration vs requirements)")
+
 
 def generate_subject_start_options(
     subject: Any,
@@ -661,12 +723,10 @@ def generate_subject_start_options(
     
     # Debug: Log input parameters
     # Safely get subject attributes with defaults
-    subject_type = getattr(subject, 'subject_type', '?')
-    hours_lec = getattr(subject, 'hours_lec', 0) or 0
-    hours_lab = getattr(subject, 'hours_lab', 0) or 0
+    subj_type_raw = getattr(subject, 'type', '?')
+    subj_units = getattr(subject, 'unit', 0) or 0
     
-    debug_log(f"Generating start options. Subject type: {subject_type}")
-    debug_log(f"Subject hours - LEC: {hours_lec}, LAB: {hours_lab}")
+    debug_log(f"Generating start options. Subject type: {subj_type_raw}, Units: {subj_units}")
     debug_log(f"Available days: {', '.join(slots_by_day.keys())}")
     
     # Track day availability
@@ -683,10 +743,6 @@ def generate_subject_start_options(
         subj_type = ""
     
     debug_log(f"Subject type detected as: {subj_type}")
-    
-    # Get hours_lec and hours_lab with fallbacks (already done above)
-    total_hours = hours_lec + hours_lab
-    debug_log(f"Total hours to schedule: {total_hours} (LEC: {hours_lec}, LAB: {hours_lab})")
     
     # Log available attributes (safely)
     try:
@@ -1630,7 +1686,9 @@ def _retry_unscheduled_subjects(
                             continue
                         
                         if instr_available:
-                            time_label = first_slot["label"] if min_slots == 1 else f"{first_slot['start']}–{last_slot['end']}"
+                            s_str = _minutes_to_time_str(int(first_slot["start_min"]))
+                            e_str = _minutes_to_time_str(int(last_slot["end_min"]))
+                            time_label = f"{s_str} - {e_str}"
 
                             # Map back to original subject ID for external consumers.
                             orig_id_val = getattr(subject, "original_subject_id", getattr(subject, "id", None))
@@ -1675,12 +1733,19 @@ def _retry_unscheduled_subjects(
                                 booked_room_slots_global.add((room_name, day.id, block_index))
                                 booked_instr_slots_global.add((instructor_id, day.id, block_index))
 
-                            if booked_room_ranges_global is not None:
-                                booked_room_ranges_global[(room_name, int(day.id))].append((int(proposed_start_min), int(proposed_end_min)))
-                            if booked_instr_ranges_global is not None:
-                                booked_instr_ranges_global[(int(instructor_id), int(day.id))].append((int(proposed_start_min), int(proposed_end_min)))
+                            # Handle paired days correctly
+                            days_to_book = [day.id]
+                            if cand.get("is_paired") and cand.get("paired_days"):
+                                days_to_book = [p["day_id"] for p in cand["paired_days"]]
+                            
+                            for d_id in days_to_book:
+                                if booked_room_ranges_global is not None:
+                                    booked_room_ranges_global[(room_name, int(d_id))].append((int(proposed_start_min), int(proposed_end_min)))
+                                if booked_instr_ranges_global is not None:
+                                    booked_instr_ranges_global[(int(instructor_id), int(d_id))].append((int(proposed_start_min), int(proposed_end_min)))
 
-                            student_time_ranges[(subj_course_id, subj_year, subj_block_label, day.id)].append((proposed_start_min, proposed_end_min))
+                                student_time_ranges[(subj_course_id, subj_year, subj_block_label, d_id)].append((proposed_start_min, proposed_end_min))
+
 
                             # Log success
                             scheduled = True
@@ -2042,13 +2107,6 @@ def _cp_retry_mini_model(
                                 block_index = slot["index"]
                                 if (room_name, check_day.id, block_index) in booked_room_slots_global:
                                     room_available = False
-                                    # Debug incorrect room conflict
-                                    if subj_code == "GE - US" and room_id == 15 and pattern[0] == "M":
-                                        logger.info(f"CP retry DEBUG: GE - US Room 15 CONFLICT at day={check_day.label} slot={block_index}")
-                                    break
-                                    room_available = False
-                                    stats["room_conflicts"] += 1
-                                    stats["rejection_counters"]["Other Subject"] += 1
                                     break
 
                     # Range-based room conflict check (cross-block/inter-run safety)
@@ -2110,7 +2168,7 @@ def _cp_retry_mini_model(
                         for check_day in pattern_days:
                             check_day_slots = slots_by_day.get(check_day.label, [])
                             if start_pos < len(check_day_slots):
-                                check_block = check_day_slots[start_pos : start_pos + min_slots]
+                                check_block = check_day_slots[start_pos : start_pos + pattern_min_slots]
                                 for slot in check_block:
                                     block_index = slot["index"]
                                     if (
@@ -2133,7 +2191,7 @@ def _cp_retry_mini_model(
                             for check_day in pattern_days:
                                 check_day_slots = slots_by_day.get(check_day.label, [])
                                 if start_pos < len(check_day_slots):
-                                    check_block = check_day_slots[start_pos : start_pos + min_slots]
+                                    check_block = check_day_slots[start_pos : start_pos + pattern_min_slots]
                                     if not check_block: continue
                                     block_start_min = int(check_block[0]["start_min"])
                                     block_end_min = int(check_block[-1]["end_min"])
@@ -2154,9 +2212,9 @@ def _cp_retry_mini_model(
                             else f"{first_slot['start']}–{last_slot['end']}"
                         )
                         
-                        # For LEC (MW/TTh), create a SINGLE unified candidate representing BOTH days
-                        # For LAB (F), create a single-day candidate
-                        if is_lec_subject and len(pattern_days) == 2:
+                        # For MW/TTh patterns, create a SINGLE unified candidate representing BOTH days
+                        # For F pattern, create a single-day candidate
+                        if len(pattern_days) == 2:
                             # Build paired candidate with both days' info
                             paired_days_info = []
                             valid_pair = True
@@ -2187,7 +2245,8 @@ def _cp_retry_mini_model(
                             # Create ONE candidate representing both days together
                             candidates.append({
                                 "subject": subject,
-                                "subject_id": subject.id,
+                                "subject_id": int(base_id),
+                                "clone_subject_id": int(clone_id),
                                 "course_id": subj_course_id,
                                 "year": subj_year,
                                 "student_block_label": subj_block_label,
@@ -2212,7 +2271,7 @@ def _cp_retry_mini_model(
                             })
                             stats["candidates"] += 1
                         else:
-                            # Single-day candidate (LAB Friday)
+                            # Single-day candidate (Friday only)
                             pattern_day = pattern_days[0]
                             pattern_day_slots = slots_by_day.get(pattern_day.label, [])
                             if start_pos >= len(pattern_day_slots):
@@ -2238,7 +2297,8 @@ def _cp_retry_mini_model(
 
                             candidates.append({
                                 "subject": subject,
-                                "subject_id": subject.id,
+                                "subject_id": int(base_id),
+                                "clone_subject_id": int(clone_id),
                                 "course_id": subj_course_id,
                                 "year": subj_year,
                                 "student_block_label": subj_block_label,
@@ -2264,7 +2324,7 @@ def _cp_retry_mini_model(
     per_subject_candidate_counts: Dict[int, int] = defaultdict(int)
     for cand in candidates:
         try:
-            sid_val = int(cand["subject_id"])
+            sid_val = int(cand["clone_subject_id"])
         except Exception:
             continue
         per_subject_candidate_counts[sid_val] += 1
@@ -2314,7 +2374,7 @@ def _cp_retry_mini_model(
 
     subject_to_indices: Dict[int, List[int]] = defaultdict(list)
     for idx, cand in enumerate(candidates):
-        subject_to_indices[int(cand["subject_id"])] .append(idx)
+        subject_to_indices[int(cand["clone_subject_id"])].append(idx)
 
     for subject_id, indices in subject_to_indices.items():
         model.Add(sum(vars_list[i] for i in indices) <= 1)
@@ -2452,7 +2512,7 @@ def _cp_retry_mini_model(
                     "instructor_id": instructor_id,
                     "room_id": room_id,
                     "day_id": day_info["day_id"],
-                    "time": day_info["time_label"] if day_info["time_label"] else f"{_minutes_to_time_str(day_info['start_min'])}–{_minutes_to_time_str(day_info['end_min'])}",
+                    "time": f"{_minutes_to_time_str(day_info['start_min'])} - {_minutes_to_time_str(day_info['end_min'])}",
                     "year": subj_year,
                     "semester": subject.semester if subject.semester else semester,
                     "block": subj_block_label,
@@ -2463,7 +2523,7 @@ def _cp_retry_mini_model(
             retry_results[subject.id] = paired_results
             scheduled_subject_ids.add(subject.id)
         else:
-            # Single-day candidate (LAB Friday)
+            # Single-day candidate (Friday only)
             day_id = cand["day_id"]
             start_min = cand["start_min"]
             end_min = cand["end_min"]
@@ -2476,7 +2536,7 @@ def _cp_retry_mini_model(
                 "instructor_id": instructor_id,
                 "room_id": room_id,
                 "day_id": day_id,
-                "time": time_label if time_label else f"{_minutes_to_time_str(start_min)}–{_minutes_to_time_str(end_min)}",
+                "time": f"{_minutes_to_time_str(start_min)} - {_minutes_to_time_str(end_min)}",
                 "year": subj_year,
                 "semester": subject.semester if subject.semester else semester,
                 "block": subj_block_label,
@@ -2955,6 +3015,16 @@ def run_cp_scheduler(
             subject_ids=subject_ids
         )
 
+    if not subjects:
+        logger.warning("No subjects to schedule")
+        return []
+    
+    print("\n--- TRACE OS 101 ---")
+    for s in subjects:
+        if s.id == 66:
+            print(f"OS 101 SURVIVED DB QUERY. Code: {s.code}")
+    print(f"Num subjects initially: {len(subjects)}")
+
     if focus_subject_ids_set:
         filtered_subjects = [subject for subject in subjects if subject.id in focus_subject_ids_set]
         if len(filtered_subjects) != len(subjects):
@@ -2964,22 +3034,25 @@ def run_cp_scheduler(
                 len(filtered_subjects),
             )
         subjects = filtered_subjects
-    
+        
+    for s in subjects:
+        if s.id == 66:
+            print(f"OS 101 SURVIVED FOCUS SET. Code: {s.code}")
+
     # Debug: Log subjects to be scheduled with safe attribute access
     logger.info("\nSubjects to be scheduled:")
     for i, subject in enumerate(subjects[:10], 1):  # Show first 10 subjects
         try:
             # Safely get attributes with defaults
             code = getattr(subject, 'code', '?')
-            name = getattr(subject, 'name', 'Unnamed')
+            name = getattr(subject, 'description', 'Unnamed')
             subj_id = getattr(subject, 'id', '?')
-            subj_type = getattr(subject, 'subject_type', '?')
-            hours_lec = getattr(subject, 'hours_lec', 0) or 0
-            hours_lab = getattr(subject, 'hours_lab', 0) or 0
+            subj_type = getattr(subject, 'type', '?')
+            subj_units = getattr(subject, 'unit', 0) or 0
             year_level = getattr(subject, 'year_level', '?')
             
             logger.info(f"{i}. {code} - {name} (ID: {subj_id}, Type: {subj_type}, "
-                      f"Hours: {hours_lec + hours_lab}, Year: {year_level})")
+                      f"Units: {subj_units}, Year: {year_level})")
         except Exception as e:
             logger.warning(f"Error logging subject at index {i}: {str(e)}")
             logger.debug(f"Subject attributes: {dir(subject)}")
@@ -3000,6 +3073,15 @@ def run_cp_scheduler(
         subject_map = {s.id: s for s in subjects_from_db}
         # Replace stored procedure results with database objects (preserving order)
         subjects = [subject_map.get(s.id, s) for s in subjects if s.id in subject_map]
+        
+        for s in subjects:
+            if s.id == 66:
+                print(f"OS 101 SURVIVED RE-QUERY. Code: {s.code}")
+                
+        if not any(s.id == 66 for s in subjects):
+            print("OS 101 DROPPED DURING RE-QUERY!!")
+            print(f"- is 66 in subject_ids? {66 in subject_ids}")
+            print(f"- is 66 in subject_map? {66 in subject_map}")
     
     if not subjects:
         logger.warning("No subjects to schedule")
@@ -3481,13 +3563,14 @@ def run_cp_scheduler(
             logger=logger
         )
         if not options:
-            logger.warning(f"⚠️ No valid start options for subject: {subject.code} - {subject.name} "
-                         f"(ID: {subject.id}, Type: {subject.subject_type}, "
-                         f"Hours: {subject.hours_lec+subject.hours_lab})")
+            logger.warning(f"⚠️ No valid start options for subject: {subject.code} - {getattr(subject, 'description', 'Unnamed')} "
+                         f"(ID: {subject.id}, Type: {subject.type}, "
+                         f"Units: {getattr(subject, 'unit', 0)})")
             
             # Additional debug for problematic subjects
             logger.debug(f"Subject details: {subject.__dict__}")
-            logger.debug(f"Required hours: LEC={subject.hours_lec}, LAB={subject.hours_lab}")
+            # Log slot mismatch diagnosis
+            _log_slot_mismatch_diagnosis(subject, slots_by_day, days, logger)
 
     if not instructors or not rooms or not days:
         logger.warning("Missing required data: instructors=%d, rooms=%d, days=%d", 
@@ -3857,6 +3940,11 @@ def run_cp_scheduler(
             booked_instr_ranges_global[(instr_id_i, day_id_i)].append(rng)
     
     all_scheduled_items = []
+    
+    def _trace_all_scheduled_items(stage: str):
+        for it in all_scheduled_items:
+            if it.get("time") is None or it.get("clone_subject_id") is None:
+                logger.error(f"[PHANTOM TRACE] Found phantom item at {stage}: {it}")
     subject_lookup = {s.id: s for s in subjects}
 
     # Global set of codes that have at least one LAB subject anywhere.
@@ -3949,6 +4037,11 @@ def run_cp_scheduler(
 
     all_diagnostics: Dict[int, Dict[str, int]] = {}
     
+    # CRITICAL: Initialize clone map BEFORE the loop so it accumulates across ALL blocks/clusters
+    # This ensures that even if a clone fails in Block A, we remember its mapping to the original subject
+    # for final diagnostics pruning.
+    clone_to_original_map = {}
+    
     # CRITICAL: Initialize these BEFORE the loop so they accumulate across ALL blocks
     # This ensures Block B sees Block A's bookings, preventing double-booking conflicts
     cross_cluster_scheduled_ranges = defaultdict(list)
@@ -3979,6 +4072,19 @@ def run_cp_scheduler(
         # Log subject IDs in this cluster for debugging
         subject_ids_in_cluster = [s.id for s in cluster_subjects]
         logger.info("Cluster %s subject IDs: %s", cluster_id, subject_ids_in_cluster)
+        
+        # Populate clone map for all subjects in this cluster (including clones)
+        for s in cluster_subjects:
+            s_id_val = getattr(s, "id", None)
+            if s_id_val is None:
+                continue
+            # Try to get original ID
+            orig_id_val = getattr(s, "original_subject_id", None)
+            if orig_id_val is not None:
+                try:
+                    clone_to_original_map[int(s_id_val)] = int(orig_id_val)
+                except Exception:
+                    pass
         
         if cluster_id == -1 or len(cluster_subjects) == 0:
             logger.info("Skipping invalid/empty cluster.")
@@ -4150,9 +4256,9 @@ def run_cp_scheduler(
             subj_opts = all_start_options.get(subject_id, [])
             if not subj_opts:
                 logger.warning(f"Subject {code} ({subject_id}) has no valid time windows - generating fallback options")
-                logger.warning(f"  - Subject type: {getattr(subject, 'subject_type', '?')}")
+                logger.warning(f"  - Subject type: {getattr(subject, 'type', '?')}")
                 logger.warning(f"  - Subject code: {getattr(subject, 'code', '?')}")
-                logger.warning(f"  - Hours LEC: {getattr(subject, 'hours_lec', 0)}, LAB: {getattr(subject, 'hours_lab', 0)}")
+                logger.warning(f"  - Units: {getattr(subject, 'unit', 0)}")
                 logger.warning(f"  - Available days: {list(slots_by_day.keys())}")
                 
                 # FALLBACK: Generate basic time windows for this subject
@@ -5788,6 +5894,13 @@ def run_cp_scheduler(
             for (sid2, _d_id2, start_min2, opt_idx2, room_id2, instructor_id2), meta in start_metadata.items():
                 meta_by_presence_key[(sid2, start_min2, opt_idx2, room_id2, instructor_id2)].append(meta)
 
+            # TTh DIAGNOSTIC: Show multi-day presence keys
+            multi_day_keys = {k: len(v) for k, v in meta_by_presence_key.items() if len(v) > 1}
+            if multi_day_keys:
+                logger.info("[TTh DIAG] meta_by_presence_key has %d multi-day keys: %s",
+                           len(multi_day_keys), 
+                           {str(k): v for k, v in list(multi_day_keys.items())[:10]})
+
             # DEBUG: Track which days are actually selected by solver.
             selected_days = defaultdict(int)  # day_id -> count
             for (subject_id, _day_id, start_min, opt_idx, room_id, instructor_id), presence in start_presence_map.items():
@@ -5843,6 +5956,18 @@ def run_cp_scheduler(
                 # CRITICAL: Handle multi-day options (MW, TTh) - create rows for ALL days
                 # Single-day options (F, LAB) have day_ids = [day_id]
                 per_day_metas = meta_by_presence_key.get((subject_id, start_min, opt_idx, room_id, instructor_id), [])
+
+                # TTh DIAGNOSTIC: Log per_day_metas count for every selected presence
+                meta_day_ids = [m.get("day_id") for m in per_day_metas]
+                all_day_ids_in_meta = per_day_metas[0].get("day_ids", []) if per_day_metas else []
+                if len(meta_day_ids) != len(all_day_ids_in_meta) or len(meta_day_ids) > 1:
+                    logger.info(
+                        "[TTh DIAG] subject_id=%s opt_idx=%s: per_day_metas=%d, meta_day_ids=%s, "
+                        "option_day_ids=%s, presence_key=(%s,%s,%s,%s,%s)",
+                        subject_id, opt_idx, len(per_day_metas), meta_day_ids,
+                        all_day_ids_in_meta,
+                        subject_id, start_min, opt_idx, room_id, instructor_id
+                    )
 
                 if not per_day_metas:
                     # Fallback: build a minimal meta from the primary day if metadata is unexpectedly missing.
@@ -5979,29 +6104,11 @@ def run_cp_scheduler(
                         )
                         continue
 
-                    # Canonical time label: prefer the registrar grid label from slots_by_day
-                    time_label = None
-                    day_label = day_id_to_label.get(day_id_int)
-                    if day_label:
-                        for slot in slots_by_day.get(day_label, []):
-                            try:
-                                if int(slot.get("start_min")) == int(start_min_day) and int(slot.get("end_min")) == int(end_min_day):
-                                    time_label = slot.get("label")
-                                    break
-                            except Exception:
-                                continue
-
-                    if not time_label:
-                        s_str = _minutes_to_time_str(int(start_min_day))
-                        e_str = _minutes_to_time_str(int(end_min_day))
-                        span_label = f"{s_str}–{e_str}"
-                        # If day_label is present, we might want to include it, but typically
-                        # the UI expects just the time range if the column is already the day.
-                        # However, to be safe and match previous logic:
-                        # Change: Do not include day_label in the time string.
-                        # The database has separate day_id column, and RoomSchedule.jsx displays day separately.
-                        # Including it breaks frontend parsing (causing "12:00 AM").
-                        time_label = span_label
+                    # CRITICAL: Always generate time label from minutes to ensure consistent formatting
+                    # (AM/PM, no seconds, standard hyphen)
+                    s_str = _minutes_to_time_str(int(start_min_day))
+                    e_str = _minutes_to_time_str(int(end_min_day))
+                    time_label = f"{s_str} - {e_str}"
                     
                     # DEBUG: Trace GE-US (original subject 9) time_label generation
                     if original_subject_id == 9:
@@ -6279,6 +6386,8 @@ def run_cp_scheduler(
                 all_scheduled_items.extend(retry_val)
             else:
                 all_scheduled_items.append(retry_val)
+        
+        _trace_all_scheduled_items(f"After Cluster {cluster_id}")
         
         # =====================================================================
         # CRITICAL FIX: Update global booking ranges with retry results
@@ -6608,13 +6717,18 @@ def run_cp_scheduler(
                     len(dropped_subjects_to_retry),
                 )
 
-                # Merge retry results back in
-                kept_rows.extend(retry_results_conflict.values())
+                # Merge retry results back in - HANDLE LISTS (for paired subjects)
+                for val in retry_results_conflict.values():
+                    if isinstance(val, list):
+                        kept_rows.extend(val)
+                    else:
+                        kept_rows.append(val)
         except Exception as e:
             logger.error("[POST-CONFLICT RETRY] Failed with error: %s", e)
 
     # Replace all_scheduled_items with kept_rows (+ any successful post-conflict retries)
     all_scheduled_items = kept_rows
+    _trace_all_scheduled_items("After Post-Conflict Retry")
 
     # CRITICAL: Log sample items to verify solver results are being returned correctly
     if all_scheduled_items:
@@ -6936,7 +7050,11 @@ def run_cp_scheduler(
     final_diagnostics = {}
     
     # Pre-build lookup for clone_id -> original_id
-    clone_to_original_map = {}
+    # DO NOT RESET clone_to_original_map = {} here! It was populated inside the cluster loop.
+    # We only add missing mappings from the main list here.
+    if clone_to_original_map is None:
+         clone_to_original_map = {}
+         
     for subj in subjects:
         sid = getattr(subj, "id", None)
         try:
@@ -6952,6 +7070,17 @@ def run_cp_scheduler(
             
         if sid_int is not None and orig_int is not None:
             clone_to_original_map[sid_int] = orig_int
+
+    # ENHANCEMENT: Also populate map from scheduled items to catch clones (e.g. 192 -> 92)
+    # This is crucial because 'subjects' list might only have originals, but diagnostics use clones.
+    for item in all_scheduled_items:
+        try:
+            c_id = item.get("clone_subject_id")
+            s_id = item.get("subject_id")
+            if c_id is not None and s_id is not None:
+                clone_to_original_map[int(c_id)] = int(s_id)
+        except Exception:
+            pass
 
     # Priority map (higher number = higher priority)
     REASON_PRIORITY = {
@@ -7045,31 +7174,51 @@ def run_cp_scheduler(
             # final_diagnostics[original_id] = reason
 
     # Fallback: Identify subjects that are NEITHER scheduled NOR have diagnostics
-    scheduled_ids_set = set()
+    # CRITICAL: Track scheduled CLONES (per-block instances)
+    scheduled_clones_set = set()
     for item in all_scheduled_items:
-        sid = item.get("subject_id")
-        if sid is not None:
-             scheduled_ids_set.add(int(sid))
-             # Also add original ID if present
-             if item.get("original_subject_id"):
-                  scheduled_ids_set.add(int(item.get("original_subject_id")))
+        cid = item.get("clone_subject_id")
+        if cid is not None:
+             scheduled_clones_set.add(int(cid))
+             # Also add mapping if we know this clone is scheduled
+             orig_id = item.get("subject_id")
+             if orig_id:
+                 clone_to_original_map[int(cid)] = int(orig_id)
+        else:
+             # Fallback: if clone_subject_id is missing (older items), use subject_id
+             # because it might be the only ID we have.
+             sid = item.get("subject_id")
+             if sid is not None:
+                 scheduled_clones_set.add(int(sid))
     
-    logger.info(f"[DIAGNOSTICS FALLBACK] Checking {len(subjects)} subjects. Scheduled count: {len(scheduled_ids_set)}")
+    logger.info(f"[DIAGNOSTICS FALLBACK] Checking {len(subjects)} subjects. Scheduled clones: {len(scheduled_clones_set)}")
+    logger.info(f"[DIAGNOSTICS DEBUG] Final Diagnostics Keys BEFORE Pruning: {list(final_diagnostics.keys())}")
+    # logger.info(f"[DIAGNOSTICS DEBUG] Scheduled Clones Set (sample): {list(scheduled_clones_set)[:20]}")
 
     for subject in subjects:
-        # Resolve to original ID for consistent lookup
+        # Resolve to original ID for consistent lookup in final results
         original_id_val = getattr(subject, "original_subject_id", None)
         sid_to_use = int(original_id_val) if original_id_val is not None else subject.id
         sid_str = str(sid_to_use)
         
-        is_scheduled = sid_to_use in scheduled_ids_set
+        # Check if THIS SPECIFIC BLOCK (clone) is scheduled
+        is_scheduled = int(subject.id) in scheduled_clones_set
         has_diagnostic = sid_str in final_diagnostics
         
         if is_scheduled:
             # CRITICAL: If the subject is scheduled, it must NOT be in diagnostics.
-            # It might be there from an earlier failed solve attempt (raw_diagnostics).
-            if sid_str in final_diagnostics:
-                del final_diagnostics[sid_str]
+            # However, we only prune if ALL instances (clones) of this subject are scheduled.
+            # Actually, simpler: if this clone is scheduled, and it was in raw_diagnostics, we should remove the clone entry.
+            # But final_diagnostics is keyed by original_id_str. 
+            # We only remove the original_id entry if we are sure NO clones of it remain unscheduled.
+            
+            # Count unscheduled clones for this original subject
+            unscheduled_clones = [s for s in subjects if (getattr(s, "original_subject_id", None) or s.id) == sid_to_use and int(s.id) not in scheduled_clones_set]
+            
+            if not unscheduled_clones:
+                if sid_str in final_diagnostics:
+                    logger.info(f"[DIAGNOSTICS PRUNE] Removing {sid_str} because all blocks are scheduled.")
+                    del final_diagnostics[sid_str]
             continue
 
         # ---------------------------------------------------------------------
@@ -7116,7 +7265,16 @@ def run_cp_scheduler(
                 # Get student time ranges for conflict checking
                 subj_course_id = getattr(subject, 'course_id', course_id) or course_id
                 subj_year = getattr(subject, 'year_level', default_year) or default_year or 1
-                subj_block = getattr(subject, 'block', 'A') or 'A'
+                # FIXED: Derive block label from student_block (integer) for cloned subjects
+                # Clone subjects use student_block=1 for Block A, student_block=2 for Block B, etc.
+                _sb = getattr(subject, 'student_block', None)
+                if _sb is not None:
+                    try:
+                        subj_block = _block_index_to_label(int(_sb))
+                    except (TypeError, ValueError):
+                        subj_block = getattr(subject, 'block', 'A') or 'A'
+                else:
+                    subj_block = getattr(subject, 'block', 'A') or 'A'
                 
                 # FIXED: Define student_time_ranges as Dict to match generate_recommendations signature
                 student_time_ranges = defaultdict(list)
@@ -7217,37 +7375,46 @@ def run_cp_scheduler(
                 # For "Solver Conflict", we let the user resolve manually using the recommendations
                 if is_newly_discovered and recommendations:
                     first_rec = recommendations[0]
-                    # Create schedule item from recommendation
-                    auto_item = {
-                        "subject_id": subject.id,
-                        "original_subject_id": sid_to_use,
-                        "subject_code": getattr(subject, 'code', ''),
-                        "subject_name": getattr(subject, 'name', ''),
-                        "course_id": subj_course_id,
-                        "year": subj_year,
-                        "block": subj_block,
-                        "room_id": first_rec["room_id"],
-                        "room_name": first_rec["room_name"],
-                        "instructor_id": first_rec["instructor_id"],
-                        "instructor_name": first_rec["instructor_name"],
-                        "day_id": first_rec["day_id"],
-                        "day": first_rec["day_label"],
-                        "time": first_rec["time"],
-                        "start_min": first_rec["start_min"],
-                        "end_min": first_rec["end_min"],
-                        "is_recommended": True,  # Flag for UI
-                        "recommendation_score": first_rec["score"],
-                    }
-                    all_scheduled_items.append(auto_item)
-                    scheduled_ids_set.add(sid_to_use)
-                    
-                    # Update booking maps to prevent conflicts with subsequent subjects
-                    room_key = (first_rec["room_name"], first_rec["day_id"])
-                    if booked_room_ranges_global is not None:
-                        booked_room_ranges_global[room_key].append((first_rec["start_min"], first_rec["end_min"]))
-                    instr_key = (first_rec["instructor_id"], first_rec["day_id"])
-                    if booked_instr_ranges_global is not None:
-                        booked_instr_ranges_global[instr_key].append((first_rec["start_min"], first_rec["end_min"]))
+                    rec_is_paired = first_rec.get("is_paired", False)
+                    rec_day_ids = first_rec.get("day_ids", [first_rec["day_id"]])
+
+                    # Create schedule items — one per day for paired patterns (M-W, T-TH)
+                    for rec_day_id in rec_day_ids:
+                        auto_item = {
+                            "subject_id": int(sid_to_use),
+                            "clone_subject_id": subject.id,
+                            "subject_code": getattr(subject, 'code', ''),
+                            "subject_name": getattr(subject, 'name', ''),
+                            "course_id": subj_course_id,
+                            "year": subj_year,
+                            "semester": getattr(subject, 'semester', None) or semester,
+                            "block": subj_block,
+                            "room_id": first_rec["room_id"],
+                            "room_name": first_rec["room_name"],
+                            "instructor_id": first_rec["instructor_id"],
+                            "instructor_name": first_rec["instructor_name"],
+                            "day_id": rec_day_id,
+                            "day": first_rec["day_label"],
+                            "time": first_rec["time"],
+                            "start_min": first_rec["start_min"],
+                            "end_min": first_rec["end_min"],
+                            "is_recommended": True,  # Flag for UI
+                            "recommendation_score": first_rec["score"],
+                            "alternatives": recommendations,  # Pass all generated alternatives to frontend
+                        }
+                        all_scheduled_items.append(auto_item)
+
+                    _trace_all_scheduled_items(f"After Auto-Apply Subj {subject.id}")
+                    scheduled_clones_set.add(int(subject.id))
+
+                    # Update booking maps for ALL days to prevent conflicts
+                    for rec_day_id in rec_day_ids:
+                        room_key = (first_rec["room_name"], rec_day_id)
+                        if booked_room_ranges_global is not None:
+                            booked_room_ranges_global[room_key].append((first_rec["start_min"], first_rec["end_min"]))
+                        instr_key = (first_rec["instructor_id"], rec_day_id)
+                        if booked_instr_ranges_global is not None:
+                            booked_instr_ranges_global[instr_key].append((first_rec["start_min"], first_rec["end_min"]))
                     
                     reason = "Auto-Recommended"
                     detail = f"Automatically scheduled using recommendation: {first_rec['room_name']} on {first_rec['day_label']} at {first_rec['time']} with {first_rec['instructor_name']}"
@@ -7317,6 +7484,12 @@ def run_cp_scheduler(
         # Keep raw diagnostics for backward compatibility
         "_raw": final_diagnostics,
     }
+
+    # FINAL DEBUG PRINT
+    for item in all_scheduled_items:
+        sid = item.get("subject_id")
+        if sid in [96, 196, 296, 99, 199, 299]:
+            logger.info(f"[FINAL RETURN DEBUG] Subject {sid} Time: {item.get('time')}")
 
     return all_scheduled_items, structured_diagnostics
 
@@ -7407,7 +7580,9 @@ def find_alternative_slots(
             block = day_slots[start_pos : start_pos + min_slots]
             first_slot = block[0]
             last_slot = block[-1]
-            time_label = f"{first_slot['start']} - {last_slot['end']}"
+            s_str = _minutes_to_time_str(int(first_slot["start_min"]))
+            e_str = _minutes_to_time_str(int(last_slot["end_min"]))
+            time_label = f"{s_str} - {e_str}"
             
             # Check constraint for this TIME across ALL days in pattern
             # For suggestions, we just check if *Instructor* or *Room* is the blocker
