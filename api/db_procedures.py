@@ -99,7 +99,8 @@ def get_existing_bookings(
     db: Session,
     semester: int,
     years: Optional[List[int]] = None,
-    exclude_course_id: Optional[int] = None
+    exclude_course_id: Optional[int] = None,
+    exclude_years: Optional[List[int]] = None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Get existing room and instructor bookings using stored procedure.
@@ -109,18 +110,24 @@ def get_existing_bookings(
         semester: Semester (1-2)
         years: Optional list of years to filter
         exclude_course_id: Optional course ID to exclude from bookings
+        exclude_years: Optional list of year levels to exclude (only when
+            combined with exclude_course_id). When provided, only records
+            matching BOTH the course AND the year levels are excluded.
+            Records from the same course but different year levels are kept.
     
     Returns:
         Tuple of (room_bookings, instructor_bookings) where each is a list of dicts
         with booking_type, resource_id, resource_name, day_id, time_label
     """
     years_array = years if years else None
+    exclude_years_array = exclude_years if exclude_years else None
     result = db.execute(
-        text("SELECT * FROM get_existing_bookings(:p_semester, :p_years, :p_exclude_course_id)"),
+        text("SELECT * FROM get_existing_bookings(:p_semester, :p_years, :p_exclude_course_id, :p_exclude_years)"),
         {
             "p_semester": semester,
             "p_years": years_array,
-            "p_exclude_course_id": exclude_course_id
+            "p_exclude_course_id": exclude_course_id,
+            "p_exclude_years": exclude_years_array
         }
     )
     

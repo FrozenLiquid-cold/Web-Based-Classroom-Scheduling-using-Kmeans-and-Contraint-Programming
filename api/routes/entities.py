@@ -353,13 +353,14 @@ def update_instructor(instructor_id: int):
         for key, value in data.items():
             setattr(instructor, key, value)
 
-        # If the client did NOT explicitly provide assignable_courses,
-        # keep the existing behavior of auto-populating specialization
-        # from the instructor's college. When assignable_courses is
-        # present, we respect it as a manual specialization list.
+        # Auto-populate specialization from the instructor's college ONLY
+        # when the college_id was explicitly changed AND assignable_courses
+        # was not explicitly provided. This prevents overwrites when
+        # toggling is_active or other fields.
         has_assignable_courses = "assignable_courses" in data
-        if not has_assignable_courses:
-            college_id = data.get("college_id", instructor.college_id)
+        college_id_changed = "college_id" in data
+        if not has_assignable_courses and college_id_changed:
+            college_id = data.get("college_id")
             if college_id:
                 courses = (
                     db.query(models.Course)
@@ -368,7 +369,7 @@ def update_instructor(instructor_id: int):
                 )
                 codes = [course.code for course in courses]
                 instructor.assignable_courses = ",".join(codes) if codes else None
-            elif "college_id" in data and college_id is None:
+            else:
                 instructor.assignable_courses = None
 
         db.commit()

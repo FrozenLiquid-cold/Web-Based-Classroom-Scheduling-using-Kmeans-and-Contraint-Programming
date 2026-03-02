@@ -1188,24 +1188,21 @@ def build_eligibility_maps(
                 )
                 preferred_rooms = []
 
-        # 2. Fallback for Instructors if empty
+        # 2. Fallback for Instructors if empty — STRICT specialization only
         if not eligible_instrs:
+            import re
+            def _normalize_code(s):
+                return re.sub(r'[^A-Z0-9]', '', s.upper())
+
+            norm_subj_code = _normalize_code(subj_code) if subj_code else ""
             eligible_instrs = []
             for inst in instructors:
                 inst_id = inst.id
-                inst_college = inst.college_id
                 assignable = inst.assignable_courses or ""
-                assignable_set = {c.strip().upper() for c in assignable.split(",") if c.strip()}
+                assignable_set = {_normalize_code(c) for c in assignable.split(",") if c.strip()}
 
-                matched = False
-                if assignable_set and subj_code in assignable_set:
-                    matched = True
-                elif subj_college and inst_college and subj_college == inst_college:
-                    matched = True
-                elif not assignable_set and not subj_college and not inst_college:
-                    matched = True
-
-                if matched:
+                # Only match if the instructor explicitly lists this subject code
+                if norm_subj_code and assignable_set and norm_subj_code in assignable_set:
                     eligible_instrs.append(inst_id)
 
         subject_to_instructors[sid] = eligible_instrs
@@ -3134,7 +3131,7 @@ def run_cp_scheduler(
                     # Get instructors that can teach this specific NSTP subject
                     # NSTP 1 should match instructors with "NSTP1" or "NSTP 1"
                     # NSTP 2 should match instructors with "NSTP2" or "NSTP 2"
-                    all_instructors = db.query(models.Instructor).all()
+                    all_instructors = db.query(models.Instructor).filter(models.Instructor.is_active == True).all()
                     debug_lines = []
                     
                     # Score-based selection:
@@ -3148,7 +3145,7 @@ def run_cp_scheduler(
                     candidate_pool = []
                     
                     # Force reload to ensure session is fresh
-                    all_active_instructors = db.query(models.Instructor).all()
+                    all_active_instructors = db.query(models.Instructor).filter(models.Instructor.is_active == True).all()
                     
                     msg_scan = f"[NSTP DEBUG] Scanning {len(all_active_instructors)} instructors for {nstp_code}..."
                     logger.info(msg_scan)
@@ -3389,8 +3386,8 @@ def run_cp_scheduler(
             years_label,
             cluster_distribution,
         )
-    # Load all instructors (no is_active filter as it doesn't exist in the model)
-    instructors = db.query(models.Instructor).all()
+    # Load only active instructors
+    instructors = db.query(models.Instructor).filter(models.Instructor.is_active == True).all()
     logger.info(f"Loaded {len(instructors)} instructors")
 
     deductions = {
@@ -3484,7 +3481,7 @@ def run_cp_scheduler(
             instructor_current_minutes[instr_id_int] += max(0, int(end_min) - int(start_min))
     
     # Load all rooms ordered by capacity
-    rooms = db.query(models.Room).order_by(models.Room.capacity).all()
+    rooms = db.query(models.Room).filter(models.Room.is_available == True).order_by(models.Room.capacity).all()
     
     # Load Building Distances for Travel Time Constraints
     travel_times = {}
@@ -4231,26 +4228,19 @@ def run_cp_scheduler(
                 )
             
             # CRITICAL: Use len() == 0 check, NOT truthy check
-            # FALLBACK: If no eligible rooms/instructors, add fallback options to ensure scheduling
-            if len(eligible_rooms) == 0 or len(eligible_instrs) == 0:
-                reason = "no eligible instructors" if len(eligible_instrs) == 0 else "no eligible rooms"
-                logger.warning(f"Subject {code} ({subject_id}) has {reason} - adding fallback eligibility")
-                logger.warning(f"  - Original eligible rooms: {eligible_rooms}")
-                logger.warning(f"  - Original eligible instructors: {eligible_instrs}")
-                
-                # FALLBACK: Add all rooms as eligible if none specified
-                if len(eligible_rooms) == 0:
-                    eligible_rooms = [room.id for room in rooms]
-                    logger.warning(f"  - Fallback: using all {len(eligible_rooms)} rooms")
-                
-                # FALLBACK: Add all instructors as eligible if none specified  
-                if len(eligible_instrs) == 0:
-                    eligible_instrs = [inst.id for inst in instructors]
-                    logger.warning(f"  - Fallback: using all {len(eligible_instrs)} instructors")
-                
-                # Don't skip the subject - continue with fallback eligibility
-                subjects_without_options.append((code, f"{reason} (used fallback)"))
-                # Don't increment subjects_skipped_count since we're using fallback
+            # FALLBACK: If no eligible rooms, add fallback options to ensure scheduling
+            # But for instructors, strict specialization is enforced — skip if no eligible
+            if len(eligible_instrs) == 0:
+                logger.warning(f"Subject {code} ({subject_id}) has no eligible specialized instructors - skipping")
+                subjects_without_options.append((code, "no eligible specialized instructors"))
+                subjects_skipped_count += 1
+                continue
+
+            if len(eligible_rooms) == 0:
+                logger.warning(f"Subject {code} ({subject_id}) has no eligible rooms - adding fallback")
+                eligible_rooms = [room.id for room in rooms]
+                logger.warning(f"  - Fallback: using all {len(eligible_rooms)} rooms")
+                subjects_without_options.append((code, "no eligible rooms (used fallback)"))
             
             # Get options for this subject
             subj_opts = all_start_options.get(subject_id, [])

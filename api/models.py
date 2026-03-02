@@ -65,6 +65,7 @@ class Instructor(Base):
     preferred_start_time = Column(String(10), nullable=True)  # e.g., "08:00"
     preferred_end_time = Column(String(10), nullable=True)  # e.g., "17:00"
     max_units = Column(Integer, nullable=True)  # Maximum units per semester
+    is_active = Column(Boolean, default=True, nullable=False, server_default="1")  # Active/Inactive flag
     
     college = relationship("College")
     user = relationship("User", back_populates="instructor", uselist=False)
@@ -116,6 +117,7 @@ class Room(Base):
     cluster = Column(Integer, nullable=True, default=-1)  # For room clustering
     description = Column(Text, nullable=True)
     building_id = Column(Integer, ForeignKey("buildings.id"), nullable=True)
+    is_available = Column(Boolean, default=True, nullable=False, server_default="1")  # Available/Unavailable flag
     
     __table_args__ = (
         CheckConstraint("type IN ('LEC', 'LAB')", name="check_room_type"),

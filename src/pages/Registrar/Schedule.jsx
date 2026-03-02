@@ -1116,6 +1116,44 @@ export default function RegistrarSchedule() {
     return ids.size;
   }, [subjects, filteredSchedule, form.course_id, form.year, form.semester]);
 
+  // Feature 1: Detect subjects with no eligible active instructor (pre-scheduling)
+  const normalizeCode = (str) => str.toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+  const subjectsWithoutInstructor = useMemo(() => {
+    const courseId = Number(form.course_id);
+    const selectedYear = Number(form.year);
+    const selectedSemester = Number(form.semester);
+    if (!courseId || !selectedYear || !selectedSemester) return [];
+
+    const plannedSubjects = (subjects || []).filter(s => {
+      return Number(s.course_id) === courseId &&
+        Number(s.year_level) === selectedYear &&
+        Number(s.semester) === selectedSemester;
+    });
+
+    const activeInstructors = (instructors || []).filter(i => i.is_active !== false);
+
+    // Deduplicate by subject code (e.g. LEC + LAB variants of same subject)
+    const seen = new Set();
+    return plannedSubjects.filter(subj => {
+      const code = (subj.code || '').trim();
+      if (!code) return false;
+      const normCode = normalizeCode(code);
+      if (seen.has(normCode)) return false; // skip LEC/LAB duplicate
+
+      const hasInstructor = activeInstructors.some(instr => {
+        const assignable = (instr.assignable_courses || instr.assignableCourses || '');
+        return assignable.split(',').some(c => normalizeCode(c) === normCode);
+      });
+
+      if (!hasInstructor) {
+        seen.add(normCode);
+        return true;
+      }
+      return false;
+    });
+  }, [subjects, instructors, form.course_id, form.year, form.semester]);
+
   // Format time from start_min and end_min to show start-to-end range
   const formatTimeRange = (slot) => {
     // Priority 1: Use start_min and end_min if available
@@ -1158,6 +1196,22 @@ export default function RegistrarSchedule() {
 
     const instructorId = slot.instructor_id || slot.instructorId;
     const instructorLabel = getInstructorName(instructorId);
+
+    // Check if the assigned instructor is specialized for this subject
+    let isSpecialized = true;
+    if (instructorId && subjectCode) {
+      const assignedInst = instructors.find(i => i.id === instructorId);
+      if (assignedInst) {
+        const assignable = (assignedInst.assignable_courses || assignedInst.assignableCourses || '').toUpperCase();
+        if (assignable.trim().length > 0) {
+          // Strip everything except letters and numbers for a bulletproof match
+          const normalizeString = (str) => str.toUpperCase().replace(/[^A-Z0-9]/g, '');
+          const cleanSubjectCode = normalizeString(subjectCode);
+
+          isSpecialized = assignable.split(',').some(c => normalizeString(c) === cleanSubjectCode);
+        }
+      }
+    }
 
     // Diagnostics check for unscheduled items
     const isUnscheduled = !dayId && !slot.time && !roomId;
@@ -1276,7 +1330,25 @@ export default function RegistrarSchedule() {
             )}
           </div>
         </td>
-        <td className="px-4 py-2 text-sm text-gray-700">{instructorLabel}</td>
+        <td className="px-4 py-2 text-sm text-gray-700">
+          {instructorId ? (
+            <div className="flex flex-col items-start gap-1">
+              <span>{instructorLabel}</span>
+              {!isSpecialized && (
+                <span
+                  className="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700 border border-amber-200 uppercase tracking-wide cursor-help"
+                  title="Instructor does not have this subject in their specialization"
+                >
+                  Not Specialized
+                </span>
+              )}
+            </div>
+          ) : (
+            <span className="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-700 border border-red-200">
+              No Instructor
+            </span>
+          )}
+        </td>
       </tr>
     );
   };
@@ -1354,15 +1426,34 @@ export default function RegistrarSchedule() {
           </select>
         </label>
 
-        <div className="sm:col-span-2 flex justify-end">
-          <button
-            type="submit"
-            disabled={isSubmitting}
-            className={`px-4 py-2 text-white rounded ${isSubmitting ? "bg-gray-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
-              }`}
-          >
-            {isSubmitting ? "Scheduling..." : "Generate Schedule"}
-          </button>
+        <div className="sm:col-span-2">
+          {subjectsWithoutInstructor.length > 0 && (
+            <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm">
+              <div className="flex items-center gap-2 text-amber-800 font-semibold mb-1">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                </svg>
+                {subjectsWithoutInstructor.length} subject{subjectsWithoutInstructor.length > 1 ? 's' : ''} without eligible active instructor
+              </div>
+              <div className="text-amber-700 flex flex-wrap gap-1">
+                {subjectsWithoutInstructor.map(s => (
+                  <span key={s.id} className="inline-block px-2 py-0.5 bg-amber-100 border border-amber-300 rounded text-xs font-mono">
+                    {s.code}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="flex justify-end">
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className={`px-4 py-2 text-white rounded ${isSubmitting ? "bg-gray-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
+                }`}
+            >
+              {isSubmitting ? "Scheduling..." : "Generate Schedule"}
+            </button>
+          </div>
         </div>
       </form>
 

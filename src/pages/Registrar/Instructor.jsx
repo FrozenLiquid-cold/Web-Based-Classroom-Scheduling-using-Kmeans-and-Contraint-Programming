@@ -208,6 +208,7 @@ export default function Instructor() {
 								<th className="text-left px-3 py-2 border-r border-gray-300">Instructor</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">College</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">Specialization</th>
+								<th className="text-center px-3 py-2 border-r border-gray-300">Status</th>
 								<th className="text-center px-3 py-2 w-36">Action</th>
 							</tr>
 						</thead>
@@ -224,6 +225,21 @@ export default function Instructor() {
 										<td className="px-3 py-2 border-r border-gray-300">{fullName || 'N/A'}</td>
 										<td className="px-3 py-2 border-r border-gray-300">{collegeName(it.college_id || it.collegeId) || '-'}</td>
 										<td className="px-3 py-2 border-r border-gray-300">{specializationText || '-'}</td>
+										<td className="px-3 py-2 border-r border-gray-300 text-center">
+											<button
+												className={`inline-block px-2 py-0.5 rounded-full text-xs font-semibold cursor-pointer hover:opacity-80 ${it.is_active !== false ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+													}`}
+												title={it.is_active !== false ? 'Click to deactivate' : 'Click to activate'}
+												onClick={async () => {
+													try {
+														await upsert('instructor', { id: it.id, is_active: it.is_active === false })
+														await load(true)
+													} catch (err) { alert(err.message || 'Failed to toggle status') }
+												}}
+											>
+												{it.is_active !== false ? 'Active' : 'Inactive'}
+											</button>
+										</td>
 										<td className="px-3 py-2 space-x-3 text-center">
 											<button className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-600 hover:opacity-90" title="Edit" onClick={() => openEdit(it)}>
 												<img src="/assets/edit.png" alt="Edit" className="w-4 h-4 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
@@ -236,7 +252,7 @@ export default function Instructor() {
 								)
 							})}
 							{filtered.length === 0 && (
-								<tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={5}>No records</td></tr>
+								<tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={6}>No records</td></tr>
 							)}
 						</tbody>
 					</table>

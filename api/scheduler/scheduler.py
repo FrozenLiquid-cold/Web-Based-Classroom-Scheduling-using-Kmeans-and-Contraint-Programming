@@ -598,9 +598,10 @@ def run_scheduler(
             return [], {}
         
         instructors = db.query(models.Instructor).filter(
+            models.Instructor.is_active == True,
             (models.Instructor.college_id == college_id) | (models.Instructor.college_id.is_(None))
         ).all()
-        rooms = db.query(models.Room).all()
+        rooms = db.query(models.Room).filter(models.Room.is_available == True).all()
         days = db.query(models.Day).all()
         
         if not instructors or not rooms or not days:
@@ -870,7 +871,7 @@ def get_suggestions(
     # 1. Load Data (Instructors, Rooms, Days)
     # We load broad set then filter? Or just load what we need.
     # We need all rooms and days.
-    rooms = db.query(models.Room).all()
+    rooms = db.query(models.Room).filter(models.Room.is_available == True).all()
     days = db.query(models.Day).all()
     
     # 2. Build Maps
@@ -1015,8 +1016,8 @@ def check_resource_availability(
     from api import db_procedures
     
     # 1. Fetch all resources
-    all_rooms = db.query(models.Room).all()
-    all_instructors = db.query(models.Instructor).all()
+    all_rooms = db.query(models.Room).filter(models.Room.is_available == True).all()
+    all_instructors = db.query(models.Instructor).filter(models.Instructor.is_active == True).all()
     
     # 2. Identify the requested day label
     day_obj = db.query(models.Day).filter(models.Day.id == day_id).first()

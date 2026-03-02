@@ -110,6 +110,7 @@ class InstructorCreate(BaseModel):
     employment_type: Optional[str] = None
     designation: Optional[str] = None
     password: Optional[str] = None
+    is_active: Optional[bool] = True
 
 
 class InstructorUpdate(BaseModel):
@@ -121,6 +122,7 @@ class InstructorUpdate(BaseModel):
     assignable_courses: Optional[str] = None
     employment_type: Optional[str] = None
     designation: Optional[str] = None
+    is_active: Optional[bool] = None
 
 
 class InstructorResponse(BaseModel):
@@ -136,6 +138,7 @@ class InstructorResponse(BaseModel):
     preferred_start_time: Optional[str] = None
     preferred_end_time: Optional[str] = None
     max_units: Optional[int] = None
+    is_active: Optional[bool] = True
 
     class Config:
         from_attributes = True
@@ -201,6 +204,7 @@ class RoomCreate(BaseModel):
     type: str  # 'LEC' or 'LAB'
     description: Optional[str] = None
     building_id: Optional[int] = None
+    is_available: Optional[bool] = True
 
 
 class RoomUpdate(BaseModel):
@@ -208,6 +212,7 @@ class RoomUpdate(BaseModel):
     type: Optional[str] = None
     description: Optional[str] = None
     building_id: Optional[int] = None
+    is_available: Optional[bool] = None
 
 
 class RoomResponse(BaseModel):
@@ -216,6 +221,7 @@ class RoomResponse(BaseModel):
     type: str
     description: Optional[str] = None
     building_id: Optional[int] = None
+    is_available: Optional[bool] = True
 
     class Config:
         from_attributes = True

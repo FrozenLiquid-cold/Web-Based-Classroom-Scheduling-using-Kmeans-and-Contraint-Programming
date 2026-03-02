@@ -436,12 +436,15 @@ def load_schedule_route():
                 instructor_id=instructor_id
             )
             
-            # Deduplicate by subject_id (keep first occurrence)
-            seen_subjects = set()
+            # Deduplicate by (subject_id, day_id, block) to preserve multi-day rows
+            # e.g., TTh subjects have two rows (T + TH) with the same subject_id
+            # but different day_ids — both must be kept for "T-TH" display
+            seen_keys = set()
             unique_schedules = []
             for sched in schedules_list:
-                if sched.subject_id not in seen_subjects:
-                    seen_subjects.add(sched.subject_id)
+                dedup_key = (sched.subject_id, sched.day_id, getattr(sched, 'block', None))
+                if dedup_key not in seen_keys:
+                    seen_keys.add(dedup_key)
                     unique_schedules.append(sched)
             
             items = [
