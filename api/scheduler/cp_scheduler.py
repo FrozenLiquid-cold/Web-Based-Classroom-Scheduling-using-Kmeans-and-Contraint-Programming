@@ -7486,22 +7486,22 @@ def run_cp_scheduler(
             logger.info(f"[FINAL RETURN DEBUG] Subject {sid} Time: {item.get('time')}")
     # ------------------------------------------------------------------
     # FINAL POST-PROCESSING: Remove items that conflict on instructor-time
-    # across blocks. This MUST run last, after recommendations/auto-apply.
-    # Priority: main-scheduled > recommended/retry items.
+    # or room-time across blocks. This MUST run last, after all scheduling.
+    # Priority: main-scheduled > recommended/retry/soft items.
     # ------------------------------------------------------------------
     def _has_time_overlap(s1, e1, s2, e2):
         return not (e1 <= s2 or e2 <= s1)
 
-    logger.info("[POST-PROCESS] Scanning %d items for cross-block instructor conflicts", len(all_scheduled_items))
+    logger.info("[POST-PROCESS] Scanning %d items for cross-block conflicts (instructor + room)", len(all_scheduled_items))
 
-    # Build instructor-time occupation from all items
-    instr_time_map = defaultdict(list)
+    # Build per-item metadata once
+    item_meta = []
     for idx, item in enumerate(all_scheduled_items):
         instr_id = item.get("instructor_id")
+        room_id = item.get("room_id")
         day_id = item.get("day_id")
         s_min = item.get("start_min")
         e_min = item.get("end_min")
-        # An item is "removable" if it came from retry, recommendation, or soft constraint
         is_removable = bool(
             item.get("is_retry", False) or
             item.get("is_recommended", False) or
@@ -7509,39 +7509,67 @@ def run_cp_scheduler(
         )
         block = item.get("block", "?")
         subject_id = item.get("subject_id")
-        if instr_id is not None and day_id is not None and s_min is not None and e_min is not None:
+        item_meta.append({
+            "idx": idx, "instr_id": instr_id, "room_id": room_id,
+            "day_id": day_id, "s_min": s_min, "e_min": e_min,
+            "removable": is_removable, "block": block, "subject_id": subject_id,
+        })
+
+    # Build conflict maps: (resource_type, resource_id, day_id) -> list of entries
+    conflict_map = defaultdict(list)  # key -> [(start, end, idx, removable, block, subject_id)]
+    for m in item_meta:
+        if m["day_id"] is None or m["s_min"] is None or m["e_min"] is None:
+            continue
+        try:
+            day_int = int(m["day_id"])
+            s_int = int(m["s_min"])
+            e_int = int(m["e_min"])
+        except (TypeError, ValueError):
+            continue
+        entry = (s_int, e_int, m["idx"], m["removable"], m["block"], m["subject_id"])
+        # Instructor key
+        if m["instr_id"] is not None:
             try:
-                instr_time_map[(int(instr_id), int(day_id))].append(
-                    (int(s_min), int(e_min), idx, is_removable, block, subject_id)
-                )
+                conflict_map[("instr", int(m["instr_id"]), day_int)].append(entry)
+            except (TypeError, ValueError):
+                pass
+        # Room key
+        if m["room_id"] is not None:
+            try:
+                conflict_map[("room", int(m["room_id"]), day_int)].append(entry)
             except (TypeError, ValueError):
                 pass
 
-    # Log instructors with multiple entries
-    for (iid, did), entries in instr_time_map.items():
+    # Log resources with multiple entries
+    for key, entries in conflict_map.items():
         if len(entries) > 1:
+            rtype, rid, did = key
             logger.info(
-                "[POST-PROCESS] Instructor %d Day %d has %d entries: %s",
-                iid, did, len(entries),
+                "[POST-PROCESS] %s %d Day %d has %d entries: %s",
+                rtype.upper(), rid, did, len(entries),
                 [(s, e, f"block={b}", f"removable={r}", f"subj={sid}") for s, e, _, r, b, sid in entries]
             )
 
     indices_to_remove = set()
-    for (instr_id, day_id), entries in instr_time_map.items():
+    for key, entries in conflict_map.items():
+        rtype, rid, did = key
         for i in range(len(entries)):
             for j in range(i + 1, len(entries)):
                 s1, e1, idx1, removable1, block1, sid1 = entries[i]
                 s2, e2, idx2, removable2, block2, sid2 = entries[j]
                 if _has_time_overlap(s1, e1, s2, e2):
+                    # Skip if both are from the same block (intra-block handled elsewhere)
+                    if block1 == block2:
+                        continue
                     logger.warning(
-                        "[POST-PROCESS] Conflict: instr=%d day=%d | "
+                        "[POST-PROCESS] %s conflict: %s=%d day=%d | "
                         "item1(idx=%d subj=%s block=%s %d-%d removable=%s) vs "
                         "item2(idx=%d subj=%s block=%s %d-%d removable=%s)",
-                        instr_id, day_id,
+                        rtype.upper(), rtype, rid, did,
                         idx1, sid1, block1, s1, e1, removable1,
                         idx2, sid2, block2, s2, e2, removable2,
                     )
-                    # Remove the removable item; if both same, remove later
+                    # Remove the removable item; if both same type, remove later
                     if removable2 and not removable1:
                         indices_to_remove.add(idx2)
                     elif removable1 and not removable2:
@@ -7555,12 +7583,13 @@ def run_cp_scheduler(
             item = all_scheduled_items[idx]
             removed_details.append(
                 f"subject_id={item.get('subject_id')} instr={item.get('instructor_id')} "
-                f"day={item.get('day_id')} time={item.get('start_min')}-{item.get('end_min')} "
+                f"room={item.get('room_id')} day={item.get('day_id')} "
+                f"time={item.get('start_min')}-{item.get('end_min')} "
                 f"block={item.get('block')} retry={item.get('is_retry', False)} "
                 f"recommended={item.get('is_recommended', False)}"
             )
         logger.warning(
-            "[POST-PROCESS] Removing %d items with cross-block instructor conflicts:\n  %s",
+            "[POST-PROCESS] Removing %d items with cross-block conflicts:\n  %s",
             len(indices_to_remove), "\n  ".join(removed_details)
         )
         all_scheduled_items = [
@@ -7568,7 +7597,7 @@ def run_cp_scheduler(
             if idx not in indices_to_remove
         ]
     else:
-        logger.info("[POST-PROCESS] No cross-block instructor conflicts found")
+        logger.info("[POST-PROCESS] No cross-block conflicts found")
 
     return all_scheduled_items, structured_diagnostics
 
