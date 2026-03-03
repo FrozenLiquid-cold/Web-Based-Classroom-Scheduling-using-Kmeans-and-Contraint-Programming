@@ -6722,90 +6722,7 @@ def run_cp_scheduler(
     all_scheduled_items = kept_rows
     _trace_all_scheduled_items("After Post-Conflict Retry")
 
-    # ------------------------------------------------------------------
-    # POST-PROCESSING: Remove items that conflict on instructor-time
-    # across blocks. Safety net against cross-block double-booking.
-    # If one item is retry and one is main, remove the retry item.
-    # If both are the same type, remove the one from the later block.
-    # ------------------------------------------------------------------
-    def _has_time_overlap(s1, e1, s2, e2):
-        return not (e1 <= s2 or e2 <= s1)
 
-    logger.info("[POST-PROCESS] Scanning %d items for cross-block instructor conflicts", len(all_scheduled_items))
-
-    # Build instructor-time occupation from all items
-    instr_time_map = defaultdict(list)  # (instr_id, day_id) -> [(start, end, index, is_retry, block, subject_id)]
-    for idx, item in enumerate(all_scheduled_items):
-        instr_id = item.get("instructor_id")
-        day_id = item.get("day_id")
-        start_min = item.get("start_min")
-        end_min = item.get("end_min")
-        is_retry = bool(item.get("is_retry", False))
-        block = item.get("block", "?")
-        subject_id = item.get("subject_id")
-        if instr_id is not None and day_id is not None and start_min is not None and end_min is not None:
-            try:
-                instr_time_map[(int(instr_id), int(day_id))].append(
-                    (int(start_min), int(end_min), idx, is_retry, block, subject_id)
-                )
-            except (TypeError, ValueError):
-                pass
-
-    # Log entries for the single-instructor subjects (like SE 2 / Jasmine)
-    for (iid, did), entries in instr_time_map.items():
-        if len(entries) > 1:
-            logger.info(
-                "[POST-PROCESS] Instructor %d Day %d has %d entries: %s",
-                iid, did,
-                len(entries),
-                [(s, e, f"block={b}", f"retry={r}", f"subj={sid}") for s, e, _, r, b, sid in entries]
-            )
-
-    indices_to_remove = set()
-    for (instr_id, day_id), entries in instr_time_map.items():
-        for i in range(len(entries)):
-            for j in range(i + 1, len(entries)):
-                s1, e1, idx1, retry1, block1, sid1 = entries[i]
-                s2, e2, idx2, retry2, block2, sid2 = entries[j]
-                if _has_time_overlap(s1, e1, s2, e2):
-                    logger.warning(
-                        "[POST-PROCESS] Conflict: instr=%d day=%d | "
-                        "item1(idx=%d subj=%s block=%s %d-%d retry=%s) vs "
-                        "item2(idx=%d subj=%s block=%s %d-%d retry=%s)",
-                        instr_id, day_id,
-                        idx1, sid1, block1, s1, e1, retry1,
-                        idx2, sid2, block2, s2, e2, retry2,
-                    )
-                    # Decide which to remove:
-                    # 1. Prefer removing retry over main
-                    # 2. If same type, remove the later one (by index)
-                    if retry2 and not retry1:
-                        indices_to_remove.add(idx2)
-                    elif retry1 and not retry2:
-                        indices_to_remove.add(idx1)
-                    else:
-                        # Both same type — remove the later one
-                        indices_to_remove.add(idx2)
-
-    if indices_to_remove:
-        removed_details = []
-        for idx in sorted(indices_to_remove):
-            item = all_scheduled_items[idx]
-            removed_details.append(
-                f"subject_id={item.get('subject_id')} instr={item.get('instructor_id')} "
-                f"day={item.get('day_id')} time={item.get('start_min')}-{item.get('end_min')} "
-                f"block={item.get('block')} retry={item.get('is_retry', False)}"
-            )
-        logger.warning(
-            "[POST-PROCESS] Removing %d items with cross-block instructor conflicts:\n  %s",
-            len(indices_to_remove), "\n  ".join(removed_details)
-        )
-        all_scheduled_items = [
-            item for idx, item in enumerate(all_scheduled_items)
-            if idx not in indices_to_remove
-        ]
-    else:
-        logger.info("[POST-PROCESS] No cross-block instructor conflicts found")
 
     # CRITICAL: Log sample items to verify solver results are being returned correctly
     if all_scheduled_items:
@@ -7567,6 +7484,91 @@ def run_cp_scheduler(
         sid = item.get("subject_id")
         if sid in [96, 196, 296, 99, 199, 299]:
             logger.info(f"[FINAL RETURN DEBUG] Subject {sid} Time: {item.get('time')}")
+    # ------------------------------------------------------------------
+    # FINAL POST-PROCESSING: Remove items that conflict on instructor-time
+    # across blocks. This MUST run last, after recommendations/auto-apply.
+    # Priority: main-scheduled > recommended/retry items.
+    # ------------------------------------------------------------------
+    def _has_time_overlap(s1, e1, s2, e2):
+        return not (e1 <= s2 or e2 <= s1)
+
+    logger.info("[POST-PROCESS] Scanning %d items for cross-block instructor conflicts", len(all_scheduled_items))
+
+    # Build instructor-time occupation from all items
+    instr_time_map = defaultdict(list)
+    for idx, item in enumerate(all_scheduled_items):
+        instr_id = item.get("instructor_id")
+        day_id = item.get("day_id")
+        s_min = item.get("start_min")
+        e_min = item.get("end_min")
+        # An item is "removable" if it came from retry, recommendation, or soft constraint
+        is_removable = bool(
+            item.get("is_retry", False) or
+            item.get("is_recommended", False) or
+            item.get("is_soft_constraint", False)
+        )
+        block = item.get("block", "?")
+        subject_id = item.get("subject_id")
+        if instr_id is not None and day_id is not None and s_min is not None and e_min is not None:
+            try:
+                instr_time_map[(int(instr_id), int(day_id))].append(
+                    (int(s_min), int(e_min), idx, is_removable, block, subject_id)
+                )
+            except (TypeError, ValueError):
+                pass
+
+    # Log instructors with multiple entries
+    for (iid, did), entries in instr_time_map.items():
+        if len(entries) > 1:
+            logger.info(
+                "[POST-PROCESS] Instructor %d Day %d has %d entries: %s",
+                iid, did, len(entries),
+                [(s, e, f"block={b}", f"removable={r}", f"subj={sid}") for s, e, _, r, b, sid in entries]
+            )
+
+    indices_to_remove = set()
+    for (instr_id, day_id), entries in instr_time_map.items():
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                s1, e1, idx1, removable1, block1, sid1 = entries[i]
+                s2, e2, idx2, removable2, block2, sid2 = entries[j]
+                if _has_time_overlap(s1, e1, s2, e2):
+                    logger.warning(
+                        "[POST-PROCESS] Conflict: instr=%d day=%d | "
+                        "item1(idx=%d subj=%s block=%s %d-%d removable=%s) vs "
+                        "item2(idx=%d subj=%s block=%s %d-%d removable=%s)",
+                        instr_id, day_id,
+                        idx1, sid1, block1, s1, e1, removable1,
+                        idx2, sid2, block2, s2, e2, removable2,
+                    )
+                    # Remove the removable item; if both same, remove later
+                    if removable2 and not removable1:
+                        indices_to_remove.add(idx2)
+                    elif removable1 and not removable2:
+                        indices_to_remove.add(idx1)
+                    else:
+                        indices_to_remove.add(idx2)
+
+    if indices_to_remove:
+        removed_details = []
+        for idx in sorted(indices_to_remove):
+            item = all_scheduled_items[idx]
+            removed_details.append(
+                f"subject_id={item.get('subject_id')} instr={item.get('instructor_id')} "
+                f"day={item.get('day_id')} time={item.get('start_min')}-{item.get('end_min')} "
+                f"block={item.get('block')} retry={item.get('is_retry', False)} "
+                f"recommended={item.get('is_recommended', False)}"
+            )
+        logger.warning(
+            "[POST-PROCESS] Removing %d items with cross-block instructor conflicts:\n  %s",
+            len(indices_to_remove), "\n  ".join(removed_details)
+        )
+        all_scheduled_items = [
+            item for idx, item in enumerate(all_scheduled_items)
+            if idx not in indices_to_remove
+        ]
+    else:
+        logger.info("[POST-PROCESS] No cross-block instructor conflicts found")
 
     return all_scheduled_items, structured_diagnostics
 
