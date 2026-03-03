@@ -1096,26 +1096,29 @@ def check_resource_availability(
     # 6. Apply strictly filtering if subject_id is provided
     if subject_id:
         try:
-             # Filter Rooms: FIELD room logic
+             # Filter Rooms: Shared building logic
              subject = db.query(models.Subject).get(subject_id)
              if subject:
-                 is_nstp = subject.code.upper().startswith("NSTP")
-                 field_room = next((r for r in all_rooms if r.name == "FIELD"), None)
+                 is_nstp = getattr(subject, 'is_block_shared', False) or subject.code.upper().startswith("NSTP")
+                 # Find rooms in shared buildings
+                 shared_room_ids = set()
+                 for r in all_rooms:
+                     if r.building_id:
+                         bldg = db.query(models.Building).get(r.building_id)
+                         if bldg and bldg.is_shared:
+                             shared_room_ids.add(r.id)
                  
-                 if field_room:
+                 if shared_room_ids:
                      if is_nstp:
-                         # NSTP MUST use FIELD. Filter out everything else.
-                         # If FIELD is available, it should be the only option.
-                         # If FIELD is busy, list should be empty.
-                         if field_room.id in avail_rooms:
-                             avail_rooms = [field_room.id]
+                         # NSTP MUST use shared building rooms. Filter out everything else.
+                         avail_shared = [rid for rid in avail_rooms if rid in shared_room_ids]
+                         if avail_shared:
+                             avail_rooms = avail_shared
                          else:
                              avail_rooms = []
                      else:
-                         # Non-NSTP cannot use FIELD
-                         # avail_rooms is a list of IDs
-                         if field_room.id in avail_rooms:
-                             avail_rooms.remove(field_room.id)
+                         # Non-NSTP cannot use shared building rooms
+                         avail_rooms = [rid for rid in avail_rooms if rid not in shared_room_ids]
 
              # Filter Instructors: Only show instructors who are BOTH available (time) AND eligible (specialization)
              eligible_instrs = db_procedures.get_instructor_eligibility(db, subject_id)
@@ -1127,7 +1130,7 @@ def check_resource_availability(
              if subject and eligible_instrs:
                  strict_matches = []
                  subject_code = subject.code.strip().upper()
-                 is_nstp = subject_code.startswith("NSTP")
+                 is_nstp = getattr(subject, 'is_block_shared', False) or subject_code.startswith("NSTP")
                  
                  for i in eligible_instrs:
                      if i.assignable_courses:

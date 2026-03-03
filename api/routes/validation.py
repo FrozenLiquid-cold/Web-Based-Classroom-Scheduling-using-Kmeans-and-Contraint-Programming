@@ -56,12 +56,14 @@ def validate_schedule_item():
         if start_time >= end_time:
             return jsonify({"valid": False, "messages": ["End time must be after start time"]}), 400
 
-        # Determine special room characteristics (FIELD allows overlap)
+        # Determine special room characteristics (shared buildings allow overlap)
         is_field_room = False
         if req.room_id:
             room_obj = db.query(models.Room).get(req.room_id)
-            if room_obj and "FIELD" in room_obj.name.upper():
-                is_field_room = True
+            if room_obj and room_obj.building_id:
+                building_obj = db.query(models.Building).get(room_obj.building_id)
+                if building_obj and building_obj.is_shared:
+                    is_field_room = True
 
         # Collect all conflicts
         

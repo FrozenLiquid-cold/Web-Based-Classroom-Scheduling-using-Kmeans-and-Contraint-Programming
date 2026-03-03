@@ -98,6 +98,7 @@ class Subject(Base):
     max_slots = Column(Integer, nullable=True)  # Maximum slots allowed
     year_level = Column(Integer, nullable=True)  # Year level (1-4) for clustering
     semester = Column(Integer, nullable=True)  # Semester (1-2) for clustering
+    is_block_shared = Column(Boolean, default=False, nullable=False, server_default="false")  # All blocks share same room/time, different instructors
     
     __table_args__ = (
         CheckConstraint("type IN ('LEC', 'LAB')", name="check_subject_type"),
@@ -134,6 +135,7 @@ class Building(Base):
     name = Column(String(100), nullable=False, unique=True)
     code = Column(String(20), nullable=True)
     description = Column(Text, nullable=True)
+    is_shared = Column(Boolean, default=False, nullable=False, server_default="false")
 
     rooms = relationship("Room", back_populates="building")
     # For distances logic

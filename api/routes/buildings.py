@@ -31,7 +31,7 @@ def create_building():
         if db.query(models.Building).filter(models.Building.name == data.name).first():
             return jsonify({"detail": "Building name already exists"}), 400
             
-        new_b = models.Building(name=data.name, code=data.code, description=data.description)
+        new_b = models.Building(name=data.name, code=data.code, description=data.description, is_shared=data.is_shared or False)
         db.add(new_b)
         db.commit()
         db.refresh(new_b)
@@ -62,6 +62,8 @@ def update_building(id):
             b.code = data.code
         if data.description is not None:
             b.description = data.description
+        if data.is_shared is not None:
+            b.is_shared = data.is_shared
             
         db.commit()
         db.refresh(b)

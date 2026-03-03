@@ -167,6 +167,7 @@ class SubjectCreate(BaseModel):
     semester: int
     is_major: Optional[bool] = None
     course_id: Optional[int] = None
+    is_block_shared: Optional[bool] = False
     # Note: block_id is no longer a subject property - it's selected during CP scheduling from time_blocks table
 
 
@@ -179,6 +180,7 @@ class SubjectUpdate(BaseModel):
     semester: Optional[int] = None
     is_major: Optional[bool] = None
     course_id: Optional[int] = None
+    is_block_shared: Optional[bool] = None
     # Note: block_id is no longer a subject property
 
 
@@ -192,6 +194,7 @@ class SubjectResponse(BaseModel):
     semester: Optional[int] = None
     is_major: Optional[bool] = None
     course_id: Optional[int] = None
+    is_block_shared: Optional[bool] = False
     # Note: block_id is no longer a subject property - it's selected during CP scheduling
 
     class Config:
@@ -232,12 +235,14 @@ class BuildingCreate(BaseModel):
     name: str
     code: Optional[str] = None
     description: Optional[str] = None
+    is_shared: Optional[bool] = False
 
 
 class BuildingUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
     description: Optional[str] = None
+    is_shared: Optional[bool] = None
 
 
 class BuildingResponse(BaseModel):
@@ -245,6 +250,7 @@ class BuildingResponse(BaseModel):
     name: str
     code: Optional[str] = None
     description: Optional[str] = None
+    is_shared: Optional[bool] = False
 
     class Config:
         from_attributes = True

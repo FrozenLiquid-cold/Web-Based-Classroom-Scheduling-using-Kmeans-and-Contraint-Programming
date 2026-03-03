@@ -48,7 +48,7 @@ class _SubjectBlockClone:
 
 # NSTP Special Scheduling Constants
 NSTP_DAY_LABEL = "SUN"  # NSTP subjects are automatically scheduled on Sunday
-NSTP_ROOM_NAME = "FIELD"  # NSTP subjects use FIELD room
+NSTP_ROOM_NAME = "FIELD"  # Legacy fallback name; prefer building.is_shared flag
 NSTP_START_MIN = 480  # 8:00 AM in minutes
 NSTP_END_MIN = 660  # 11:00 AM in minutes
 NSTP_TIME_LABEL = "SUN 8:00–11:00"  # Display label for NSTP time slot
@@ -79,17 +79,22 @@ def _range_conflicts(ranges_dict, key, day_id, start, end):
 
 
 def _is_nstp_subject(subject) -> bool:
-    """Check if a subject is NSTP (NSTP1, NSTP 2, NSTP 12, etc.)
+    """Check if a subject is block-shared (e.g., NSTP, PE).
     
-    NSTP subjects get special handling:
-    - Fixed day: Sunday
-    - Fixed room: FIELD
-    - Fixed time: 8:00 AM - 11:00 AM
-    - All blocks share the same NSTP session (no per-block duplication)
-    - Only instructor selection uses CP to avoid overlaps
+    Block-shared subjects get special handling:
+    - All blocks share the same room and time
+    - Only instructor selection varies per block
+    - Uses shared building rooms (FIELD, GYM, etc.)
+    
+    Checks the is_block_shared DB flag first. Falls back to NSTP name check
+    for backward compatibility with existing data.
     """
+    # Prefer DB flag if available
+    is_shared = getattr(subject, "is_block_shared", None)
+    if is_shared is True:
+        return True
+    # Legacy fallback: check NSTP prefix in code
     code = getattr(subject, "code", "") or ""
-    # Match NSTP1, NSTP 2, NSTP12, NSTP 12, etc.
     return code.upper().startswith("NSTP")
 
 
@@ -1217,13 +1222,19 @@ def build_eligibility_maps(
             if room_type == subj_type:
                 all_valid_rooms.append(room.id)
 
-        # CRITICAL: Exclude FIELD room for non-NSTP subjects from ALL lists
+        # CRITICAL: Exclude shared-building rooms for non-NSTP subjects from ALL lists
+        # Build shared room IDs set from buildings with is_shared=True
+        _shared_room_ids = set()
+        for _r in rooms:
+            if _r.building_id:
+                _bldg = db.query(models.Building).get(_r.building_id)
+                if _bldg and _bldg.is_shared:
+                    _shared_room_ids.add(_r.id)
         if not _is_nstp_subject(subject):
-            field_room_ids = {room.id for room in rooms if (room.name or "").upper() == "FIELD"}
-            if field_room_ids:
-                all_valid_rooms = [rid for rid in all_valid_rooms if rid not in field_room_ids]
+            if _shared_room_ids:
+                all_valid_rooms = [rid for rid in all_valid_rooms if rid not in _shared_room_ids]
                 # Also filter preferred just in case SP returned bad data
-                subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in field_room_ids]
+                subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in _shared_room_ids]
         
         # Capacity check logic could go here, but usually done in solver options generation
         
@@ -1232,9 +1243,8 @@ def build_eligibility_maps(
             if preferred_rooms:
                  all_valid_rooms = list(preferred_rooms)
             else:
-                 # Last resort: all rooms except FIELD
-                 field_ids = {room.id for room in rooms if (room.name or "").upper() == "FIELD"}
-                 all_valid_rooms = [r.id for r in rooms if r.id not in field_ids]
+                 # Last resort: all rooms except shared-building rooms
+                 all_valid_rooms = [r.id for r in rooms if r.id not in _shared_room_ids]
 
         subject_to_all_rooms[sid] = all_valid_rooms
 
@@ -1925,12 +1935,17 @@ def _cp_retry_mini_model(
         if not eligible_rooms:
             eligible_rooms = course_to_rooms.get(subject.id, []) or []
 
-        # CRITICAL: Exclude FIELD room for non-NSTP subjects in retry pass
-        # FIELD is reserved exclusively for NSTP subjects
+        # CRITICAL: Exclude shared-building rooms for non-NSTP subjects in retry pass
+        # Shared buildings are reserved exclusively for NSTP subjects
         if not _is_nstp_subject(subject):
-            field_room_ids = [room.id for room in rooms if (room.name or "").upper() == "FIELD"]
-            if field_room_ids:
-                eligible_rooms = [rid for rid in eligible_rooms if rid not in field_room_ids]
+            _retry_shared_ids = set()
+            for _r in rooms:
+                if _r.building_id:
+                    _bldg = db.query(models.Building).get(_r.building_id)
+                    if _bldg and _bldg.is_shared:
+                        _retry_shared_ids.add(_r.id)
+            if _retry_shared_ids:
+                eligible_rooms = [rid for rid in eligible_rooms if rid not in _retry_shared_ids]
 
         stats["eligible_instrs"] = len(eligible_instrs)
         stats["eligible_rooms"] = len(eligible_rooms)
@@ -3115,15 +3130,38 @@ def run_cp_scheduler(
             non_nstp_subjects.extend(nstp_subjects)
             nstp_subjects = []
         else:
-            # Get FIELD room
-            field_room = db.query(models.Room).filter(models.Room.name == NSTP_ROOM_NAME).first()
+            # Get shared-building room (for NSTP scheduling)
+            # Prefer a room named FIELD in shared buildings, then any shared room, then legacy fallback
+            shared_rooms = []
+            for _r in db.query(models.Room).all():
+                if _r.building_id:
+                    _bldg = db.query(models.Building).get(_r.building_id)
+                    if _bldg and _bldg.is_shared:
+                        shared_rooms.append(_r)
+            
+            # Prefer FIELD-named room, then first shared room, then legacy fallback
+            field_room = None
+            if shared_rooms:
+                field_named = [r for r in shared_rooms if (r.name or "").upper() == "FIELD"]
+                field_room = field_named[0] if field_named else shared_rooms[0]
             if not field_room:
-                logger.warning(f"FIELD room not found in rooms table. NSTP subjects will be scheduled via normal CP.")
+                # Fallback to legacy name match
+                field_room = db.query(models.Room).filter(models.Room.name == NSTP_ROOM_NAME).first()
+            
+            if not field_room:
+                logger.warning(f"No shared-building room found. NSTP subjects will be scheduled via normal CP.")
                 non_nstp_subjects.extend(nstp_subjects)
                 nstp_subjects = []
             else:
-                # Get eligible instructors for NSTP subjects
-                # We'll use CP only for instructor selection to avoid overlaps
+                # Schedule NSTP subjects: each block gets a DIFFERENT instructor
+                # All blocks share the same room, day, and time
+                
+                try:
+                    num_blocks = int(block_count) if block_count else 1
+                except (TypeError, ValueError):
+                    num_blocks = 1
+                
+                # Track instructors already assigned across ALL NSTP subjects+blocks
                 newly_booked_instructors = set()
                 
                 for nstp_subj in nstp_subjects:
@@ -3131,23 +3169,14 @@ def run_cp_scheduler(
                     nstp_id = getattr(nstp_subj, 'id', 0)
                     
                     # Get instructors that can teach this specific NSTP subject
-                    # NSTP 1 should match instructors with "NSTP1" or "NSTP 1"
-                    # NSTP 2 should match instructors with "NSTP2" or "NSTP 2"
-                    all_instructors = db.query(models.Instructor).filter(models.Instructor.is_active == True).all()
+                    all_active_instructors = db.query(models.Instructor).filter(models.Instructor.is_active == True).all()
                     debug_lines = []
-                    
-                    # Score-based selection:
-                    # Priority 1: Exact Match (e.g. NSTP 1 for code NSTP 1)
-                    # Priority 2: Generic Match (e.g. NSTP 2 or just NSTP)
                     
                     nstp_code_upper = nstp_code.upper().replace(" ", "")
                     is_nstp1 = "NSTP1" in nstp_code_upper or nstp_code_upper == "NSTP"
                     is_nstp2 = "NSTP2" in nstp_code_upper
                     
                     candidate_pool = []
-                    
-                    # Force reload to ensure session is fresh
-                    all_active_instructors = db.query(models.Instructor).filter(models.Instructor.is_active == True).all()
                     
                     msg_scan = f"[NSTP DEBUG] Scanning {len(all_active_instructors)} instructors for {nstp_code}..."
                     logger.info(msg_scan)
@@ -3158,114 +3187,79 @@ def run_cp_scheduler(
                         assignable_clean = assignable.replace(" ", "")
                         
                         score = 0
-                        # Check Exact Match
+                        # Only accept EXACT subject match (NSTP 1 ≠ NSTP 2)
                         if is_nstp1 and ("NSTP1" in assignable_clean or "NSTP 1" in assignable):
                             score = 2
                         elif is_nstp2 and ("NSTP2" in assignable_clean or "NSTP 2" in assignable):
                             score = 2
-                        # Check Generic Match
-                        elif "NSTP" in assignable:
-                            score = 1
                             
                         if score > 0:
                             candidate_pool.append((score, instr))
                     
                     # Sort candidates by score descending (best first)
                     candidate_pool.sort(key=lambda x: x[0], reverse=True)
-                    
                     eligible_instrs = [c[1] for c in candidate_pool]
                     
-                    # Find an instructor that doesn't have Saturday 8-11am conflict
                     param_len = len(eligible_instrs)
                     msg_header = f"[NSTP INFO] found {param_len} qualified candidates for {nstp_code} (Day {sat_day.id})."
                     logger.info(msg_header)
                     debug_lines.append(msg_header)
                     
-                    selected_instructor = None
-                    processed_count = 0
+                    subj_course_id = getattr(nstp_subj, 'course_id', course_id) or course_id
+                    subj_year = getattr(nstp_subj, 'year_level', year) or year or 1
                     
-                    for instr in eligible_instrs:
-                        processed_count += 1
+                    # Assign a DIFFERENT instructor for EACH block
+                    all_blocks_scheduled = True
+                    for block_idx in range(1, num_blocks + 1):
+                        block_label = _block_index_to_label(block_idx) or "A"
                         
-                        # Check newly booked (in-memory) conflicts
-                        # DEBUG: Print set content
-                        logger.debug(f"  Checking {instr.id} (type {type(instr.id)}) against booked: {newly_booked_instructors}")
+                        selected_instructor = None
+                        for instr in eligible_instrs:
+                            # Skip if already assigned to another block for this NSTP
+                            if instr.id in newly_booked_instructors:
+                                msg = f"  -> Block {block_label} Candidate {instr.id}: BUSY (assigned to another block)"
+                                logger.debug(msg)
+                                debug_lines.append(msg)
+                                continue
+                            
+                            # Available! Select this instructor
+                            selected_instructor = instr
+                            newly_booked_instructors.add(instr.id)
+                            msg = f"  -> Block {block_label} Candidate {instr.id}: AVAILABLE (Selected)."
+                            logger.info(msg)
+                            debug_lines.append(msg)
+                            break
                         
-                        if instr.id in newly_booked_instructors:
-                             msg = f"  -> Candidate {instr.id}: BUSY (Just assigned to another NSTP block)"
-                             if processed_count <= 10: 
-                                 logger.debug(msg)
-                             debug_lines.append(msg)
-                             continue
-
-                        # Check if instructor is already booked on Saturday 8-11am
-                        existing = db.query(models.Schedule).filter(
-                            models.Schedule.instructor_id == instr.id,
-                            models.Schedule.day_id == sat_day.id,
-                            models.Schedule.semester == semester,
-                        ).first()
-                        
-                        if not existing:
-                             msg = f"  -> Candidate {instr.id}: AVAILABLE (Selected)."
-                             logger.info(msg)
-                             debug_lines.append(msg)
-                             selected_instructor = instr
-                             # Mark as booked for subsequent iterations
-                             newly_booked_instructors.add(instr.id)
-                             break
-                        else:
-                             msg = f"  -> Candidate {instr.id}: BUSY (Schedule ID: {existing.id})"
-                             # Log first few failures or if list is short
-                             if processed_count <= 10: 
-                                 logger.debug(msg)
-                             debug_lines.append(msg)
-                    
-                    if not selected_instructor:
-                        msg_fail = f"[NSTP FAILURE] All {param_len} candidates were BUSY/CONFLICTED for {nstp_code}."
-                        logger.error(msg_fail)
-                        debug_lines.append(msg_fail)
-                        
-                    # Write debug log to file for easier inspection
-                    try:
-                        with open("nstp_debug.log", "a") as f:
-                            f.write("\n".join(debug_lines) + "\n\n")
-                    except Exception as e:
-                        logger.error(f"Failed to write nstp_debug.log: {e}")
-                    
-                    if selected_instructor:
-                        subj_course_id = getattr(nstp_subj, 'course_id', course_id) or course_id
-                        subj_year = getattr(nstp_subj, 'year_level', year) or year or 1
-                        
-                        # Create NSTP entries for ALL blocks (block_count)
-                        # Each block gets its own entry but same room/day/time
-                        # This works because the unique constraint now includes block
-                        try:
-                            num_blocks = int(block_count) if block_count else 1
-                        except (TypeError, ValueError):
-                            num_blocks = 1
-                        
-                        for block_idx in range(1, num_blocks + 1):
-                            block_label = _block_index_to_label(block_idx) or "A"
+                        if selected_instructor:
                             nstp_item = {
                                 "subject_id": nstp_id,
                                 "clone_subject_id": nstp_id,
                                 "course_id": subj_course_id,
                                 "instructor_id": selected_instructor.id,
                                 "room_id": field_room.id,
-                                "day_id": sat_day.id,  # sat_day is actually Sunday (variable name kept for compatibility)
+                                "day_id": sat_day.id,
                                 "time": NSTP_TIME_LABEL,
                                 "year": subj_year,
                                 "semester": semester,
-                                "block": block_label,  # Individual block label (A, B, C, etc.)
+                                "block": block_label,
                                 "start_min": NSTP_START_MIN,
                                 "end_min": NSTP_END_MIN,
                             }
                             nstp_scheduled_items.append(nstp_item)
-                            logger.info(f"  [OK] NSTP scheduled: {nstp_code} block {block_label} -> Sunday 8-11am, FIELD, Instructor {selected_instructor.id}")
-                    else:
-                        logger.warning(f"  [FAIL] NSTP {nstp_code}: No available instructor for Sunday 8-11am")
-                        # Fall back to normal scheduling
-                        non_nstp_subjects.append(nstp_subj)
+                            logger.info(f"  [OK] NSTP scheduled: {nstp_code} block {block_label} -> Sunday 8-11am, {field_room.name}, Instructor {selected_instructor.id}")
+                        else:
+                            all_blocks_scheduled = False
+                            logger.warning(f"  [FAIL] NSTP {nstp_code} block {block_label}: No available instructor for Sunday 8-11am")
+                    
+                    if not all_blocks_scheduled:
+                        logger.warning(f"  [PARTIAL] NSTP {nstp_code}: Some blocks could not be assigned instructors")
+                    
+                    # Write debug log
+                    try:
+                        with open("nstp_debug.log", "a") as f:
+                            f.write("\n".join(debug_lines) + "\n\n")
+                    except Exception as e:
+                        logger.error(f"Failed to write nstp_debug.log: {e}")
         
         logger.info(f"NSTP pre-scheduling complete: {len(nstp_scheduled_items)} scheduled, {len([s for s in nstp_subjects if s not in non_nstp_subjects])} subjects handled")
     
@@ -3971,12 +3965,17 @@ def run_cp_scheduler(
 
     day_distribution_tracker = defaultdict(set)  # day_id -> set(subject_id)
 
-    # Identify FIELD room ID for filtering logic (optimizes solver)
-    field_room_id = -1
+    # Identify shared-building room IDs for filtering logic (optimizes solver)
+    # Build set once from buildings with is_shared=True
+    _solver_shared_room_ids = set()
     for r in rooms:
-        if r.name and r.name.upper() == "FIELD":
-            field_room_id = r.id
-            break
+        if r.building_id:
+            _bldg = db.query(models.Building).get(r.building_id)
+            if _bldg and _bldg.is_shared:
+                _solver_shared_room_ids.add(r.id)
+    field_room_id = -1
+    if _solver_shared_room_ids:
+        field_room_id = next(iter(_solver_shared_room_ids))  # Use first shared room for backward compat
 
     # =========================================================================
     # ADAPTIVE SOLVER: Calculate resource utilization pressure
@@ -4184,10 +4183,9 @@ def run_cp_scheduler(
             if not isinstance(eligible_instrs, list):
                 eligible_instrs = list(eligible_instrs) if eligible_instrs else []
             
-            # Filter out FIELD room for non-NSTP subjects
-            if field_room_id != -1 and not _is_nstp_subject(subject):
-                if field_room_id in eligible_rooms:
-                    eligible_rooms = [rid for rid in eligible_rooms if rid != field_room_id]
+            # Filter out shared-building rooms for non-NSTP subjects
+            if _solver_shared_room_ids and not _is_nstp_subject(subject):
+                eligible_rooms = [rid for rid in eligible_rooms if rid not in _solver_shared_room_ids]
             
             # DEBUG: Log actual lists to verify subject_id lookup is working
             logger.debug(
@@ -7533,10 +7531,21 @@ def run_cp_scheduler(
                 conflict_map[("instr", int(m["instr_id"]), day_int)].append(entry)
             except (TypeError, ValueError):
                 pass
-        # Room key
+        # Room key — EXEMPT shared building rooms (FIELD, GYM, etc.) from cross-block conflict checks
+        # These rooms are designed to hold multiple classes simultaneously
         if m["room_id"] is not None:
             try:
-                conflict_map[("room", int(m["room_id"]), day_int)].append(entry)
+                room_id_int = int(m["room_id"])
+                room_name = room_id_to_name.get(room_id_int, "").upper()
+                # Skip shared building rooms — they allow overlaps by design
+                is_shared_room = (room_name == NSTP_ROOM_NAME or "FIELD" in room_name 
+                                  or "COURT" in room_name or "GYM" in room_name)
+                if not is_shared_room:
+                    # Also check building.is_shared flag
+                    if room_id_int in _solver_shared_room_ids if '_solver_shared_room_ids' in dir() else False:
+                        is_shared_room = True
+                if not is_shared_room:
+                    conflict_map[("room", room_id_int, day_int)].append(entry)
             except (TypeError, ValueError):
                 pass
 

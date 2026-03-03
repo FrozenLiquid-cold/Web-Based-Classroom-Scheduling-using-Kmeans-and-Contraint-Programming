@@ -31,6 +31,7 @@ export default function RegistrarSchedule() {
   const [days, setDays] = useState([]);
   const [subjects, setSubjects] = useState([]);
   const [rooms, setRooms] = useState([]);
+  const [buildings, setBuildings] = useState([]);
   const [form, setForm] = useState({
     course_id: "",
     year: "",
@@ -80,11 +81,18 @@ export default function RegistrarSchedule() {
           list("subject"),
           list("room"),
         ]);
+        // Load buildings for shared flag lookup
+        let buildingList = [];
+        try {
+          const bRes = await fetch('http://localhost:8000/api/buildings');
+          if (bRes.ok) buildingList = await bRes.json();
+        } catch (e) { console.error('Failed to load buildings', e); }
         setCourses(courseList || []);
         setInstructors(instructorList || []);
         setDays(dayList || []);
         setSubjects(subjectList || []);
         setRooms(roomList || []);
+        setBuildings(buildingList);
       } catch (err) {
         console.error("Failed to load data", err);
       }
@@ -1838,10 +1846,12 @@ export default function RegistrarSchedule() {
                     {rooms.map(r => {
                       const isAvail = availableResources.rooms.includes(r.id);
 
-                      // Check for NSTP special case
+                      // Check for block-shared subject (e.g., NSTP, PE)
                       const subject = getSubject(editingItem.subject_id);
-                      const isNSTP = subject && subject.code.toUpperCase().startsWith("NSTP");
-                      const isField = r.name.toUpperCase().includes("FIELD");
+                      const isNSTP = subject && (subject.is_block_shared || subject.code.toUpperCase().startsWith("NSTP"));
+                      // Check if room is in a shared building (replaces hardcoded FIELD name check)
+                      const roomBuilding = buildings.find(b => b.id === r.building_id);
+                      const isField = roomBuilding && roomBuilding.is_shared;
 
                       // Logic:
                       // 1. If Room is FIELD and Subject is NSTP -> FORCE ENABLE (ignore availability)

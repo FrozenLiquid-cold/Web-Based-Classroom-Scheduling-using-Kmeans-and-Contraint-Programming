@@ -9,6 +9,7 @@ export default function Buildings() {
     const [name, setName] = useState('')
     const [code, setCode] = useState('')
     const [description, setDescription] = useState('')
+    const [isShared, setIsShared] = useState(false)
     const [error, setError] = useState('')
     const [entries, setEntries] = useState(10)
     const [processing, setProcessing] = useState(false)
@@ -61,6 +62,7 @@ export default function Buildings() {
         setName('')
         setCode('')
         setDescription('')
+        setIsShared(false)
         setError('')
         setShow(true)
     }
@@ -70,6 +72,7 @@ export default function Buildings() {
         setName(it.name || '')
         setCode(it.code || '')
         setDescription(it.description || '')
+        setIsShared(it.is_shared || false)
         setError('')
         setShow(true)
     }
@@ -78,10 +81,16 @@ export default function Buildings() {
         e.preventDefault()
         if (processing) return
         if (!name.trim()) { setError('Building name is required'); return }
+        if (code.trim()) {
+            const duplicate = items.find(
+                it => it.code && it.code.toLowerCase() === code.trim().toLowerCase() && (!editing || it.id !== editing.id)
+            )
+            if (duplicate) { setError(`Building code "${code.trim()}" is already used by "${duplicate.name}"`); return }
+        }
 
         try {
             setProcessing(true)
-            const payload = { name: name.trim(), code: code.trim() || null, description: description.trim() || null }
+            const payload = { name: name.trim(), code: code.trim() || null, description: description.trim() || null, is_shared: isShared }
             let res;
             if (editing) {
                 res = await fetch(`http://localhost:8000/api/buildings/${editing.id}`, {
@@ -162,6 +171,7 @@ export default function Buildings() {
                                 <th className="text-left px-3 py-2 border-r border-gray-300">Building Name</th>
                                 <th className="text-left px-3 py-2 border-r border-gray-300 w-24">Code</th>
                                 <th className="text-left px-3 py-2 border-r border-gray-300">Description</th>
+                                <th className="text-center px-3 py-2 border-r border-gray-300 w-20">Shared</th>
                                 <th className="text-center px-3 py-2 w-36">Action</th>
                             </tr>
                         </thead>
@@ -172,6 +182,9 @@ export default function Buildings() {
                                     <td className="px-3 py-2 border-r border-gray-300 font-medium">{it.name}</td>
                                     <td className="px-3 py-2 border-r border-gray-300">{it.code}</td>
                                     <td className="px-3 py-2 border-r border-gray-300 text-gray-600 truncate max-w-xs">{it.description}</td>
+                                    <td className="px-3 py-2 border-r border-gray-300 text-center">
+                                        {it.is_shared ? <span className="inline-block px-2 py-0.5 text-xs font-semibold rounded-full bg-green-100 text-green-700">Shared</span> : <span className="text-gray-400">—</span>}
+                                    </td>
                                     <td className="px-3 py-2 space-x-3 text-center">
                                         <button className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-600 hover:opacity-90" title="Edit" onClick={() => openEdit(it)}>
                                             <img src="/assets/edit.png" alt="Edit" className="w-4 h-4 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
@@ -183,7 +196,7 @@ export default function Buildings() {
                                 </tr>
                             ))}
                             {filtered.length === 0 && (
-                                <tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={5}>No records</td></tr>
+                                <tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={6}>No records</td></tr>
                             )}
                         </tbody>
                     </table>
@@ -208,6 +221,11 @@ export default function Buildings() {
                         <div>
                             <label className="block text-xs font-semibold text-gray-600 mb-1">Description</label>
                             <textarea className="w-full px-3 py-2 rounded border" placeholder="Description / Notes" rows="3" value={description} onChange={e => setDescription(e.target.value)}></textarea>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                            <input type="checkbox" id="isShared" checked={isShared} onChange={e => setIsShared(e.target.checked)} className="w-4 h-4 accent-green-600" />
+                            <label htmlFor="isShared" className="text-sm text-gray-700">Shared building <span className="text-xs text-gray-400">(allows multiple subjects at the same time, e.g. GRANDSTAND/FIELD)</span></label>
                         </div>
 
                         {error && <div className="text-sm text-red-600">{error}</div>}
