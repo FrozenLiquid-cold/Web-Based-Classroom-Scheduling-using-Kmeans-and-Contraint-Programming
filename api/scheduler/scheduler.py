@@ -1119,7 +1119,8 @@ def check_resource_availability(
              # Filter Rooms: Shared building logic
              subject = db.query(models.Subject).get(subject_id)
              if subject:
-                 is_nstp = getattr(subject, 'is_block_shared', False) or subject.code.upper().startswith("NSTP")
+                 subject_code = subject.code.strip().upper() if subject.code else ""
+                 is_shared_subj = getattr(subject, 'is_block_shared', False) or subject_code.startswith("NSTP") or subject_code.startswith("PE")
                  # Find rooms in shared buildings
                  shared_room_ids = set()
                  for r in all_rooms:
@@ -1129,15 +1130,15 @@ def check_resource_availability(
                              shared_room_ids.add(r.id)
                  
                  if shared_room_ids:
-                     if is_nstp:
-                         # NSTP MUST use shared building rooms. Filter out everything else.
+                     if is_shared_subj:
+                         # Shared subjects MUST use shared building rooms. Filter out everything else.
                          avail_shared = [rid for rid in avail_rooms if rid in shared_room_ids]
                          if avail_shared:
                              avail_rooms = avail_shared
                          else:
                              avail_rooms = []
                      else:
-                         # Non-NSTP cannot use shared building rooms
+                         # Non-shared subjects cannot use shared building rooms
                          avail_rooms = [rid for rid in avail_rooms if rid not in shared_room_ids]
 
              # College-based room filtering: only show rooms from the subject's college
@@ -1169,7 +1170,7 @@ def check_resource_availability(
              if subject and eligible_instrs:
                  strict_matches = []
                  subject_code = subject.code.strip().upper()
-                 is_nstp = getattr(subject, 'is_block_shared', False) or subject_code.startswith("NSTP")
+                 is_shared_subj = getattr(subject, 'is_block_shared', False) or subject_code.startswith("NSTP") or subject_code.startswith("PE")
                  
                  for i in eligible_instrs:
                      if i.assignable_courses:
@@ -1177,9 +1178,9 @@ def check_resource_availability(
                          courses = [c.strip().upper() for c in i.assignable_courses.split(',')]
                          
                          match = False
-                         if is_nstp:
-                             # NSTP special case: match prefix
-                             if any(c.startswith("NSTP") for c in courses):
+                         if is_shared_subj:
+                             # NSTP/PE special case: match prefix
+                             if any(c.startswith("NSTP") or c.startswith("PE") for c in courses):
                                  match = True
                          else:
                              # Exact match for standard subjects

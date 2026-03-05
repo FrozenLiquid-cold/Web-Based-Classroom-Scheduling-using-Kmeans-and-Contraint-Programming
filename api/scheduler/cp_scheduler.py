@@ -93,9 +93,10 @@ def _is_nstp_subject(subject) -> bool:
     is_shared = getattr(subject, "is_block_shared", None)
     if is_shared is True:
         return True
-    # Legacy fallback: check NSTP prefix in code
+    # Legacy fallback: check NSTP or PE prefix in code
     code = getattr(subject, "code", "") or ""
-    return code.upper().startswith("NSTP")
+    code_upper = code.upper()
+    return code_upper.startswith("NSTP") or code_upper.startswith("PE")
 
 
 def _time_str_to_minutes(value: str) -> Optional[int]:
