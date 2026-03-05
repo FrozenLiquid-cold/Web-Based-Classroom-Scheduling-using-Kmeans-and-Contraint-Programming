@@ -78,7 +78,7 @@ def _range_conflicts(ranges_dict, key, day_id, start, end):
     return None
 
 
-def _is_nstp_subject(subject) -> bool:
+def _is_shared_subject(subject) -> bool:
     """Check if a subject is block-shared (e.g., NSTP, PE).
     
     Block-shared subjects get special handling:
@@ -97,6 +97,12 @@ def _is_nstp_subject(subject) -> bool:
     code = getattr(subject, "code", "") or ""
     code_upper = code.upper()
     return code_upper.startswith("NSTP") or code_upper.startswith("PE")
+
+
+def _is_nstp_only_subject(subject) -> bool:
+    """Check if a subject is EXACTLY an NSTP subject, to be hardcoded to Saturday."""
+    code = getattr(subject, "code", "") or ""
+    return code.upper().startswith("NSTP")
 
 
 def _time_str_to_minutes(value: str) -> Optional[int]:
