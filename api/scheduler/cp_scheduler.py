@@ -1247,8 +1247,8 @@ def build_eligibility_maps(
                 # If room_college is None (building not assigned to any college), allow it (graceful fallback)
                 all_valid_rooms.append(room.id)
 
-        # CRITICAL: Exclude shared-building rooms for non-NSTP subjects from ALL lists
-        if not _is_nstp_subject(subject):
+        # CRITICAL: Exclude shared-building rooms for non-shared subjects from ALL lists
+        if not _is_shared_subject(subject):
             if _shared_room_ids:
                 all_valid_rooms = [rid for rid in all_valid_rooms if rid not in _shared_room_ids]
                 # Also filter preferred just in case SP returned bad data
@@ -1964,9 +1964,9 @@ def _cp_retry_mini_model(
         if not eligible_rooms:
             eligible_rooms = course_to_rooms.get(subject.id, []) or []
 
-        # CRITICAL: Exclude shared-building rooms for non-NSTP subjects in retry pass
-        # Shared buildings are reserved exclusively for NSTP subjects
-        if not _is_nstp_subject(subject):
+        # CRITICAL: Exclude shared-building rooms for non-shared subjects in retry pass
+        # Shared buildings are reserved exclusively for block-shared subjects
+        if not _is_shared_subject(subject):
             _retry_shared_ids = set()
             for _r in rooms:
                 if _r.building_id:
@@ -3142,8 +3142,8 @@ def run_cp_scheduler(
     # We extract NSTP subjects and schedule them separately before the main CP solver
     # =========================================================================
     
-    nstp_subjects = [s for s in subjects if _is_nstp_subject(s)]
-    non_nstp_subjects = [s for s in subjects if not _is_nstp_subject(s)]
+    nstp_subjects = [s for s in subjects if _is_nstp_only_subject(s)]
+    non_nstp_subjects = [s for s in subjects if not _is_nstp_only_subject(s)]
     nstp_scheduled_items = []
     
     if nstp_subjects:
@@ -4287,8 +4287,8 @@ def run_cp_scheduler(
             if not isinstance(eligible_instrs, list):
                 eligible_instrs = list(eligible_instrs) if eligible_instrs else []
             
-            # Filter out shared-building rooms for non-NSTP subjects
-            if _solver_shared_room_ids and not _is_nstp_subject(subject):
+            # Filter out shared-building rooms for non-shared subjects
+            if _solver_shared_room_ids and not _is_shared_subject(subject):
                 eligible_rooms = [rid for rid in eligible_rooms if rid not in _solver_shared_room_ids]
             
             # DEBUG: Log actual lists to verify subject_id lookup is working
@@ -4453,7 +4453,7 @@ def run_cp_scheduler(
                 
                 # ENFORCE NSTP SUNDAY CONSTRAINT
                 # If pre-scheduling failed and we are here, we MUST ensure we don't schedule NSTP on non-Sunday
-                if _is_nstp_subject(subject):
+                if _is_nstp_only_subject(subject):
                     # Find Sunday ID - usually 7 but let's be safe
                     # We can iterate days list or assume 7. 
                     # Let's check against the DAY_LABEL constant if available, otherwise "SUN"
