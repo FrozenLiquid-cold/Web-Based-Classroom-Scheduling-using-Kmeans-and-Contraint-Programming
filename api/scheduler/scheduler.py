@@ -874,6 +874,26 @@ def get_suggestions(
     rooms = db.query(models.Room).filter(models.Room.is_available == True).all()
     days = db.query(models.Day).all()
     
+    # College-based room filtering: only use rooms from the subject's college
+    subject_obj = db.query(models.Subject).get(subject_id)
+    _subj_college_id = None
+    if subject_obj and subject_obj.course_id:
+        _course = db.query(models.Course).filter(models.Course.id == subject_obj.course_id).first()
+        if _course:
+            _subj_college_id = _course.college_id
+    
+    if _subj_college_id is not None:
+        _room_college_map = {}
+        for _r in rooms:
+            if _r.building_id:
+                _bldg = db.query(models.Building).get(_r.building_id)
+                if _bldg:
+                    _room_college_map[_r.id] = getattr(_bldg, 'college_id', None)
+        rooms = [
+            r for r in rooms
+            if _room_college_map.get(r.id) is None or _room_college_map.get(r.id) == _subj_college_id
+        ]
+    
     # 2. Build Maps
     room_id_to_name = {r.id: r.name for r in rooms}
     
@@ -1119,6 +1139,25 @@ def check_resource_availability(
                      else:
                          # Non-NSTP cannot use shared building rooms
                          avail_rooms = [rid for rid in avail_rooms if rid not in shared_room_ids]
+
+             # College-based room filtering: only show rooms from the subject's college
+             _subj_college_id = None
+             if subject.course_id:
+                 _course = db.query(models.Course).filter(models.Course.id == subject.course_id).first()
+                 if _course:
+                     _subj_college_id = _course.college_id
+             
+             if _subj_college_id is not None:
+                 _room_college_map = {}
+                 for _r in all_rooms:
+                     if _r.building_id:
+                         _bldg = db.query(models.Building).get(_r.building_id)
+                         if _bldg:
+                             _room_college_map[_r.id] = getattr(_bldg, 'college_id', None)
+                 avail_rooms = [
+                     rid for rid in avail_rooms
+                     if _room_college_map.get(rid) is None or _room_college_map.get(rid) == _subj_college_id
+                 ]
 
              # Filter Instructors: Only show instructors who are BOTH available (time) AND eligible (specialization)
              eligible_instrs = db_procedures.get_instructor_eligibility(db, subject_id)

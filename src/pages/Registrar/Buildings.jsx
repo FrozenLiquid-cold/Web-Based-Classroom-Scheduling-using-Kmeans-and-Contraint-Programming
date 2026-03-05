@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState, useRef } from 'react'
 
 export default function Buildings() {
     const [items, setItems] = useState([])
+    const [colleges, setColleges] = useState([])
     const [q, setQ] = useState('')
     const [show, setShow] = useState(false)
     const [editing, setEditing] = useState(null)
@@ -10,6 +11,7 @@ export default function Buildings() {
     const [code, setCode] = useState('')
     const [description, setDescription] = useState('')
     const [isShared, setIsShared] = useState(false)
+    const [collegeId, setCollegeId] = useState('')
     const [error, setError] = useState('')
     const [entries, setEntries] = useState(10)
     const [processing, setProcessing] = useState(false)
@@ -40,6 +42,17 @@ export default function Buildings() {
                 console.error("Failed to load buildings");
             }
 
+            // Load colleges for dropdown
+            try {
+                const cRes = await fetch('http://localhost:8000/api/colleges')
+                if (cRes.ok) {
+                    const cData = await cRes.json()
+                    setColleges(cData)
+                }
+            } catch (err) {
+                console.error('Error loading colleges:', err)
+            }
+
         } catch (error) {
             console.error('Error loading buildings:', error);
         } finally {
@@ -63,6 +76,7 @@ export default function Buildings() {
         setCode('')
         setDescription('')
         setIsShared(false)
+        setCollegeId('')
         setError('')
         setShow(true)
     }
@@ -73,6 +87,7 @@ export default function Buildings() {
         setCode(it.code || '')
         setDescription(it.description || '')
         setIsShared(it.is_shared || false)
+        setCollegeId(it.college_id != null ? String(it.college_id) : '')
         setError('')
         setShow(true)
     }
@@ -90,7 +105,7 @@ export default function Buildings() {
 
         try {
             setProcessing(true)
-            const payload = { name: name.trim(), code: code.trim() || null, description: description.trim() || null, is_shared: isShared }
+            const payload = { name: name.trim(), code: code.trim() || null, description: description.trim() || null, is_shared: isShared, college_id: collegeId ? Number(collegeId) : null }
             let res;
             if (editing) {
                 res = await fetch(`http://localhost:8000/api/buildings/${editing.id}`, {
@@ -170,6 +185,7 @@ export default function Buildings() {
                                 <th className="text-left px-3 py-2 border-r border-gray-300 w-12">No.</th>
                                 <th className="text-left px-3 py-2 border-r border-gray-300">Building Name</th>
                                 <th className="text-left px-3 py-2 border-r border-gray-300 w-24">Code</th>
+                                <th className="text-left px-3 py-2 border-r border-gray-300">College</th>
                                 <th className="text-left px-3 py-2 border-r border-gray-300">Description</th>
                                 <th className="text-center px-3 py-2 border-r border-gray-300 w-20">Shared</th>
                                 <th className="text-center px-3 py-2 w-36">Action</th>
@@ -181,6 +197,7 @@ export default function Buildings() {
                                     <td className="px-3 py-2 border-r border-gray-300">{idx + 1}</td>
                                     <td className="px-3 py-2 border-r border-gray-300 font-medium">{it.name}</td>
                                     <td className="px-3 py-2 border-r border-gray-300">{it.code}</td>
+                                    <td className="px-3 py-2 border-r border-gray-300">{it.college_id ? (colleges.find(c => c.id === it.college_id)?.code || `ID ${it.college_id}`) : <span className="text-gray-400">—</span>}</td>
                                     <td className="px-3 py-2 border-r border-gray-300 text-gray-600 truncate max-w-xs">{it.description}</td>
                                     <td className="px-3 py-2 border-r border-gray-300 text-center">
                                         {it.is_shared ? <span className="inline-block px-2 py-0.5 text-xs font-semibold rounded-full bg-green-100 text-green-700">Shared</span> : <span className="text-gray-400">—</span>}
@@ -196,7 +213,7 @@ export default function Buildings() {
                                 </tr>
                             ))}
                             {filtered.length === 0 && (
-                                <tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={6}>No records</td></tr>
+                                <tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={7}>No records</td></tr>
                             )}
                         </tbody>
                     </table>
@@ -226,6 +243,14 @@ export default function Buildings() {
                         <div className="flex items-center gap-2">
                             <input type="checkbox" id="isShared" checked={isShared} onChange={e => setIsShared(e.target.checked)} className="w-4 h-4 accent-green-600" />
                             <label htmlFor="isShared" className="text-sm text-gray-700">Shared building <span className="text-xs text-gray-400">(allows multiple subjects at the same time, e.g. GRANDSTAND/FIELD)</span></label>
+                        </div>
+
+                        <div>
+                            <label className="block text-xs font-semibold text-gray-600 mb-1">College (owns rooms in this building)</label>
+                            <select className="w-full px-3 py-2 rounded border" value={collegeId} onChange={e => setCollegeId(e.target.value)}>
+                                <option value="">— None (available to all) —</option>
+                                {colleges.map(c => <option key={c.id} value={c.id}>{c.code} — {c.description}</option>)}
+                            </select>
                         </div>
 
                         {error && <div className="text-sm text-red-600">{error}</div>}

@@ -136,11 +136,23 @@ class Building(Base):
     code = Column(String(20), nullable=True)
     description = Column(Text, nullable=True)
     is_shared = Column(Boolean, default=False, nullable=False, server_default="false")
+    college_id = Column(Integer, ForeignKey("colleges.id"), nullable=True)
 
+    college = relationship("College")
     rooms = relationship("Room", back_populates="building")
     # For distances logic
-    distances_from = relationship("BuildingDistance", foreign_keys="[BuildingDistance.from_building_id]", back_populates="from_building")
-    distances_to = relationship("BuildingDistance", foreign_keys="[BuildingDistance.to_building_id]", back_populates="to_building")
+    distances_from = relationship(
+        "BuildingDistance", 
+        foreign_keys="[BuildingDistance.from_building_id]", 
+        back_populates="from_building",
+        cascade="all, delete-orphan"
+    )
+    distances_to = relationship(
+        "BuildingDistance", 
+        foreign_keys="[BuildingDistance.to_building_id]", 
+        back_populates="to_building",
+        cascade="all, delete-orphan"
+    )
 
 
 class BuildingDistance(Base):

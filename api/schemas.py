@@ -236,6 +236,7 @@ class BuildingCreate(BaseModel):
     code: Optional[str] = None
     description: Optional[str] = None
     is_shared: Optional[bool] = False
+    college_id: Optional[int] = None
 
 
 class BuildingUpdate(BaseModel):
@@ -243,6 +244,7 @@ class BuildingUpdate(BaseModel):
     code: Optional[str] = None
     description: Optional[str] = None
     is_shared: Optional[bool] = None
+    college_id: Optional[int] = None
 
 
 class BuildingResponse(BaseModel):
@@ -251,6 +253,7 @@ class BuildingResponse(BaseModel):
     code: Optional[str] = None
     description: Optional[str] = None
     is_shared: Optional[bool] = False
+    college_id: Optional[int] = None
 
     class Config:
         from_attributes = True

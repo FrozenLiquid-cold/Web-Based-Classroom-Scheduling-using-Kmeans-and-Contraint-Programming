@@ -1151,6 +1151,23 @@ def build_eligibility_maps(
                 .all()
             )
             course_college_map = {c.id: c.college_id for c in courses}
+    # ---------------------------------------------------------
+    # Build room → college mapping & shared-building rooms set
+    # (done ONCE before the per-subject loop for efficiency)
+    # ---------------------------------------------------------
+    room_to_college_id: Dict[int, Optional[int]] = {}  # room.id → college_id (None if unassigned)
+    _shared_room_ids: set = set()
+    if db:
+        _building_cache: Dict[int, models.Building] = {}
+        for _r in rooms:
+            if _r.building_id:
+                if _r.building_id not in _building_cache:
+                    _building_cache[_r.building_id] = db.query(models.Building).get(_r.building_id)
+                _bldg = _building_cache[_r.building_id]
+                if _bldg:
+                    room_to_college_id[_r.id] = getattr(_bldg, 'college_id', None)
+                    if _bldg.is_shared:
+                        _shared_room_ids.add(_r.id)
 
     # ---------------------------------------------------------
     # Build eligibility PER SUBJECT
@@ -1213,28 +1230,35 @@ def build_eligibility_maps(
         subject_to_instructors[sid] = eligible_instrs
         subject_to_preferred_rooms[sid] = preferred_rooms
 
-        # 3. Build All Valid Rooms (Type-based Hard Constraint)
+        # 3. Build All Valid Rooms (Type-based + College-based Hard Constraint)
         # Allows scheduler to pick NON-preferred rooms with a penalty
         all_valid_rooms = []
         for room in rooms:
             room_type = (room.type or "").upper().strip()
             # Strict type match
             if room_type == subj_type:
+                # College-based filtering: only allow rooms from the same college's buildings
+                room_college = room_to_college_id.get(room.id)
+                if subj_college is not None and room_college is not None:
+                    # Both subject and room have a college — must match
+                    if room_college != subj_college:
+                        continue
+                # If room_college is None (building not assigned to any college), allow it (graceful fallback)
                 all_valid_rooms.append(room.id)
 
         # CRITICAL: Exclude shared-building rooms for non-NSTP subjects from ALL lists
-        # Build shared room IDs set from buildings with is_shared=True
-        _shared_room_ids = set()
-        for _r in rooms:
-            if _r.building_id:
-                _bldg = db.query(models.Building).get(_r.building_id)
-                if _bldg and _bldg.is_shared:
-                    _shared_room_ids.add(_r.id)
         if not _is_nstp_subject(subject):
             if _shared_room_ids:
                 all_valid_rooms = [rid for rid in all_valid_rooms if rid not in _shared_room_ids]
                 # Also filter preferred just in case SP returned bad data
                 subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in _shared_room_ids]
+        
+        # Also apply college filtering to preferred rooms
+        if subj_college is not None:
+            subject_to_preferred_rooms[sid] = [
+                rid for rid in subject_to_preferred_rooms[sid]
+                if room_to_college_id.get(rid) is None or room_to_college_id.get(rid) == subj_college
+            ]
         
         # Capacity check logic could go here, but usually done in solver options generation
         
@@ -1243,8 +1267,12 @@ def build_eligibility_maps(
             if preferred_rooms:
                  all_valid_rooms = list(preferred_rooms)
             else:
-                 # Last resort: all rooms except shared-building rooms
-                 all_valid_rooms = [r.id for r in rooms if r.id not in _shared_room_ids]
+                 # Last resort: all rooms except shared-building rooms, still respecting college filter
+                 all_valid_rooms = [
+                     r.id for r in rooms
+                     if r.id not in _shared_room_ids
+                     and (subj_college is None or room_to_college_id.get(r.id) is None or room_to_college_id.get(r.id) == subj_college)
+                 ]
 
         subject_to_all_rooms[sid] = all_valid_rooms
 
@@ -3209,26 +3237,91 @@ def run_cp_scheduler(
                     subj_year = getattr(nstp_subj, 'year_level', year) or year or 1
                     
                     # Assign a DIFFERENT instructor for EACH block
+                    # If all unique instructors are used, allow reuse with workload checks
                     all_blocks_scheduled = True
+                    nstp_duration_min = NSTP_END_MIN - NSTP_START_MIN  # 180 min
+                    # Track how many NSTP blocks each instructor has been assigned
+                    nstp_block_count_per_instr = defaultdict(int)
+                    
                     for block_idx in range(1, num_blocks + 1):
                         block_label = _block_index_to_label(block_idx) or "A"
                         
                         selected_instructor = None
+                        # --- Pass 1: Try to find an unused instructor ---
                         for instr in eligible_instrs:
-                            # Skip if already assigned to another block for this NSTP
                             if instr.id in newly_booked_instructors:
                                 msg = f"  -> Block {block_label} Candidate {instr.id}: BUSY (assigned to another block)"
                                 logger.debug(msg)
                                 debug_lines.append(msg)
                                 continue
                             
-                            # Available! Select this instructor
                             selected_instructor = instr
                             newly_booked_instructors.add(instr.id)
+                            nstp_block_count_per_instr[instr.id] += 1
                             msg = f"  -> Block {block_label} Candidate {instr.id}: AVAILABLE (Selected)."
                             logger.info(msg)
                             debug_lines.append(msg)
                             break
+                        
+                        # --- Pass 2: All unique instructors exhausted, allow reuse ---
+                        if not selected_instructor and eligible_instrs:
+                            logger.info(f"  [NSTP] All {len(eligible_instrs)} unique instructors used. Attempting reuse for block {block_label}...")
+                            debug_lines.append(f"  [NSTP REUSE] Attempting instructor reuse for block {block_label}")
+                            
+                            # Compute existing workload for each eligible instructor
+                            # (existing DB schedules + NSTP blocks already assigned in this run)
+                            reuse_candidates = []
+                            for instr in eligible_instrs:
+                                # Get existing weekly minutes from DB schedules
+                                existing_mins = 0
+                                try:
+                                    existing_scheds = db.query(models.Schedule).filter(
+                                        models.Schedule.instructor_id == instr.id,
+                                        models.Schedule.semester == semester
+                                    ).all()
+                                    for sched in existing_scheds:
+                                        raw_time = (getattr(sched, 'time', None) or '').strip()
+                                        parsed = _parse_time_range_minutes(raw_time.split(' ', 1)[-1] if ' ' in raw_time else raw_time)
+                                        if parsed:
+                                            existing_mins += max(0, parsed[1] - parsed[0])
+                                except Exception:
+                                    pass
+                                
+                                # Add NSTP blocks already assigned in this run
+                                nstp_assigned_mins = nstp_block_count_per_instr.get(instr.id, 0) * nstp_duration_min
+                                total_mins = existing_mins + nstp_assigned_mins
+                                
+                                # Get this instructor's weekly limit
+                                employment_type = (getattr(instr, 'employment_type', None) or 'regular').strip().lower()
+                                if employment_type == 'visiting':
+                                    limit_mins = 30 * 60  # 1800 min
+                                else:
+                                    designation = (getattr(instr, 'designation', None) or '').strip().lower()
+                                    deduction_map = {"program chair": 3, "college secretary": 3, "dean": 12, "associate dean": 12, "director": 12}
+                                    deduction = deduction_map.get(designation, 0)
+                                    limit_mins = max(0, 24 - deduction) * 60
+                                
+                                remaining = limit_mins - total_mins
+                                msg = f"  -> Reuse check {instr.id}: {total_mins}/{limit_mins} min used, {nstp_block_count_per_instr.get(instr.id, 0)} NSTP blocks, remaining={remaining}"
+                                logger.debug(msg)
+                                debug_lines.append(msg)
+                                
+                                if remaining >= nstp_duration_min:
+                                    reuse_candidates.append((nstp_block_count_per_instr.get(instr.id, 0), total_mins, instr))
+                            
+                            if reuse_candidates:
+                                # Pick instructor with fewest NSTP blocks, then least total workload
+                                reuse_candidates.sort(key=lambda x: (x[0], x[1]))
+                                _, _, best_instr = reuse_candidates[0]
+                                selected_instructor = best_instr
+                                nstp_block_count_per_instr[best_instr.id] += 1
+                                msg = f"  -> Block {block_label} Candidate {best_instr.id}: REUSED (least loaded, {reuse_candidates[0][0]} existing NSTP blocks)"
+                                logger.info(msg)
+                                debug_lines.append(msg)
+                            else:
+                                msg = f"  -> Block {block_label}: No instructor has capacity for reuse ({nstp_duration_min} min needed)"
+                                logger.warning(msg)
+                                debug_lines.append(msg)
                         
                         if selected_instructor:
                             nstp_item = {
@@ -3246,10 +3339,11 @@ def run_cp_scheduler(
                                 "end_min": NSTP_END_MIN,
                             }
                             nstp_scheduled_items.append(nstp_item)
-                            logger.info(f"  [OK] NSTP scheduled: {nstp_code} block {block_label} -> Sunday 8-11am, {field_room.name}, Instructor {selected_instructor.id}")
+                            reuse_tag = " [REUSED]" if nstp_block_count_per_instr.get(selected_instructor.id, 0) > 1 else ""
+                            logger.info(f"  [OK] NSTP scheduled: {nstp_code} block {block_label} -> Sunday 8-11am, {field_room.name}, Instructor {selected_instructor.id}{reuse_tag}")
                         else:
                             all_blocks_scheduled = False
-                            logger.warning(f"  [FAIL] NSTP {nstp_code} block {block_label}: No available instructor for Sunday 8-11am")
+                            logger.warning(f"  [FAIL] NSTP {nstp_code} block {block_label}: No available instructor (all exhausted and over capacity)")
                     
                     if not all_blocks_scheduled:
                         logger.warning(f"  [PARTIAL] NSTP {nstp_code}: Some blocks could not be assigned instructors")
@@ -3507,7 +3601,16 @@ def run_cp_scheduler(
     logger.info("\nResource Availability:")
     logger.info(f"- Total active rooms: {len(rooms)}")
     if rooms:
-        logger.info(f"  - Capacity range: {min(r.capacity for r in rooms)} to {max(r.capacity for r in rooms)}")
+        capacities = [r.capacity for r in rooms if r.capacity is not None]
+        if capacities:
+            logger.info(f"  - Capacity range: {min(capacities)} to {max(capacities)}")
+        else:
+            logger.info("  - Capacity range: N/A (no rooms have capacity set)")
+        # Ensure no room has None capacity (default to 0) to prevent downstream comparisons failing
+        for r in rooms:
+            if r.capacity is None:
+                logger.warning(f"  ⚠️ Room '{r.name}' (ID: {r.id}) has no capacity set — defaulting to 0")
+                r.capacity = 0
     logger.info(f"- Total active instructors: {len(instructors)}")
     
     # Load days from database
@@ -4238,8 +4341,34 @@ def run_cp_scheduler(
 
             if len(eligible_rooms) == 0:
                 logger.warning(f"Subject {code} ({subject_id}) has no eligible rooms - adding fallback")
-                eligible_rooms = [room.id for room in rooms]
-                logger.warning(f"  - Fallback: using all {len(eligible_rooms)} rooms")
+                # CRITICAL: Fallback must still respect college filtering
+                # Look up the subject's college via its course_id
+                _subj_obj = subject_lookup_cluster.get(subject_id)
+                _subj_course_id = getattr(_subj_obj, 'course_id', None) if _subj_obj else None
+                _subj_college_id = None
+                if _subj_course_id:
+                    _course_obj = db.query(models.Course).filter(models.Course.id == _subj_course_id).first()
+                    if _course_obj:
+                        _subj_college_id = _course_obj.college_id
+                
+                # Build college-aware room → college map (reuse from build_eligibility_maps)
+                _room_college_map = {}
+                for _rm in rooms:
+                    if _rm.building_id:
+                        _bldg_obj = db.query(models.Building).get(_rm.building_id)
+                        if _bldg_obj:
+                            _room_college_map[_rm.id] = getattr(_bldg_obj, 'college_id', None)
+                
+                if _subj_college_id is not None:
+                    # Only use rooms from the same college or rooms with no college assigned
+                    eligible_rooms = [
+                        room.id for room in rooms
+                        if _room_college_map.get(room.id) is None or _room_college_map.get(room.id) == _subj_college_id
+                    ]
+                    logger.warning(f"  - Fallback: using {len(eligible_rooms)} rooms (college-filtered, college_id={_subj_college_id})")
+                else:
+                    eligible_rooms = [room.id for room in rooms]
+                    logger.warning(f"  - Fallback: using all {len(eligible_rooms)} rooms (no college context)")
                 subjects_without_options.append((code, "no eligible rooms (used fallback)"))
             
             # Get options for this subject
@@ -7525,10 +7654,16 @@ def run_cp_scheduler(
         except (TypeError, ValueError):
             continue
         entry = (s_int, e_int, m["idx"], m["removable"], m["block"], m["subject_id"])
-        # Instructor key
+        # Instructor key — EXEMPT items in shared building rooms (FIELD, GYM, etc.)
+        # When NSTP/PE reuses instructors across blocks in a shared venue, that is intentional
         if m["instr_id"] is not None:
             try:
-                conflict_map[("instr", int(m["instr_id"]), day_int)].append(entry)
+                instr_room_id = int(m["room_id"]) if m["room_id"] is not None else None
+                instr_room_name = room_id_to_name.get(instr_room_id, "").upper() if instr_room_id else ""
+                is_shared_venue = (instr_room_name == NSTP_ROOM_NAME or "FIELD" in instr_room_name 
+                                   or "COURT" in instr_room_name or "GYM" in instr_room_name)
+                if not is_shared_venue:
+                    conflict_map[("instr", int(m["instr_id"]), day_int)].append(entry)
             except (TypeError, ValueError):
                 pass
         # Room key — EXEMPT shared building rooms (FIELD, GYM, etc.) from cross-block conflict checks
