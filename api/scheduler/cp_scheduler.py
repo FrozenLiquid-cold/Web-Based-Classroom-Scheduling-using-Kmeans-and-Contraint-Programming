@@ -1253,12 +1253,52 @@ def build_eligibility_maps(
                 # If room_college is None (building not assigned to any college), allow it (graceful fallback)
                 all_valid_rooms.append(room.id)
 
-        # CRITICAL: Exclude shared-building rooms for non-shared subjects from ALL lists
-        if not _is_shared_subject(subject):
+        # CRITICAL: Exclude shared-building rooms AND PE-exclusive rooms for non-shared/non-PE subjects
+        if not _is_shared_subject(subject) or ("PE" not in subj_code and "NSTP" not in subj_code):
+            # 1. Filter out shared building rooms (like FIELD)
             if _shared_room_ids:
                 all_valid_rooms = [rid for rid in all_valid_rooms if rid not in _shared_room_ids]
-                # Also filter preferred just in case SP returned bad data
                 subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in _shared_room_ids]
+            
+            # 2. Filter out PE-exclusive rooms (GYM, QUAD) for all non-PE subjects
+            if "PE" not in subj_code:
+                non_pe_valid_rooms = []
+                for rid in all_valid_rooms:
+                    r_obj = next((r for r in rooms if r.id == rid), None)
+                    if r_obj:
+                        r_name = (r_obj.name or "").upper()
+                        if "GYM" not in r_name and "QUAD" not in r_name:
+                            non_pe_valid_rooms.append(rid)
+                all_valid_rooms = non_pe_valid_rooms
+                
+                non_pe_preferred = []
+                for rid in subject_to_preferred_rooms[sid]:
+                    r_obj = next((r for r in rooms if r.id == rid), None)
+                    if r_obj:
+                        r_name = (r_obj.name or "").upper()
+                        if "GYM" not in r_name and "QUAD" not in r_name:
+                            non_pe_preferred.append(rid)
+                subject_to_preferred_rooms[sid] = non_pe_preferred
+        else:
+            # If it IS a shared subject, and specifically PE, enforce strict room restrictions
+            if "PE" in subj_code:
+                pe_valid_rooms = []
+                for room in rooms:
+                    if room.id in all_valid_rooms:
+                        room_name = (room.name or "").upper()
+                        if "GYM" in room_name or "QUAD" in room_name:
+                            pe_valid_rooms.append(room.id)
+                all_valid_rooms = pe_valid_rooms
+                
+                # Also restrict preferred rooms for PE
+                pe_preferred = []
+                for rid in subject_to_preferred_rooms[sid]:
+                    r_obj = next((r for r in rooms if r.id == rid), None)
+                    if r_obj:
+                        r_name = (r_obj.name or "").upper()
+                        if "GYM" in r_name or "QUAD" in r_name:
+                            pe_preferred.append(rid)
+                subject_to_preferred_rooms[sid] = pe_preferred
         
         # Also apply college filtering to preferred rooms
         if subj_college is not None:
@@ -1274,11 +1314,12 @@ def build_eligibility_maps(
             if preferred_rooms:
                  all_valid_rooms = list(preferred_rooms)
             else:
-                 # Last resort: all rooms except shared-building rooms, still respecting college filter
+                 # Last resort: all rooms except shared-building rooms AND PE-exclusive rooms, still respecting college filter
                  all_valid_rooms = [
                      r.id for r in rooms
                      if r.id not in _shared_room_ids
                      and (subj_college is None or room_to_college_id.get(r.id) is None or room_to_college_id.get(r.id) == subj_college)
+                     and ("PE" in subj_code or ("GYM" not in (r.name or "").upper() and "QUAD" not in (r.name or "").upper()))
                  ]
 
         subject_to_all_rooms[sid] = all_valid_rooms
@@ -4368,13 +4409,18 @@ def run_cp_scheduler(
                 
                 if _subj_college_id is not None:
                     # Only use rooms from the same college or rooms with no college assigned
+                    # Also exclude PE-exclusive rooms (GYM/QUAD) for non-PE subjects
                     eligible_rooms = [
                         room.id for room in rooms
-                        if _room_college_map.get(room.id) is None or _room_college_map.get(room.id) == _subj_college_id
+                        if (_room_college_map.get(room.id) is None or _room_college_map.get(room.id) == _subj_college_id)
+                        and (code.upper().startswith("PE") or ("GYM" not in (room.name or "").upper() and "QUAD" not in (room.name or "").upper()))
                     ]
                     logger.warning(f"  - Fallback: using {len(eligible_rooms)} rooms (college-filtered, college_id={_subj_college_id})")
                 else:
-                    eligible_rooms = [room.id for room in rooms]
+                    eligible_rooms = [
+                        room.id for room in rooms
+                        if code.upper().startswith("PE") or ("GYM" not in (room.name or "").upper() and "QUAD" not in (room.name or "").upper())
+                    ]
                     logger.warning(f"  - Fallback: using all {len(eligible_rooms)} rooms (no college context)")
                 subjects_without_options.append((code, "no eligible rooms (used fallback)"))
             
@@ -7361,16 +7407,42 @@ def run_cp_scheduler(
             # Case 1: Subject was skipped / missing from diagnostics
             is_newly_discovered = True
             code = (getattr(subject, "code", "") or "").upper()
-            reason = "Unscheduled"
-            detail = "Optimization skipped this subject due to configuration limits."
+            
+            # ---- Build a SPECIFIC reason using actual eligibility data ----
+            eligible_room_ids = course_to_all_rooms.get(subject.id, [])
+            eligible_instr_ids = course_to_instructors.get(subject.id, [])
+            num_rooms = len(eligible_room_ids) if eligible_room_ids else 0
+            num_instrs = len(eligible_instr_ids) if eligible_instr_ids else 0
+            
             if "NSTP" in code:
-                 reason = "No Valid Time"
-                 detail = "No valid Sunday time slots found, or no eligible instructor matches Sunday schedule."
+                reason = "No Valid Time"
+                detail = "No valid Sunday time slots found, or no eligible instructor matches Sunday schedule."
+            elif num_instrs == 0 and num_rooms == 0:
+                reason = "No Instructor & No Rooms"
+                detail = f"This subject has no eligible instructors and no eligible rooms assigned."
+            elif num_instrs == 0:
+                reason = "No Instructor"
+                detail = f"No instructor is assigned to teach this subject. {num_rooms} eligible room(s) found but scheduling cannot proceed without an instructor."
+            elif num_rooms == 0:
+                reason = "No Rooms"
+                detail = f"{num_instrs} instructor(s) can teach this subject, but no eligible rooms are available."
+            else:
+                # Has both rooms and instructors but still failed -> all slots booked
+                reason = "All Slots Booked"
+                detail = (
+                    f"Only {num_instrs} instructor(s) and {num_rooms} eligible room(s) available. "
+                    f"All their time slots are already occupied by other subjects in this block."
+                )
             
             diagnostic_entry = {
                 "failure_reason": reason,
                 "detail": detail,
-                "metrics": {"candidates": 0, "fallback_generated": True},
+                "metrics": {
+                    "candidates": 0,
+                    "fallback_generated": True,
+                    "eligible_rooms": num_rooms,
+                    "eligible_instructors": num_instrs,
+                },
                 "recommendations": []
             }
             final_diagnostics[sid_str] = diagnostic_entry
@@ -7758,11 +7830,13 @@ def _get_suggestion_for_reason(reason: str) -> str:
     suggestions = {
         "Solver Conflict": "Go to Subjects page and assign more instructors to this subject, or go to Rooms page and add more rooms of this type.",
         "No Rooms": "Go to Rooms page and add rooms that match this subject type (LEC or LAB).",
-        "No Instructor": "Go to Subjects page and assign at least one instructor to teach this subject.",
+        "No Instructor": "Go to Instructors page and assign this subject to at least one instructor's specialization.",
+        "No Instructor & No Rooms": "This subject needs both an instructor and a room. Go to Instructors page and Rooms page to configure this subject.",
         "No Valid Time": "This subject needs longer time blocks. Check if enough consecutive time slots are available.",
         "Room Conflict": "All eligible rooms are fully booked. Add more rooms in the Rooms page or reduce other classes.",
         "Instructor Conflict": "All assigned instructors are fully booked. Add more instructors to this subject or reduce their workload.",
         "Student Conflict": "This class would overlap with another subject for the same students. Reduce the number of subjects or add more time slots.",
+        "All Slots Booked": "All available room and instructor time slots are taken by other subjects. Try adding more instructors or rooms for this subject.",
         "Unscheduled": "Check that this subject has instructors and rooms assigned in the Subjects page.",
     }
     return suggestions.get(reason, "Check subject settings in the Subjects page.")

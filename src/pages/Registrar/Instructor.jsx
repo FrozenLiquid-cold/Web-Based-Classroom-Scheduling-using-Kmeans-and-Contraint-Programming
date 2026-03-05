@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, useRef } from 'react'
 import { list, upsert, remove } from '../../store/db'
+import ConfirmDialog from '../../components/ConfirmDialog'
 
 export default function Instructor() {
 	const [items, setItems] = useState([])
@@ -19,6 +20,7 @@ export default function Instructor() {
 	const [error, setError] = useState('')
 	const [entries, setEntries] = useState(10)
 	const [processing, setProcessing] = useState(false)
+	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
 	// Prevent duplicate loads from React StrictMode
 	const dataLoadingRef = useRef(false);
@@ -159,18 +161,27 @@ export default function Instructor() {
 		setSpecialization(prev => prev.filter(c => c !== code))
 	}
 
-	async function onDelete(id) {
+	function onDelete(id) {
 		if (processing) return
-		if (!confirm('Delete this instructor?')) return
-		try {
-			setProcessing(true)
-			await remove('instructor', id)
-			await load(true)
-		} catch (error) {
-			alert(error.message || 'Failed to delete')
-		} finally {
-			setProcessing(false)
-		}
+		setConfirmDialog({
+			open: true,
+			title: 'Delete Instructor',
+			message: 'Are you sure you want to delete this instructor? This action cannot be undone.',
+			confirmText: 'Delete',
+			variant: 'danger',
+			onConfirm: async () => {
+				setConfirmDialog({ open: false })
+				try {
+					setProcessing(true)
+					await remove('instructor', id)
+					await load(true)
+				} catch (error) {
+					alert(error.message || 'Failed to delete')
+				} finally {
+					setProcessing(false)
+				}
+			},
+		})
 	}
 
 	return (
@@ -230,11 +241,23 @@ export default function Instructor() {
 												className={`inline-block px-2 py-0.5 rounded-full text-xs font-semibold cursor-pointer hover:opacity-80 ${it.is_active !== false ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
 													}`}
 												title={it.is_active !== false ? 'Click to deactivate' : 'Click to activate'}
-												onClick={async () => {
-													try {
-														await upsert('instructor', { id: it.id, is_active: it.is_active === false })
-														await load(true)
-													} catch (err) { alert(err.message || 'Failed to toggle status') }
+												onClick={() => {
+													const fullName = `${it.first_name || ''} ${it.last_name || ''}`.trim()
+													const newActive = it.is_active === false
+													setConfirmDialog({
+														open: true,
+														title: newActive ? 'Activate Instructor' : 'Deactivate Instructor',
+														message: `Are you sure you want to ${newActive ? 'activate' : 'deactivate'} "${fullName}"?`,
+														confirmText: newActive ? 'Activate' : 'Deactivate',
+														variant: 'warning',
+														onConfirm: async () => {
+															setConfirmDialog({ open: false })
+															try {
+																await upsert('instructor', { id: it.id, is_active: newActive })
+																await load(true)
+															} catch (err) { alert(err.message || 'Failed to toggle status') }
+														},
+													})
 												}}
 											>
 												{it.is_active !== false ? 'Active' : 'Inactive'}
@@ -330,6 +353,11 @@ export default function Instructor() {
 					</form>
 				</div>
 			)}
+
+			<ConfirmDialog
+				{...confirmDialog}
+				onCancel={() => setConfirmDialog({ open: false })}
+			/>
 		</div>
 	)
 }

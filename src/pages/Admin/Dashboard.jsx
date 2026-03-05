@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getAdminStats, deleteScheduleItem } from '../../services/api'
+import ConfirmDialog from '../../components/ConfirmDialog'
 
 export default function Dashboard() {
     const navigate = useNavigate()
@@ -13,6 +14,7 @@ export default function Dashboard() {
     // modal state
     const [showConflictModal, setShowConflictModal] = useState(false)
     const [resolving, setResolving] = useState(false)
+    const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
     // Load departments once
     useEffect(() => {
@@ -48,18 +50,26 @@ export default function Dashboard() {
         fetchStats()
     }, [semester, departmentId])
 
-    const handleResolveConflict = async (scheduleId) => {
-        if (!confirm("Are you sure you want to delete this schedule item?")) return
-        setResolving(true)
-        try {
-            await deleteScheduleItem(scheduleId)
-            // Refresh stats
-            await fetchStats()
-        } catch (err) {
-            alert("Failed to delete item: " + err.message)
-        } finally {
-            setResolving(false)
-        }
+    const handleResolveConflict = (scheduleId) => {
+        setConfirmDialog({
+            open: true,
+            title: 'Delete Schedule Item',
+            message: 'Are you sure you want to delete this schedule item? This will resolve the conflict.',
+            confirmText: 'Delete',
+            variant: 'danger',
+            onConfirm: async () => {
+                setConfirmDialog({ open: false })
+                setResolving(true)
+                try {
+                    await deleteScheduleItem(scheduleId)
+                    await fetchStats()
+                } catch (err) {
+                    alert("Failed to delete item: " + err.message)
+                } finally {
+                    setResolving(false)
+                }
+            },
+        })
     }
 
     const StatCard = ({ title, value, subtext, color, icon, onClick, actionLabel }) => (
@@ -341,6 +351,11 @@ export default function Dashboard() {
                     </div>
                 </div>
             )}
+
+            <ConfirmDialog
+                {...confirmDialog}
+                onCancel={() => setConfirmDialog({ open: false })}
+            />
         </div>
     )
 }

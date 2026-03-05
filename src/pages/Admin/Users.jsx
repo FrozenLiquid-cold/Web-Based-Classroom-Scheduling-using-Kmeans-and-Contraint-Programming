@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { list, upsert, remove } from '../../store/db'
+import ConfirmDialog from '../../components/ConfirmDialog'
 
 export default function Users() {
 	const [items, setItems] = useState([])
@@ -14,6 +15,7 @@ export default function Users() {
 	const [error, setError] = useState('')
 	const [entries, setEntries] = useState(10)
 	const [processing, setProcessing] = useState(false)
+	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
 	async function load() {
 		try {
@@ -114,18 +116,27 @@ export default function Users() {
 		}
 	}
 
-	async function onDelete(id) {
+	function onDelete(id) {
 		if (processing) return
-		if (!confirm('Delete this user account?')) return
-		try {
-			setProcessing(true)
-			await remove('user', id)
-			await load()
-		} catch (error) {
-			alert(error.message || 'Failed to delete user')
-		} finally {
-			setProcessing(false)
-		}
+		setConfirmDialog({
+			open: true,
+			title: 'Delete User',
+			message: 'Are you sure you want to delete this user account? This action cannot be undone.',
+			confirmText: 'Delete',
+			variant: 'danger',
+			onConfirm: async () => {
+				setConfirmDialog({ open: false })
+				try {
+					setProcessing(true)
+					await remove('user', id)
+					await load()
+				} catch (error) {
+					alert(error.message || 'Failed to delete user')
+				} finally {
+					setProcessing(false)
+				}
+			},
+		})
 	}
 
 	// Helper to get instructor name for inline display
@@ -200,8 +211,8 @@ export default function Users() {
 									<td className="px-3 py-2 border-r border-gray-300">{it.username}</td>
 									<td className="px-3 py-2 border-r border-gray-300 capitalize">
 										<span className={`inline-block px-2 py-0.5 rounded-full text-xs font-semibold ${it.role === 'admin' ? 'bg-purple-100 text-purple-800' :
-												it.role === 'registrar' ? 'bg-blue-100 text-blue-800' :
-													'bg-green-100 text-green-800'
+											it.role === 'registrar' ? 'bg-blue-100 text-blue-800' :
+												'bg-green-100 text-green-800'
 											}`}>
 											{it.role}
 										</span>
@@ -318,6 +329,11 @@ export default function Users() {
 					</form>
 				</div>
 			)}
+
+			<ConfirmDialog
+				{...confirmDialog}
+				onCancel={() => setConfirmDialog({ open: false })}
+			/>
 		</div>
 	)
 }

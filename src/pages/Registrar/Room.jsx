@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, useRef } from 'react'
 import { list, upsert, remove } from '../../store/db'
+import ConfirmDialog from '../../components/ConfirmDialog'
 
 export default function Room() {
 	const [buildings, setBuildings] = useState([])
@@ -14,6 +15,7 @@ export default function Room() {
 	const [error, setError] = useState('')
 	const [entries, setEntries] = useState(10)
 	const [processing, setProcessing] = useState(false)
+	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
 	// Prevent duplicate loads from React StrictMode
 	const dataLoadingRef = useRef(false);
@@ -95,18 +97,27 @@ export default function Room() {
 		}
 	}
 
-	async function onDelete(id) {
+	function onDelete(id) {
 		if (processing) return
-		if (!confirm('Delete this room?')) return
-		try {
-			setProcessing(true)
-			await remove('room', id)
-			await load(true)
-		} catch (error) {
-			alert(error.message || 'Failed to delete')
-		} finally {
-			setProcessing(false)
-		}
+		setConfirmDialog({
+			open: true,
+			title: 'Delete Room',
+			message: 'Are you sure you want to delete this room? This action cannot be undone.',
+			confirmText: 'Delete',
+			variant: 'danger',
+			onConfirm: async () => {
+				setConfirmDialog({ open: false })
+				try {
+					setProcessing(true)
+					await remove('room', id)
+					await load(true)
+				} catch (error) {
+					alert(error.message || 'Failed to delete')
+				} finally {
+					setProcessing(false)
+				}
+			},
+		})
 	}
 
 	return (
@@ -163,11 +174,22 @@ export default function Room() {
 												className={`inline-block px-2 py-0.5 rounded-full text-xs font-semibold cursor-pointer hover:opacity-80 ${it.is_available !== false ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
 													}`}
 												title={it.is_available !== false ? 'Click to mark unavailable' : 'Click to mark available'}
-												onClick={async () => {
-													try {
-														await upsert('room', { id: it.id, is_available: it.is_available === false })
-														await load(true)
-													} catch (err) { alert(err.message || 'Failed to toggle status') }
+												onClick={() => {
+													const newStatus = it.is_available === false
+													setConfirmDialog({
+														open: true,
+														title: newStatus ? 'Mark Room Available' : 'Mark Room Unavailable',
+														message: `Are you sure you want to mark "${it.name}" as ${newStatus ? 'available' : 'unavailable'}?`,
+														confirmText: newStatus ? 'Mark Available' : 'Mark Unavailable',
+														variant: 'warning',
+														onConfirm: async () => {
+															setConfirmDialog({ open: false })
+															try {
+																await upsert('room', { id: it.id, is_available: newStatus })
+																await load(true)
+															} catch (err) { alert(err.message || 'Failed to toggle status') }
+														},
+													})
 												}}
 											>
 												{it.is_available !== false ? 'Available' : 'Unavailable'}
@@ -216,6 +238,11 @@ export default function Room() {
 					</form>
 				</div>
 			)}
+
+			<ConfirmDialog
+				{...confirmDialog}
+				onCancel={() => setConfirmDialog({ open: false })}
+			/>
 		</div>
 	)
 }

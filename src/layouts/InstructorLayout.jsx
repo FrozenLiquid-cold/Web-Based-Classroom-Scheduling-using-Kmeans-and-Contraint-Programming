@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { logout } from '../store/auth'
+import ConfirmDialog from '../components/ConfirmDialog'
 
 const nav = [
 	{ to: '/i/dashboard', label: 'Dashboard' },
@@ -59,6 +60,7 @@ export default function InstructorLayout() {
 		const saved = localStorage.getItem('jrmsu.theme')
 		return saved ? saved === 'dark' : false
 	})
+	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
 	useEffect(() => {
 		localStorage.setItem('jrmsu.theme', isDark ? 'dark' : 'light')
@@ -90,10 +92,18 @@ export default function InstructorLayout() {
 				<div className="mt-auto pt-6 w-full">
 					<button
 						onClick={() => {
-							if (confirm('Are you sure you want to log out?')) {
-								logout();
-								navigate('/login/instructor')
-							}
+							setConfirmDialog({
+								open: true,
+								title: 'Log Out',
+								message: 'Are you sure you want to log out?',
+								confirmText: 'Log Out',
+								variant: 'warning',
+								onConfirm: () => {
+									setConfirmDialog({ open: false })
+									logout();
+									navigate('/login/instructor')
+								},
+							})
 						}}
 						className="w-48 text-left px-4 py-2 rounded transition-all duration-300 ease-out font-semibold tracking-wide flex items-center gap-3 text-white/90 hover:text-white hover:bg-red-600/20"
 					>
@@ -141,6 +151,11 @@ export default function InstructorLayout() {
 					)}
 				</div>
 			</main>
+
+			<ConfirmDialog
+				{...confirmDialog}
+				onCancel={() => setConfirmDialog({ open: false })}
+			/>
 		</div>
 	)
 }

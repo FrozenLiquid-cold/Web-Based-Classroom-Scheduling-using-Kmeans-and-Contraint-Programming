@@ -40,6 +40,11 @@ def validate_schedule_item():
     
     try:
 
+        # Build day_id -> label lookup for human-readable messages
+        all_days = db.query(models.Day).all()
+        day_label_map = {d.id: d.label for d in all_days}
+        DAY_FULL_NAMES = {"M": "Monday", "T": "Tuesday", "W": "Wednesday", "TH": "Thursday", "F": "Friday", "SAT": "Saturday", "SUN": "Sunday"}
+
         # Pydantic has handled basic type checks
         # Decide which days to check: prefer day_ids if present, else day_id
         days_to_check = req.day_ids if req.day_ids else [req.day_id]
@@ -120,7 +125,9 @@ def validate_schedule_item():
                          course_code = item.course.code if item.course else f"Course {item.course_id}"
                          conflict_time = item.time or "?"
                          
-                         msg = f"Room Conflict (Day {check_day_id}): Occupied by {course_code} - {subj_code} ({conflict_time})"
+                         day_label = day_label_map.get(check_day_id, str(check_day_id))
+                         day_full = DAY_FULL_NAMES.get(day_label, day_label)
+                         msg = f"Room Conflict ({day_full}): Occupied by {course_code} - {subj_code} ({conflict_time})"
                          messages.append(msg)
                          logger.info(f"Conflict FOUND: {msg}")
 
@@ -131,6 +138,9 @@ def validate_schedule_item():
                      models.Schedule.day_id == check_day_id,
                      models.Schedule.semester == req.semester,
                      models.Schedule.instructor_id == req.instructor_id
+                 ).options(
+                     joinedload(models.Schedule.course),
+                     joinedload(models.Schedule.subject)
                  )
                  if req.id:
                      instr_query = instr_query.filter(models.Schedule.id != req.id)
@@ -139,7 +149,13 @@ def validate_schedule_item():
                  for item in instr_conflicts:
                      i_start, i_end = _parse_schedule_time(item.time)
                      if times_overlap(start_time, end_time, i_start, i_end):
-                         messages.append(f"Instructor Conflict (Day {check_day_id}): Instructor is teaching {item.subject_id} at this time.")
+                         subj_code = item.subject.code if item.subject else f"Subject {item.subject_id}"
+                         course_code = item.course.code if item.course else ""
+                         conflict_time = item.time or "?"
+                         day_label = day_label_map.get(check_day_id, str(check_day_id))
+                         day_full = DAY_FULL_NAMES.get(day_label, day_label)
+                         desc = f"{course_code} - {subj_code}" if course_code else subj_code
+                         messages.append(f"Instructor Conflict ({day_full}): Teaching {desc} ({conflict_time})")
 
                  # 4. Check Travel Time (Only if no direct conflict)
                  if req.room_id:
@@ -170,7 +186,9 @@ def validate_schedule_item():
                                  dist = _get_travel_time(db, prev_room.building_id, proposed_room.building_id)
                                  gap = (get_minutes(start_time) - get_minutes(prev_class["end"]))
                                  if gap < dist:
-                                     messages.append(f"Travel Time Warning (Day {check_day_id}): Only {gap} mins gap after previous class.")
+                                     day_label = day_label_map.get(check_day_id, str(check_day_id))
+                                     day_full = DAY_FULL_NAMES.get(day_label, day_label)
+                                     messages.append(f"Travel Time Warning ({day_full}): Only {gap} mins gap after previous class.")
 
                          if next_class and next_class["room_id"]:
                              next_room = db.query(models.Room).get(next_class["room_id"])
@@ -178,7 +196,9 @@ def validate_schedule_item():
                                  dist = _get_travel_time(db, proposed_room.building_id, next_room.building_id)
                                  gap = (get_minutes(next_class["start"]) - get_minutes(end_time))
                                  if gap < dist:
-                                     messages.append(f"Travel Time Warning (Day {check_day_id}): Only {gap} mins gap before next class.")
+                                     day_label = day_label_map.get(check_day_id, str(check_day_id))
+                                     day_full = DAY_FULL_NAMES.get(day_label, day_label)
+                                     messages.append(f"Travel Time Warning ({day_full}): Only {gap} mins gap before next class.")
 
 
              # 3. Check Student Group Conflict (Specific Year Level Resource)
@@ -198,6 +218,8 @@ def validate_schedule_item():
                  models.Schedule.semester == req.semester,
                  models.Schedule.year == req.year,
                  models.Schedule.course_id == req.course_id
+             ).options(
+                 joinedload(models.Schedule.subject)
              )
              if req.id:
                  student_query = student_query.filter(models.Schedule.id != req.id)
@@ -209,7 +231,11 @@ def validate_schedule_item():
              for item in student_conflicts:
                   i_start, i_end = _parse_schedule_time(item.time)
                   if times_overlap(start_time, end_time, i_start, i_end):
-                      messages.append(f"Student Conflict (Day {check_day_id}): Group has another class {item.subject_id} at this time.")
+                      subj_code = item.subject.code if item.subject else f"Subject {item.subject_id}"
+                      conflict_time = item.time or "?"
+                      day_label = day_label_map.get(check_day_id, str(check_day_id))
+                      day_full = DAY_FULL_NAMES.get(day_label, day_label)
+                      messages.append(f"Student Conflict ({day_full}): Block has {subj_code} ({conflict_time}) at this time.")
 
         return jsonify({
             "valid": len(messages) == 0,

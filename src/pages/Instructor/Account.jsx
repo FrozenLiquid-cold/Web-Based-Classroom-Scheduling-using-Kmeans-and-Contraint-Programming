@@ -3,6 +3,7 @@ import { useNavigate, useOutletContext } from 'react-router-dom'
 import { logout } from '../../store/auth'
 import { list } from '../../store/db'
 import { updateProfile } from '../../services/api'
+import ConfirmDialog from '../../components/ConfirmDialog'
 
 export default function InstructorAccount() {
     const navigate = useNavigate()
@@ -161,6 +162,7 @@ export default function InstructorAccount() {
         input: isDark ? 'bg-slate-700 border-slate-600 text-white placeholder-slate-400' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400',
         inputFocus: 'focus:ring-2 focus:ring-blue-500 focus:border-transparent',
     }
+    const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
     return (
         <div className={`min-h-screen ${theme.bg} p-6`}>
@@ -411,10 +413,18 @@ export default function InstructorAccount() {
                     <button
                         className="px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-700 transition-colors flex items-center gap-2"
                         onClick={() => {
-                            if (confirm('Are you sure you want to log out?')) {
-                                logout()
-                                navigate('/login/instructor')
-                            }
+                            setConfirmDialog({
+                                open: true,
+                                title: 'Log Out',
+                                message: 'Are you sure you want to log out?',
+                                confirmText: 'Log Out',
+                                variant: 'warning',
+                                onConfirm: () => {
+                                    setConfirmDialog({ open: false })
+                                    logout()
+                                    navigate('/login/instructor')
+                                },
+                            })
                         }}
                     >
                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -423,6 +433,11 @@ export default function InstructorAccount() {
                         Sign Out
                     </button>
                 </div>
+
+                <ConfirmDialog
+                    {...confirmDialog}
+                    onCancel={() => setConfirmDialog({ open: false })}
+                />
             </div>
         </div>
     )

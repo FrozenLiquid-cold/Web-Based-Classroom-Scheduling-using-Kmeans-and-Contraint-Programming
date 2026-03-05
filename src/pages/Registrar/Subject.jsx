@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, useRef } from 'react'
 import { list, upsert, remove } from '../../store/db'
+import ConfirmDialog from '../../components/ConfirmDialog'
 
 export default function Subject() {
 	const [items, setItems] = useState([])
@@ -19,6 +20,7 @@ export default function Subject() {
 	const [error, setError] = useState('')
 	const [entries, setEntries] = useState(10)
 	const [processing, setProcessing] = useState(false)
+	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
 	// Prevent duplicate loads from React StrictMode
 	const dataLoadingRef = useRef(false);
@@ -161,18 +163,27 @@ export default function Subject() {
 		return course ? `${course.code} — ${course.description}` : ''
 	}
 
-	async function onDelete(id) {
+	function onDelete(id) {
 		if (processing) return
-		if (!confirm('Delete this subject?')) return
-		try {
-			setProcessing(true)
-			await remove('subject', id)
-			await load(true)
-		} catch (error) {
-			alert(error.message || 'Failed to delete')
-		} finally {
-			setProcessing(false)
-		}
+		setConfirmDialog({
+			open: true,
+			title: 'Delete Subject',
+			message: 'Are you sure you want to delete this subject? This action cannot be undone.',
+			confirmText: 'Delete',
+			variant: 'danger',
+			onConfirm: async () => {
+				setConfirmDialog({ open: false })
+				try {
+					setProcessing(true)
+					await remove('subject', id)
+					await load(true)
+				} catch (error) {
+					alert(error.message || 'Failed to delete')
+				} finally {
+					setProcessing(false)
+				}
+			},
+		})
 	}
 
 	return (
@@ -307,6 +318,11 @@ export default function Subject() {
 					</form>
 				</div>
 			)}
+
+			<ConfirmDialog
+				{...confirmDialog}
+				onCancel={() => setConfirmDialog({ open: false })}
+			/>
 		</div>
 	)
 }

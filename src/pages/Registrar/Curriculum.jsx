@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { list } from '../../store/db';
+import ConfirmDialog from '../../components/ConfirmDialog';
 
 export default function Curriculum() {
     const [courses, setCourses] = useState([]);
@@ -10,6 +11,7 @@ export default function Curriculum() {
     const [processing, setProcessing] = useState(false);
     const [message, setMessage] = useState('');
     const [error, setError] = useState('');
+    const [confirmDialog, setConfirmDialog] = useState({ open: false });
 
     useEffect(() => {
         loadCourses();
@@ -116,22 +118,31 @@ export default function Curriculum() {
     }
 
     async function onDelete() {
-        if (!confirm("Are you sure you want to delete this curriculum?")) return;
-        setProcessing(true);
-        try {
-            const res = await fetch(`http://localhost:8000/api/curriculum/${courseId}`, {
-                method: 'DELETE'
-            });
-            if (!res.ok) throw new Error("Delete failed");
+        setConfirmDialog({
+            open: true,
+            title: 'Delete Curriculum',
+            message: 'Are you sure you want to delete this curriculum? This action cannot be undone.',
+            confirmText: 'Delete',
+            variant: 'danger',
+            onConfirm: async () => {
+                setConfirmDialog({ open: false })
+                setProcessing(true);
+                try {
+                    const res = await fetch(`http://localhost:8000/api/curriculum/${courseId}`, {
+                        method: 'DELETE'
+                    });
+                    if (!res.ok) throw new Error("Delete failed");
 
-            setSubjects([]);
-            setView('upload');
-            setMessage('Curriculum Deleted.');
-        } catch (err) {
-            setError(err.message);
-        } finally {
-            setProcessing(false);
-        }
+                    setSubjects([]);
+                    setView('upload');
+                    setMessage('Curriculum Deleted.');
+                } catch (err) {
+                    setError(err.message);
+                } finally {
+                    setProcessing(false);
+                }
+            },
+        });
     }
 
     // Helper to group items by year
@@ -145,7 +156,7 @@ export default function Curriculum() {
     };
 
     const TotalRow = ({ list }) => {
-        const total = list.reduce((sum, item) => sum + (item.units || 0), 0);
+        const total = list.reduce((sum, item) => sum + (Number(item.units) || 0), 0);
         return (
             <tr className="bg-white font-bold border-t-2 border-black">
                 <td colSpan={2} className="px-3 py-1 text-center font-black tracking-[0.3em]">TOTAL</td>
@@ -313,6 +324,11 @@ export default function Curriculum() {
                     })}
                 </div>
             )}
+
+            <ConfirmDialog
+                {...confirmDialog}
+                onCancel={() => setConfirmDialog({ open: false })}
+            />
         </div>
     );
 }

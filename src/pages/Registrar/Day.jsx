@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, useRef } from 'react'
 import { list, upsert, remove } from '../../store/db'
+import ConfirmDialog from '../../components/ConfirmDialog'
 
 export default function Day() {
 	const [items, setItems] = useState([])
@@ -10,6 +11,7 @@ export default function Day() {
 	const [error, setError] = useState('')
 	const [entries, setEntries] = useState(10)
 	const [processing, setProcessing] = useState(false) // For Save/Delete
+	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
 	// Prevent duplicate loads from React StrictMode
 	const dataLoadingRef = useRef(false)
@@ -74,19 +76,27 @@ export default function Day() {
 		}
 	}
 
-	async function onDelete(id) {
+	function onDelete(id) {
 		if (processing) return
-		if (!confirm('Delete this day?')) return
-
-		setProcessing(true)
-		try {
-			await remove('day', id)
-			await load(true)
-		} catch (err) {
-			alert(err.message || 'Failed to delete')
-		} finally {
-			setProcessing(false)
-		}
+		setConfirmDialog({
+			open: true,
+			title: 'Delete Day',
+			message: 'Are you sure you want to delete this day? This action cannot be undone.',
+			confirmText: 'Delete',
+			variant: 'danger',
+			onConfirm: async () => {
+				setConfirmDialog({ open: false })
+				setProcessing(true)
+				try {
+					await remove('day', id)
+					await load(true)
+				} catch (err) {
+					alert(err.message || 'Failed to delete')
+				} finally {
+					setProcessing(false)
+				}
+			},
+		})
 	}
 
 	return (
@@ -98,7 +108,7 @@ export default function Day() {
 					onClick={openAdd}
 					disabled={processing}
 				>
-					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M11 11V5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>
+					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M11 11V5h2v6h6v2h-6v6h-2v-6H5v-2h6z" /></svg>
 					<span>Add Day</span>
 				</button>
 			</div>
@@ -165,6 +175,11 @@ export default function Day() {
 					</form>
 				</div>
 			)}
+
+			<ConfirmDialog
+				{...confirmDialog}
+				onCancel={() => setConfirmDialog({ open: false })}
+			/>
 		</div>
 	)
 }

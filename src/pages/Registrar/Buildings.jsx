@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, useRef } from 'react'
+import ConfirmDialog from '../../components/ConfirmDialog'
 
 
 export default function Buildings() {
@@ -15,6 +16,7 @@ export default function Buildings() {
     const [error, setError] = useState('')
     const [entries, setEntries] = useState(10)
     const [processing, setProcessing] = useState(false)
+    const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
     const dataLoadingRef = useRef(false);
     const dataLoadedRef = useRef(false);
@@ -135,22 +137,31 @@ export default function Buildings() {
         }
     }
 
-    async function onDelete(id) {
+    function onDelete(id) {
         if (processing) return
-        if (!confirm('Delete this building?')) return
-        try {
-            setProcessing(true)
-            const res = await fetch(`http://localhost:8000/api/buildings/${id}`, { method: 'DELETE' })
-            if (!res.ok) {
-                const json = await res.json().catch(() => ({}))
-                throw new Error(json.detail || 'Failed to delete')
-            }
-            await load(true)
-        } catch (error) {
-            alert(error.message || 'Failed to delete')
-        } finally {
-            setProcessing(false)
-        }
+        setConfirmDialog({
+            open: true,
+            title: 'Delete Building',
+            message: 'Are you sure you want to delete this building? This action cannot be undone.',
+            confirmText: 'Delete',
+            variant: 'danger',
+            onConfirm: async () => {
+                setConfirmDialog({ open: false })
+                try {
+                    setProcessing(true)
+                    const res = await fetch(`http://localhost:8000/api/buildings/${id}`, { method: 'DELETE' })
+                    if (!res.ok) {
+                        const json = await res.json().catch(() => ({}))
+                        throw new Error(json.detail || 'Failed to delete')
+                    }
+                    await load(true)
+                } catch (error) {
+                    alert(error.message || 'Failed to delete')
+                } finally {
+                    setProcessing(false)
+                }
+            },
+        })
     }
 
     return (
@@ -261,6 +272,11 @@ export default function Buildings() {
                     </form>
                 </div>
             )}
+
+            <ConfirmDialog
+                {...confirmDialog}
+                onCancel={() => setConfirmDialog({ open: false })}
+            />
         </div>
     )
 }

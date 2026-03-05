@@ -1,5 +1,7 @@
+import { useState } from 'react'
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { logout } from '../store/auth'
+import ConfirmDialog from '../components/ConfirmDialog'
 
 const nav = [
 	{ to: '/a/dashboard', label: 'Dashboard' },
@@ -37,6 +39,7 @@ export default function AdminLayout() {
 	const navigate = useNavigate()
 	const { pathname } = useLocation()
 	const isDashboard = pathname === '/a/dashboard' || pathname === '/a'
+	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
 	return (
 		<div className="min-h-screen flex">
@@ -64,10 +67,18 @@ export default function AdminLayout() {
 				<div className="mt-auto pt-6 w-full">
 					<button
 						onClick={() => {
-							if (confirm('Are you sure you want to log out?')) {
-								logout();
-								navigate('/login/admin')
-							}
+							setConfirmDialog({
+								open: true,
+								title: 'Log Out',
+								message: 'Are you sure you want to log out?',
+								confirmText: 'Log Out',
+								variant: 'warning',
+								onConfirm: () => {
+									setConfirmDialog({ open: false })
+									logout();
+									navigate('/login/admin')
+								},
+							})
 						}}
 						className="w-48 text-left px-4 py-2 rounded transition-all duration-300 ease-out font-semibold tracking-wide flex items-center gap-3 text-white/90 hover:text-white hover:bg-red-600/20"
 					>
@@ -91,6 +102,11 @@ export default function AdminLayout() {
 					)}
 				</div>
 			</main>
+
+			<ConfirmDialog
+				{...confirmDialog}
+				onCancel={() => setConfirmDialog({ open: false })}
+			/>
 		</div>
 	)
 }
