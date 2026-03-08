@@ -107,7 +107,11 @@ export default function Curriculum() {
                 throw new Error(err.detail || 'Save failed');
             }
 
-            setMessage('Curriculum Saved Successfully!');
+            const result = await res.json();
+            const parts = ['Curriculum Saved Successfully!'];
+            if (result.subjects_created > 0) parts.push(`${result.subjects_created} subject(s) added`);
+            if (result.subjects_updated > 0) parts.push(`${result.subjects_updated} subject(s) updated`);
+            setMessage(parts.join(' — '));
             setFile(null);
             fetchCurriculum(courseId);
         } catch (err) {
@@ -156,11 +160,15 @@ export default function Curriculum() {
     };
 
     const TotalRow = ({ list }) => {
+        const totalLec = list.reduce((sum, item) => sum + (Number(item.lec_hours) || 0), 0);
+        const totalLab = list.reduce((sum, item) => sum + (Number(item.lab_hours) || 0), 0);
         const total = list.reduce((sum, item) => sum + (Number(item.units) || 0), 0);
         return (
             <tr className="bg-white font-bold border-t-2 border-black">
                 <td colSpan={2} className="px-3 py-1 text-center font-black tracking-[0.3em]">TOTAL</td>
-                <td className="px-3 py-1 text-center border-l-2 border-black border-r-2">{total}</td>
+                <td className="px-3 py-1 text-center border-l-2 border-black">{totalLec || ''}</td>
+                <td className="px-3 py-1 text-center border-l border-black">{totalLab || ''}</td>
+                <td className="px-3 py-1 text-center border-l-2 border-r-2 border-black font-black">{total}</td>
                 <td className="px-3 py-1"></td>
             </tr>
         );
@@ -173,11 +181,16 @@ export default function Curriculum() {
             </div>
             <table className="w-full text-[10px] border-collapse">
                 <thead>
+                    <tr className="border-b border-black">
+                        <th rowSpan={2} className="px-1 py-1 text-center border-r-2 border-black w-[15%]">Course No.</th>
+                        <th rowSpan={2} className="px-1 py-1 text-center border-r-2 border-black w-[45%]">Descriptive Title</th>
+                        <th colSpan={3} className="px-1 py-0.5 text-center border-r-2 border-black w-[20%]">Units</th>
+                        <th rowSpan={2} className="px-1 py-1 text-center w-[20%] text-[8px]">Pre-requisite/ Co-requisite</th>
+                    </tr>
                     <tr className="border-b-2 border-black">
-                        <th className="px-1 py-1 text-center border-r-2 border-black w-[15%]">Course No.</th>
-                        <th className="px-1 py-1 text-center border-r-2 border-black w-[55%]">Descriptive Title</th>
-                        <th className="px-1 py-1 text-center border-r-2 border-black w-[10%]">Units</th>
-                        <th className="px-1 py-1 text-center w-[20%] text-[8px]">Pre-requisite/ Co-requisite</th>
+                        <th className="px-1 py-0.5 text-center border-r border-black text-[8px]">LEC</th>
+                        <th className="px-1 py-0.5 text-center border-r border-black text-[8px]">LAB</th>
+                        <th className="px-1 py-0.5 text-center border-r-2 border-black text-[8px]">Total</th>
                     </tr>
                 </thead>
                 <tbody className="divide-y divide-black">
@@ -185,6 +198,8 @@ export default function Curriculum() {
                         <tr key={idx} className="h-7 border-black">
                             <td className="px-1 py-1 border-r-2 border-black align-top font-bold uppercase">{item.code}</td>
                             <td className="px-1 py-1 border-r-2 border-black align-top leading-tight">{item.description}</td>
+                            <td className="px-1 py-1 border-r border-black text-center align-top">{item.lec_hours || ''}</td>
+                            <td className="px-1 py-1 border-r border-black text-center align-top">{item.lab_hours || ''}</td>
                             <td className="px-1 py-1 border-r-2 border-black text-center align-top font-bold">{item.units}</td>
                             <td className="px-1 py-1 text-[8px] align-top">{item.prerequisite}</td>
                         </tr>

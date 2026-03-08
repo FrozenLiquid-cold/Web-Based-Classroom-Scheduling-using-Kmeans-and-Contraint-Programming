@@ -300,6 +300,8 @@ class CurriculumSubject(Base):
     code = Column(String(50), nullable=False)
     description = Column(Text, nullable=False)
     units = Column(Integer, nullable=False, default=0)
+    lec_hours = Column(Integer, nullable=True, default=0)
+    lab_hours = Column(Integer, nullable=True, default=0)
     prerequisite = Column(String(255), nullable=True)
     
     # New fields for structured layout

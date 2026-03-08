@@ -159,7 +159,7 @@ def parse_and_add_subject(subject_list, row, year, sem):
     if "EXIT POINT" in code.upper() or "PREREQUISITE" in code.upper(): return
     if len(title) < 4: return
 
-    # Units extraction
+    # Units extraction - preserve separate LEC and LAB hours
     try:
         lec = 0.0
         lab = 0.0
@@ -173,6 +173,8 @@ def parse_and_add_subject(subject_list, row, year, sem):
         else:
              units = int(lec + lab)
     except:
+        lec = 0.0
+        lab = 0.0
         units = 0
         
     prereq = row[4].replace('\n', ' ').strip() if len(row) > 4 else ""
@@ -183,6 +185,8 @@ def parse_and_add_subject(subject_list, row, year, sem):
         "code": code.upper(),
         "description": title.replace('\n', ' ').strip(),
         "units": units,
+        "lec_hours": int(lec),
+        "lab_hours": int(lab),
         "is_exit_point": False,
         "prerequisite": prereq
     })
@@ -233,13 +237,80 @@ def save_curriculum(course_id: int):
                 code=item.get('code'),
                 description=item.get('description'),
                 units=item.get('units', 0),
+                lec_hours=item.get('lec_hours', 0),
+                lab_hours=item.get('lab_hours', 0),
                 prerequisite=item.get('prerequisite'),
                 is_exit_point=item.get('is_exit_point', False),
                 extra_info=item.get('extra_info')
             )
             session.add(subject)
+        
+        # --- Auto-sync to subjects table ---
+        subjects_created = 0
+        subjects_updated = 0
+        for item in payload:
+            if item.get('is_exit_point'):
+                continue
+            
+            code = item.get('code', '').strip().upper()
+            description = item.get('description', '').strip()
+            year_level = item.get('year_level')
+            semester = item.get('semester')
+            lec_hours = item.get('lec_hours', 0)
+            lab_hours = item.get('lab_hours', 0)
+            total_units = item.get('units', 0)
+            
+            if not code or not description:
+                continue
+            
+            # Skip summer subjects (semester 3) since scheduling only supports sem 1 & 2
+            if semester not in (1, 2):
+                continue
+            
+            # Determine which subject entries to create based on PDF's LEC/LAB columns
+            entries_to_sync = []
+            if lec_hours > 0:
+                entries_to_sync.append(("LEC", lec_hours))
+            if lab_hours > 0:
+                entries_to_sync.append(("LAB", lab_hours))
+            # Fallback: if both are 0 but total units exist, create a LEC entry
+            if not entries_to_sync and total_units > 0:
+                entries_to_sync.append(("LEC", total_units))
+            
+            for subj_type, units in entries_to_sync:
+                existing = session.query(models.Subject).filter(
+                    models.Subject.code == code,
+                    models.Subject.type == subj_type,
+                    models.Subject.course_id == course_id,
+                    models.Subject.year_level == year_level,
+                    models.Subject.semester == semester
+                ).first()
+                
+                if existing:
+                    existing.description = description
+                    existing.unit = units
+                    subjects_updated += 1
+                else:
+                    new_subject = models.Subject(
+                        code=code,
+                        description=description,
+                        type=subj_type,
+                        unit=units,
+                        course_id=course_id,
+                        year_level=year_level,
+                        semester=semester,
+                        is_major=None
+                    )
+                    session.add(new_subject)
+                    subjects_created += 1
+        
         session.commit()
-        return jsonify({"detail": "Saved successfully", "count": len(payload)}), 201
+        return jsonify({
+            "detail": "Saved successfully",
+            "count": len(payload),
+            "subjects_created": subjects_created,
+            "subjects_updated": subjects_updated
+        }), 201
     except SQLAlchemyError as e:
         session.rollback()
         return jsonify({"detail": str(e)}), 500
@@ -267,6 +338,8 @@ def get_curriculum(course_id: int):
                 "code": s.code,
                 "description": s.description,
                 "units": s.units,
+                "lec_hours": s.lec_hours if hasattr(s, 'lec_hours') else 0,
+                "lab_hours": s.lab_hours if hasattr(s, 'lab_hours') else 0,
                 "prerequisite": s.prerequisite,
                 "is_exit_point": s.is_exit_point,
                 "extra_info": s.extra_info
