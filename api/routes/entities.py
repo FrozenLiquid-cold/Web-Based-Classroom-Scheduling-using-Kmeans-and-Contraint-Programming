@@ -716,11 +716,36 @@ def delete_day(day_id: int):
 # ---------------------------------------------------------------------------
 # Subject routes
 # ---------------------------------------------------------------------------
+
+def _serialize_subject(subject):
+    """Serialize a Subject model to dict including preferred_room_ids."""
+    data = _serialize(subject, schemas.SubjectResponse)
+    data["preferred_room_ids"] = [
+        pref.room_id for pref in (subject.preferred_rooms or [])
+    ]
+    return data
+
+
+def _sync_subject_room_prefs(db, subject_id, room_ids):
+    """Replace all room preferences for a subject with the given room_ids."""
+    # Delete existing preferences
+    db.query(models.SubjectRoomPreference).filter(
+        models.SubjectRoomPreference.subject_id == subject_id
+    ).delete()
+    # Insert new ones
+    if room_ids:
+        for rid in room_ids:
+            db.add(models.SubjectRoomPreference(
+                subject_id=subject_id,
+                room_id=rid,
+            ))
+
+
 @entities_bp.route("/subjects", methods=["GET"])
 def list_subjects():
     with _get_session() as db:
         subjects = db.query(models.Subject).all()
-        return jsonify(_serialize_list(subjects, schemas.SubjectResponse))
+        return jsonify([_serialize_subject(s) for s in subjects])
 
 
 @entities_bp.route("/subjects", methods=["POST"])
@@ -744,11 +769,19 @@ def create_subject():
         return jsonify({"detail": "semester must be 1 or 2"}), 400
 
     with _get_session() as db:
-        db_subject = models.Subject(**subject.model_dump())
+        # Separate preferred_room_ids from core subject fields
+        subject_data = subject.model_dump(exclude={"preferred_room_ids"})
+        db_subject = models.Subject(**subject_data)
         db.add(db_subject)
+        db.flush()  # Get the ID before adding preferences
+
+        # Save room preferences
+        if subject.preferred_room_ids:
+            _sync_subject_room_prefs(db, db_subject.id, subject.preferred_room_ids)
+
         db.commit()
         db.refresh(db_subject)
-        return jsonify(_serialize(db_subject, schemas.SubjectResponse)), 201
+        return jsonify(_serialize_subject(db_subject)), 201
 
 
 @entities_bp.route("/subjects/<int:subject_id>", methods=["GET"])
@@ -757,7 +790,7 @@ def get_subject(subject_id: int):
         subject = db.query(models.Subject).filter(models.Subject.id == subject_id).first()
         if not subject:
             return jsonify({"detail": "Subject not found"}), 404
-        return jsonify(_serialize(subject, schemas.SubjectResponse))
+        return jsonify(_serialize_subject(subject))
 
 
 @entities_bp.route("/subjects/<int:subject_id>", methods=["PUT"])
@@ -777,7 +810,10 @@ def update_subject(subject_id: int):
         if not subject:
             return jsonify({"detail": "Subject not found"}), 404
 
-        for key, value in subject_update.model_dump(exclude_unset=True).items():
+        update_data = subject_update.model_dump(exclude_unset=True)
+        room_ids = update_data.pop("preferred_room_ids", None)
+
+        for key, value in update_data.items():
             if key == "type" and value not in {"LEC", "LAB"}:
                 return jsonify({"detail": "Type must be 'LEC' or 'LAB'"}), 400
             if key == "year_level" and value is not None and value not in {1, 2, 3, 4}:
@@ -786,9 +822,13 @@ def update_subject(subject_id: int):
                 return jsonify({"detail": "semester must be 1 or 2"}), 400
             setattr(subject, key, value)
 
+        # Sync room preferences if provided
+        if room_ids is not None:
+            _sync_subject_room_prefs(db, subject_id, room_ids)
+
         db.commit()
         db.refresh(subject)
-        return jsonify(_serialize(subject, schemas.SubjectResponse))
+        return jsonify(_serialize_subject(subject))
 
 
 @entities_bp.route("/subjects/<int:subject_id>", methods=["DELETE"])
@@ -804,6 +844,56 @@ def delete_subject(subject_id: int):
         db.delete(subject)
         db.commit()
         return "", 204
+
+
+@entities_bp.route("/subjects/merge", methods=["POST"])
+def merge_subjects():
+    payload = request.get_json(force=True) or {}
+    try:
+        merge_data = schemas.SubjectMerge(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    if merge_data.source_id == merge_data.target_id:
+        return jsonify({"detail": "Source and target subjects must be different"}), 400
+
+    with _get_session() as db:
+        source_subject = db.query(models.Subject).filter(models.Subject.id == merge_data.source_id).first()
+        target_subject = db.query(models.Subject).filter(models.Subject.id == merge_data.target_id).first()
+
+        if not source_subject:
+            return jsonify({"detail": "Source subject not found"}), 404
+        if not target_subject:
+            return jsonify({"detail": "Target subject not found"}), 404
+
+        # Find all schedules referencing the source subject
+        schedules = db.query(models.Schedule).filter(models.Schedule.subject_id == merge_data.source_id).all()
+        moved_count = 0
+        skipped_count = 0
+
+        for sched in schedules:
+            # Check for unique constraint violation (room, day, time, year, semester)
+            # if we just blindly change the subject_id, we might hit a unique constraint
+            # Actually, the unique constraint is on (room_id, day_id, time, year, semester)
+            # changing subject_id DOES NOT violate this constraint.
+            # BUT it could violate instructor double-booking.
+            # Wait, the unique constraint doesn't involve subject_id at all.
+            # uq_room_time: ("room_id", "day_id", "time", "year", "semester")
+            # uq_instructor_time: ("instructor_id", "day_id", "time", "year", "semester")
+            # So changing subject_id is perfectly safe from a DB constraint perspective.
+            
+            sched.subject_id = target_subject.id
+            moved_count += 1
+
+        db.delete(source_subject)
+        db.commit()
+
+        return jsonify({
+            "detail": "Merge successful",
+            "schedules_moved": moved_count,
+            "deleted_subject_code": source_subject.code,
+            "target_subject_code": target_subject.code
+        }), 200
 
 
 # ---------------------------------------------------------------------------

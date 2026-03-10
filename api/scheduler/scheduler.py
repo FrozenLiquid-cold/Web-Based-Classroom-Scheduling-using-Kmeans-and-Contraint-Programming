@@ -874,22 +874,31 @@ def get_suggestions(
     rooms = db.query(models.Room).filter(models.Room.is_available == True).all()
     days = db.query(models.Day).all()
     
-    # Restrict GYM and QUAD to PE subjects only
+    # Apply subject-specific room preferences from DB (replaces hardcoded PE/GYM/QUAD logic)
     subject_obj = db.query(models.Subject).get(subject_id)
-    if subject_obj:
-        subj_code = (subject_obj.code or "").upper().strip()
-        if not subj_code.startswith("PE"):
-            # Filter out GYM and QUAD for non-PE subjects
-            rooms = [
-                r for r in rooms
-                if "GYM" not in (r.name or "").upper() and "QUAD" not in (r.name or "").upper()
-            ]
-        else:
-            # If it IS PE, it can ONLY use GYM and QUAD rooms
-            rooms = [
-                r for r in rooms
-                if "GYM" in (r.name or "").upper() or "QUAD" in (r.name or "").upper()
-            ]
+    preferred_ids = set()
+    if subject_obj and subject_obj.preferred_rooms:
+        preferred_ids = {pref.room_id for pref in subject_obj.preferred_rooms}
+    elif subject_obj and subject_obj.code:
+        # Inherit preferences from another subject with the same code
+        code_upper = subject_obj.code.strip().upper()
+        same_code_subjects = db.query(models.Subject).filter(
+            models.Subject.code.ilike(code_upper)
+        ).all()
+        for scs in same_code_subjects:
+            if scs.preferred_rooms:
+                preferred_ids = {pref.room_id for pref in scs.preferred_rooms}
+                break
+    if preferred_ids:
+        rooms = [r for r in rooms if r.id in preferred_ids]
+    else:
+        # Exclude rooms that are claimed as preferred by OTHER subjects (exclusive reservation)
+        all_claimed = set()
+        all_prefs = db.query(models.SubjectRoomPreference).all()
+        for p in all_prefs:
+            all_claimed.add(p.room_id)
+        if all_claimed:
+            rooms = [r for r in rooms if r.id not in all_claimed]
     
     # College-based room filtering: only use rooms from the subject's college
     subject_obj = db.query(models.Subject).get(subject_id)
@@ -1137,7 +1146,24 @@ def check_resource_availability(
              subject = db.query(models.Subject).get(subject_id)
              if subject:
                  subject_code = subject.code.strip().upper() if subject.code else ""
-                 is_shared_subj = getattr(subject, 'is_block_shared', False) or subject_code.startswith("NSTP") or subject_code.startswith("PE")
+                 # Only NSTP subjects default to shared-building rooms. PE subjects
+                 # use DB room preferences (preferred_rooms relationship).
+                 is_nstp_subj = getattr(subject, 'is_block_shared', False) or subject_code.startswith("NSTP")
+                 
+                 # Check if subject has explicit room preferences configured
+                 # Also inherit from same-code subjects if this subject ID doesn't have direct prefs
+                 subject_pref_room_ids = set()
+                 if hasattr(subject, 'preferred_rooms') and subject.preferred_rooms:
+                     subject_pref_room_ids = {pref.room_id for pref in subject.preferred_rooms}
+                 elif subject_code:
+                     same_code_subs = db.query(models.Subject).filter(
+                         models.Subject.code.ilike(subject_code)
+                     ).all()
+                     for scs in same_code_subs:
+                         if hasattr(scs, 'preferred_rooms') and scs.preferred_rooms:
+                             subject_pref_room_ids = {pref.room_id for pref in scs.preferred_rooms}
+                             break
+                 
                  # Find rooms in shared buildings
                  shared_room_ids = set()
                  for r in all_rooms:
@@ -1146,36 +1172,25 @@ def check_resource_availability(
                          if bldg and bldg.is_shared:
                              shared_room_ids.add(r.id)
                  
-                 if shared_room_ids:
-                     if is_shared_subj:
-                         # Shared subjects MUST use shared building rooms OR specific designated rooms.
-                         if subject_code.startswith("PE"):
-                             # PE is strictly restricted to GYM or QUAD rooms
-                             pe_rooms = []
-                             for r in all_rooms:
-                                 r_name = (r.name or "").upper()
-                                 if ("GYM" in r_name or "QUAD" in r_name) and r.id in avail_rooms:
-                                     pe_rooms.append(r.id)
-                             avail_rooms = pe_rooms
-                         else:
-                             # Ordinary shared subjects (like NSTP) use shared building rooms.
-                             avail_shared = [rid for rid in avail_rooms if rid in shared_room_ids]
-                             if avail_shared:
-                                 avail_rooms = avail_shared
-                             else:
-                                 avail_rooms = []
+                 if subject_pref_room_ids:
+                     # Subject has explicit room preferences — use them regardless
+                     avail_rooms = [rid for rid in avail_rooms if rid in subject_pref_room_ids]
+                 elif is_nstp_subj and shared_room_ids:
+                     # NSTP subjects without explicit prefs — use shared building rooms
+                     avail_shared = [rid for rid in avail_rooms if rid in shared_room_ids]
+                     if avail_shared:
+                         avail_rooms = avail_shared
                      else:
-                         # Non-shared subjects cannot use shared building rooms
-                         avail_rooms = [rid for rid in avail_rooms if rid not in shared_room_ids]
-                         
-                     # Strip out GYM/QUAD rooms for all non-PE subjects
-                     if not subject_code.startswith("PE"):
-                         non_pe_rooms = []
-                         for r in all_rooms:
-                             r_name = (r.name or "").upper()
-                             if "GYM" not in r_name and "QUAD" not in r_name and r.id in avail_rooms:
-                                 non_pe_rooms.append(r.id)
-                         avail_rooms = non_pe_rooms
+                         avail_rooms = []
+                 else:
+                     # All other subjects — shared-building rooms are available to all.
+                     # Only exclude rooms claimed as preferred by other subjects.
+                     all_claimed_ids = set()
+                     all_srp = db.query(models.SubjectRoomPreference).all()
+                     for _p in all_srp:
+                         all_claimed_ids.add(_p.room_id)
+                     if all_claimed_ids:
+                         avail_rooms = [rid for rid in avail_rooms if rid not in all_claimed_ids]
              _subj_college_id = None
              if subject.course_id:
                  _course = db.query(models.Course).filter(models.Course.id == subject.course_id).first()

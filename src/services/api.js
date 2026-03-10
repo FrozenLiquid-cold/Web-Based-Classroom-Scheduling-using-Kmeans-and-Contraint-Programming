@@ -130,6 +130,13 @@ export async function update(entity, id, data) {
   })
 }
 
+export async function mergeSubjects(sourceId, targetId) {
+  return apiCall(`/subjects/merge`, {
+    method: 'POST',
+    body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
+  })
+}
+
 export async function remove(entity, id) {
   const backendEntity = ENTITY_MAP[entity] || entity
   return apiCall(`/${backendEntity}/${id}`, { method: 'DELETE' })

@@ -106,6 +106,7 @@ class Subject(Base):
     
     course = relationship("Course")
     schedules = relationship("Schedule", back_populates="subject")
+    preferred_rooms = relationship("SubjectRoomPreference", back_populates="subject", cascade="all, delete-orphan")
 
 
 class Room(Base):
@@ -310,4 +311,24 @@ class CurriculumSubject(Base):
     
     # Establish relationship to Course if needed, though mostly used for filtering
     course = relationship("Course")
+
+
+class SubjectRoomPreference(Base):
+    """
+    Join table: which rooms a subject is allowed to use.
+    When a subject has entries here, the scheduler restricts it to ONLY these rooms.
+    When empty, the scheduler falls back to type-based room matching.
+    """
+    __tablename__ = "subject_room_preferences"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
+    room_id = Column(Integer, ForeignKey("rooms.id", ondelete="CASCADE"), nullable=False)
+
+    subject = relationship("Subject", back_populates="preferred_rooms")
+    room = relationship("Room")
+
+    __table_args__ = (
+        UniqueConstraint('subject_id', 'room_id', name='uq_subject_room_pref'),
+    )
 

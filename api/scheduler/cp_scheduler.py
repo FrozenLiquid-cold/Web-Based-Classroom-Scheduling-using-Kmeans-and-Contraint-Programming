@@ -1164,6 +1164,8 @@ def build_eligibility_maps(
     # ---------------------------------------------------------
     room_to_college_id: Dict[int, Optional[int]] = {}  # room.id → college_id (None if unassigned)
     _shared_room_ids: set = set()
+    # Pre-load subject room preferences from DB (replaces hardcoded PE/GYM/QUAD logic)
+    _subject_pref_room_ids: Dict[int, Set[int]] = {}  # subject_id → set of preferred room_ids
     if db:
         _building_cache: Dict[int, models.Building] = {}
         for _r in rooms:
@@ -1175,6 +1177,33 @@ def build_eligibility_maps(
                     room_to_college_id[_r.id] = getattr(_bldg, 'college_id', None)
                     if _bldg.is_shared:
                         _shared_room_ids.add(_r.id)
+        # Load preferred rooms for ALL subjects from DB (not just current batch)
+        # This ensures block-cloned subjects inherit preferences even if their
+        # original isn't in the current scheduling batch.
+        if db:
+            all_prefs = db.query(models.SubjectRoomPreference).all()
+            for p in all_prefs:
+                _subject_pref_room_ids.setdefault(p.subject_id, set()).add(p.room_id)
+            # For subjects in this batch that aren't in _subject_pref_room_ids,
+            # try to inherit from a subject with the same code that HAS preferences
+            _code_to_pref: dict = {}
+            for sid, pref_set in _subject_pref_room_ids.items():
+                subj = db.query(models.Subject).get(sid)
+                if subj and subj.code:
+                    _code_to_pref[subj.code.strip().upper()] = pref_set
+            for s in subjects:
+                if s.id not in _subject_pref_room_ids and s.code:
+                    code_key = s.code.strip().upper()
+                    if code_key in _code_to_pref:
+                        _subject_pref_room_ids[s.id] = _code_to_pref[code_key]
+    # Compute set of all "claimed" room IDs from the ENTIRE database — rooms that are
+    # the exclusive preference of ANY subject (even subjects not in this batch).
+    # This ensures e.g. FIELD stays reserved for NSTP even when scheduling a different course.
+    _all_claimed_room_ids: Set[int] = set()
+    if db:
+        all_db_prefs = db.query(models.SubjectRoomPreference).all()
+        for p in all_db_prefs:
+            _all_claimed_room_ids.add(p.room_id)
 
     # ---------------------------------------------------------
     # Build eligibility PER SUBJECT
@@ -1253,52 +1282,25 @@ def build_eligibility_maps(
                 # If room_college is None (building not assigned to any college), allow it (graceful fallback)
                 all_valid_rooms.append(room.id)
 
-        # CRITICAL: Exclude shared-building rooms AND PE-exclusive rooms for non-shared/non-PE subjects
-        if not _is_shared_subject(subject) or ("PE" not in subj_code and "NSTP" not in subj_code):
-            # 1. Filter out shared building rooms (like FIELD)
+        # Room restriction logic: use DB-configured preferred rooms if available,
+        # otherwise fall back to shared-building / non-shared building filtering.
+        subj_pref_ids = _subject_pref_room_ids.get(sid, set())
+        if subj_pref_ids:
+            # Subject has explicit room preferences configured — restrict to those rooms only
+            all_valid_rooms = [rid for rid in all_valid_rooms if rid in subj_pref_ids]
+            subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid in subj_pref_ids]
+        elif _is_nstp_only_subject(subject):
+            # NSTP subjects without explicit prefs — use shared building rooms (FIELD)
             if _shared_room_ids:
-                all_valid_rooms = [rid for rid in all_valid_rooms if rid not in _shared_room_ids]
-                subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in _shared_room_ids]
-            
-            # 2. Filter out PE-exclusive rooms (GYM, QUAD) for all non-PE subjects
-            if "PE" not in subj_code:
-                non_pe_valid_rooms = []
-                for rid in all_valid_rooms:
-                    r_obj = next((r for r in rooms if r.id == rid), None)
-                    if r_obj:
-                        r_name = (r_obj.name or "").upper()
-                        if "GYM" not in r_name and "QUAD" not in r_name:
-                            non_pe_valid_rooms.append(rid)
-                all_valid_rooms = non_pe_valid_rooms
-                
-                non_pe_preferred = []
-                for rid in subject_to_preferred_rooms[sid]:
-                    r_obj = next((r for r in rooms if r.id == rid), None)
-                    if r_obj:
-                        r_name = (r_obj.name or "").upper()
-                        if "GYM" not in r_name and "QUAD" not in r_name:
-                            non_pe_preferred.append(rid)
-                subject_to_preferred_rooms[sid] = non_pe_preferred
+                shared_valid = [rid for rid in all_valid_rooms if rid in _shared_room_ids]
+                if shared_valid:
+                    all_valid_rooms = shared_valid
         else:
-            # If it IS a shared subject, and specifically PE, enforce strict room restrictions
-            if "PE" in subj_code:
-                pe_valid_rooms = []
-                for room in rooms:
-                    if room.id in all_valid_rooms:
-                        room_name = (room.name or "").upper()
-                        if "GYM" in room_name or "QUAD" in room_name:
-                            pe_valid_rooms.append(room.id)
-                all_valid_rooms = pe_valid_rooms
-                
-                # Also restrict preferred rooms for PE
-                pe_preferred = []
-                for rid in subject_to_preferred_rooms[sid]:
-                    r_obj = next((r for r in rooms if r.id == rid), None)
-                    if r_obj:
-                        r_name = (r_obj.name or "").upper()
-                        if "GYM" in r_name or "QUAD" in r_name:
-                            pe_preferred.append(rid)
-                subject_to_preferred_rooms[sid] = pe_preferred
+            # All other subjects without explicit prefs — only exclude rooms claimed by other subjects.
+            # Shared-building rooms (GS ER 1-8 etc.) are available to all colleges.
+            if _all_claimed_room_ids:
+                all_valid_rooms = [rid for rid in all_valid_rooms if rid not in _all_claimed_room_ids]
+                subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in _all_claimed_room_ids]
         
         # Also apply college filtering to preferred rooms
         if subj_college is not None:
@@ -1313,13 +1315,15 @@ def build_eligibility_maps(
         if not all_valid_rooms:
             if preferred_rooms:
                  all_valid_rooms = list(preferred_rooms)
+            elif subj_pref_ids:
+                 # Use explicitly configured rooms as last resort
+                 all_valid_rooms = list(subj_pref_ids)
             else:
-                 # Last resort: all rooms except shared-building rooms AND PE-exclusive rooms, still respecting college filter
+                 # Last resort: all rooms except claimed rooms, still respecting college filter
                  all_valid_rooms = [
                      r.id for r in rooms
-                     if r.id not in _shared_room_ids
+                     if r.id not in _all_claimed_room_ids
                      and (subj_college is None or room_to_college_id.get(r.id) is None or room_to_college_id.get(r.id) == subj_college)
-                     and ("PE" in subj_code or ("GYM" not in (r.name or "").upper() and "QUAD" not in (r.name or "").upper()))
                  ]
 
         subject_to_all_rooms[sid] = all_valid_rooms
@@ -2011,17 +2015,18 @@ def _cp_retry_mini_model(
         if not eligible_rooms:
             eligible_rooms = course_to_rooms.get(subject.id, []) or []
 
-        # CRITICAL: Exclude shared-building rooms for non-shared subjects in retry pass
-        # Shared buildings are reserved exclusively for block-shared subjects
-        if not _is_shared_subject(subject):
-            _retry_shared_ids = set()
-            for _r in rooms:
-                if _r.building_id:
-                    _bldg = db.query(models.Building).get(_r.building_id)
-                    if _bldg and _bldg.is_shared:
-                        _retry_shared_ids.add(_r.id)
-            if _retry_shared_ids:
-                eligible_rooms = [rid for rid in eligible_rooms if rid not in _retry_shared_ids]
+        # Exclude rooms claimed as preferred by other subjects (exclusive reservation)
+        # Shared-building rooms are available to all — do NOT exclude them
+        if not _is_nstp_only_subject(subject):
+            _subj_pref_ids = set()
+            if hasattr(subject, 'preferred_rooms') and subject.preferred_rooms:
+                _subj_pref_ids = {p.room_id for p in subject.preferred_rooms}
+            if not _subj_pref_ids and db:
+                _all_claimed = set()
+                for _p in db.query(models.SubjectRoomPreference).all():
+                    _all_claimed.add(_p.room_id)
+                if _all_claimed:
+                    eligible_rooms = [rid for rid in eligible_rooms if rid not in _all_claimed]
 
         stats["eligible_instrs"] = len(eligible_instrs)
         stats["eligible_rooms"] = len(eligible_rooms)
@@ -3736,6 +3741,18 @@ def run_cp_scheduler(
     room_id_to_name = {room.id: room.name for room in rooms}
     room_by_id = {room.id: room for room in rooms}
     
+    # Pre-load building distances and room-to-building mapping for proximity enforcement
+    _bldg_dist_map: Dict[Tuple[int, int], int] = {}  # (from_bldg_id, to_bldg_id) -> travel_time_minutes
+    _room_to_bldg_id: Dict[int, int] = {}  # room_id -> building_id
+    if db:
+        for bd in db.query(models.BuildingDistance).all():
+            _bldg_dist_map[(bd.from_building_id, bd.to_building_id)] = bd.travel_time_minutes
+            _bldg_dist_map[(bd.to_building_id, bd.from_building_id)] = bd.travel_time_minutes  # symmetric
+        for r in rooms:
+            if r.building_id:
+                _room_to_bldg_id[r.id] = r.building_id
+    logger.info(f"Loaded {len(_bldg_dist_map)//2} building distance pairs, {len(_room_to_bldg_id)} room-to-building mappings")
+    
     # Build instructor preferences lookup (time preferences and unit limits)
     instructor_prefs = {}
     for inst in instructors:
@@ -4299,6 +4316,11 @@ def run_cp_scheduler(
         soft_room_penalties = []
         SOFT_ROOM_PENALTY_WEIGHT = 50
         
+        # Distance-based room penalties: penalize rooms far from subject's college building
+        # Each entry is (presence_var, travel_time_penalty)
+        distance_penalties: List[Tuple[Any, int]] = []
+        DISTANCE_PENALTY_WEIGHT = 10  # Multiplied by travel_time_minutes
+        
         # Global limit: maximum variables per subject to prevent memory explosion
         # ADAPTIVE: Increases when resources are heavily utilized (80%+) for better solutions
         MAX_VARIABLES_PER_SUBJECT = ADAPTIVE_MAX_VARS_PER_SUBJECT
@@ -4334,9 +4356,20 @@ def run_cp_scheduler(
             if not isinstance(eligible_instrs, list):
                 eligible_instrs = list(eligible_instrs) if eligible_instrs else []
             
-            # Filter out shared-building rooms for non-shared subjects
-            if _solver_shared_room_ids and not _is_shared_subject(subject):
-                eligible_rooms = [rid for rid in eligible_rooms if rid not in _solver_shared_room_ids]
+            # NOTE: Shared-building rooms are available to all colleges (not excluded).
+            # Claimed rooms (via subject_room_preferences) are already excluded by build_eligibility_maps.
+            
+            # Compute subject's college building ID for proximity sorting/penalties
+            _subj_bldg_id = None
+            if subject.course_id and db:
+                _c = db.query(models.Course).get(subject.course_id)
+                if _c and _c.college_id:
+                    _college_bldgs = db.query(models.Building).filter(
+                        models.Building.college_id == _c.college_id
+                    ).all()
+                    if _college_bldgs:
+                        _subj_bldg_id = _college_bldgs[0].id
+            PROXIMITY_THRESHOLD_MIN = 15
             
             # DEBUG: Log actual lists to verify subject_id lookup is working
             logger.debug(
@@ -4409,18 +4442,43 @@ def run_cp_scheduler(
                 
                 if _subj_college_id is not None:
                     # Only use rooms from the same college or rooms with no college assigned
-                    # Also exclude PE-exclusive rooms (GYM/QUAD) for non-PE subjects
-                    eligible_rooms = [
-                        room.id for room in rooms
-                        if (_room_college_map.get(room.id) is None or _room_college_map.get(room.id) == _subj_college_id)
-                        and (code.upper().startswith("PE") or ("GYM" not in (room.name or "").upper() and "QUAD" not in (room.name or "").upper()))
-                    ]
+                    # If subject has explicit DB room preferences, restrict to those
+                    _db_pref_ids = set()
+                    if db:
+                        _prefs = db.query(models.SubjectRoomPreference).filter(
+                            models.SubjectRoomPreference.subject_id == subject_id
+                        ).all()
+                        _db_pref_ids = {p.room_id for p in _prefs}
+                    if _db_pref_ids:
+                        eligible_rooms = [room.id for room in rooms if room.id in _db_pref_ids]
+                    else:
+                        # Exclude rooms claimed by other subjects
+                        _all_claimed = set()
+                        if db:
+                            for _p in db.query(models.SubjectRoomPreference).all():
+                                _all_claimed.add(_p.room_id)
+                        eligible_rooms = [
+                            room.id for room in rooms
+                            if (_room_college_map.get(room.id) is None or _room_college_map.get(room.id) == _subj_college_id)
+                            and room.id not in _all_claimed
+                        ]
                     logger.warning(f"  - Fallback: using {len(eligible_rooms)} rooms (college-filtered, college_id={_subj_college_id})")
                 else:
-                    eligible_rooms = [
-                        room.id for room in rooms
-                        if code.upper().startswith("PE") or ("GYM" not in (room.name or "").upper() and "QUAD" not in (room.name or "").upper())
-                    ]
+                    _db_pref_ids = set()
+                    if db:
+                        _prefs = db.query(models.SubjectRoomPreference).filter(
+                            models.SubjectRoomPreference.subject_id == subject_id
+                        ).all()
+                        _db_pref_ids = {p.room_id for p in _prefs}
+                    if _db_pref_ids:
+                        eligible_rooms = [room.id for room in rooms if room.id in _db_pref_ids]
+                    else:
+                        # Exclude rooms claimed by other subjects
+                        _all_claimed = set()
+                        if db:
+                            for _p in db.query(models.SubjectRoomPreference).all():
+                                _all_claimed.add(_p.room_id)
+                        eligible_rooms = [room.id for room in rooms if room.id not in _all_claimed]
                     logger.warning(f"  - Fallback: using all {len(eligible_rooms)} rooms (no college context)")
                 subjects_without_options.append((code, "no eligible rooms (used fallback)"))
             
@@ -4692,8 +4750,23 @@ def run_cp_scheduler(
                 
                 # Cap rooms and instructors to prevent exponential explosion
                 if len(compatible_rooms) > MAX_ROOMS_PER_OPTION:
-                    # Prioritize rooms by capacity (prefer larger rooms for flexibility)
-                    compatible_rooms.sort(key=lambda r: room_by_id.get(r[0], type('obj', (object,), {'capacity': 0})).capacity or 0, reverse=True)
+                    # Prioritize rooms by proximity to the subject's college building,
+                    # then by capacity as a tiebreaker. This biases the solver toward
+                    # assigning rooms in nearby buildings (minimizing travel time).
+                    def _room_proximity_sort_key(r_tuple):
+                        rid = r_tuple[0]
+                        r_bldg = _room_to_bldg_id.get(rid)
+                        # Same building as subject's college = 0 travel time
+                        if r_bldg and _subj_bldg_id and r_bldg == _subj_bldg_id:
+                            travel = 0
+                        elif r_bldg and _subj_bldg_id:
+                            travel = _bldg_dist_map.get((r_bldg, _subj_bldg_id), 9999)
+                        else:
+                            travel = 500  # Unknown building, sort after known ones
+                        capacity = room_by_id.get(rid, type('obj', (object,), {'capacity': 0})).capacity or 0
+                        return (travel, -capacity)  # Lower travel first, then higher capacity
+                    
+                    compatible_rooms.sort(key=_room_proximity_sort_key)
                     compatible_rooms = compatible_rooms[:MAX_ROOMS_PER_OPTION]
                 
                 if len(compatible_instructors) > MAX_INSTRUCTORS_PER_OPTION:
@@ -4758,6 +4831,17 @@ def run_cp_scheduler(
                         # Only apply penalty if we HAVE preferred rooms defined (otherwise all are equal)
                         if preferred_rooms_set and room_id not in preferred_rooms_set:
                             soft_room_penalties.append(presence)
+                        
+                        # Distance-based penalty: penalize rooms far from subject's college building
+                        if _room_to_bldg_id and _bldg_dist_map:
+                            _r_bldg = _room_to_bldg_id.get(room_id)
+                            if _r_bldg and _subj_bldg_id:
+                                if _r_bldg == _subj_bldg_id:
+                                    _travel = 0
+                                else:
+                                    _travel = _bldg_dist_map.get((_r_bldg, _subj_bldg_id), 0)
+                                if _travel > PROXIMITY_THRESHOLD_MIN:
+                                    distance_penalties.append((presence, _travel))
 
                         # CRITICAL: Create separate interval for EACH day in day_ids
                         # MW options create 2 intervals (Monday + Wednesday)
@@ -4989,7 +5073,7 @@ def run_cp_scheduler(
             logger.warning("Cluster %s: %d subjects, %d codes with instructors, %d codes with rooms, "
                           "%d days, %d total slots", 
                           cluster_id, len(cluster_subjects),
-                          len(course_to_instructors), len(course_to_rooms),
+                          len(course_to_instructors), len(course_to_all_rooms),
                           len(days), sum(len(slots) for slots in slots_by_day.values()))
             continue
         
@@ -5745,6 +5829,19 @@ def run_cp_scheduler(
             )
             model.Add(total_soft_room_penalty == sum(v * SOFT_ROOM_PENALTY_WEIGHT for v in soft_room_penalties))
             penalty_exprs.append(total_soft_room_penalty)
+        
+        # Add distance-based penalties: rooms far from subject's college building
+        if distance_penalties:
+            total_distance_penalty = model.NewIntVar(
+                0,
+                sum(t * DISTANCE_PENALTY_WEIGHT for _, t in distance_penalties),
+                f"cluster_{cluster_id}_distance_total"
+            )
+            model.Add(total_distance_penalty == sum(
+                v * t * DISTANCE_PENALTY_WEIGHT for v, t in distance_penalties
+            ))
+            penalty_exprs.append(total_distance_penalty)
+            logger.info(f"[PROXIMITY] Added distance penalties for {len(distance_penalties)} room variables in cluster {cluster_id}")
 
         if distribution_penalty is not None:
             penalty_exprs.append(DAY_TARGET_PENALTY_WEIGHT * distribution_penalty)
@@ -7821,6 +7918,149 @@ def run_cp_scheduler(
         ]
     else:
         logger.info("[POST-PROCESS] No cross-block conflicts found")
+
+    # =========================================================================
+    # POST-SCHEDULING PROXIMITY PASS
+    # =========================================================================
+    # Scan consecutive classes in the same block+day and try to swap rooms
+    # when the travel time between buildings exceeds a threshold.
+    # =========================================================================
+    PROXIMITY_THRESHOLD_MIN = 15  # Maximum acceptable travel time in minutes
+    proximity_swaps = 0
+    proximity_violations = 0
+    
+    if _bldg_dist_map and _room_to_bldg_id:
+        # Group items by (block, day_id) — only within the same student block + day
+        from collections import defaultdict as _dd
+        block_day_groups: Dict[Tuple[Any, Any], list] = _dd(list)
+        for idx, item in enumerate(all_scheduled_items):
+            block_label = item.get("block")
+            day_id = item.get("day_id")
+            if block_label is not None and day_id is not None:
+                block_day_groups[(block_label, day_id)].append((idx, item))
+        
+        # Build a set of already-booked (room_id, day_id, start_min, end_min)
+        # for conflict checking when swapping
+        _booked_room_slots: Dict[Tuple[int, int], List[Tuple[int, int]]] = _dd(list)
+        for item in all_scheduled_items:
+            rid = item.get("room_id")
+            did = item.get("day_id")
+            s_min = item.get("start_min")
+            e_min = item.get("end_min")
+            if rid and did and s_min is not None and e_min is not None:
+                _booked_room_slots[(rid, did)].append((s_min, e_min))
+        
+        for (block_label, day_id), items_in_group in block_day_groups.items():
+            # Sort by start time to find consecutive classes
+            items_in_group.sort(key=lambda x: x[1].get("start_min", 0))
+            
+            for i in range(len(items_in_group) - 1):
+                idx1, item1 = items_in_group[i]
+                idx2, item2 = items_in_group[i + 1]
+                
+                rid1 = item1.get("room_id")
+                rid2 = item2.get("room_id")
+                if not rid1 or not rid2 or rid1 == rid2:
+                    continue
+                
+                bldg1 = _room_to_bldg_id.get(rid1)
+                bldg2 = _room_to_bldg_id.get(rid2)
+                if not bldg1 or not bldg2 or bldg1 == bldg2:
+                    continue  # Same building, no issue
+                
+                travel_time = _bldg_dist_map.get((bldg1, bldg2), 0)
+                if travel_time <= PROXIMITY_THRESHOLD_MIN:
+                    continue  # Acceptable travel time
+                
+                proximity_violations += 1
+                # Check gap between the two classes
+                end1 = item1.get("end_min", 0)
+                start2 = item2.get("start_min", 0)
+                gap_min = start2 - end1
+                
+                logger.warning(
+                    "[PROXIMITY] Block %s Day %s: %s (room=%s, bldg=%s, %s-%s) → %s (room=%s, bldg=%s, %s-%s) "
+                    "travel=%d min, gap=%d min",
+                    block_label, day_id,
+                    item1.get("subject_id"), rid1, bldg1,
+                    item1.get("start_min"), item1.get("end_min"),
+                    item2.get("subject_id"), rid2, bldg2,
+                    item2.get("start_min"), item2.get("end_min"),
+                    travel_time, gap_min
+                )
+                
+                # Try to swap the SECOND item's room to one closer to bldg1
+                # Find rooms in the same building as item1 (or closer building)
+                best_swap_rid = None
+                best_swap_travel = travel_time
+                
+                for candidate_rid, candidate_bldg in _room_to_bldg_id.items():
+                    if candidate_rid == rid2:
+                        continue
+                    # Check the room type matches
+                    candidate_room = room_by_id.get(candidate_rid)
+                    item2_room = room_by_id.get(rid2)
+                    if not candidate_room or not item2_room:
+                        continue
+                    if candidate_room.type != item2_room.type:
+                        continue
+                    # Check capacity
+                    if candidate_room.capacity and item2_room.capacity:
+                        # Don't downgrade capacity too much
+                        if candidate_room.capacity < (item2_room.capacity * 0.5):
+                            continue
+                    
+                    # Check travel time from bldg1 to candidate building
+                    candidate_travel = _bldg_dist_map.get((bldg1, candidate_bldg), 9999)
+                    if candidate_travel >= best_swap_travel:
+                        continue  # Not better
+                    
+                    # Check the candidate room is not booked at item2's time
+                    item2_start = item2.get("start_min", 0)
+                    item2_end = item2.get("end_min", 0)
+                    conflict = False
+                    for (bs, be) in _booked_room_slots.get((candidate_rid, day_id), []):
+                        if not (item2_end <= bs or be <= item2_start):
+                            conflict = True
+                            break
+                    if conflict:
+                        continue
+                    
+                    best_swap_rid = candidate_rid
+                    best_swap_travel = candidate_travel
+                
+                if best_swap_rid and best_swap_travel < travel_time:
+                    old_room_name = room_id_to_name.get(rid2, f"ID:{rid2}")
+                    new_room_name = room_id_to_name.get(best_swap_rid, f"ID:{best_swap_rid}")
+                    logger.info(
+                        "[PROXIMITY SWAP] Block %s Day %s: Swapped %s room from %s → %s "
+                        "(travel %d→%d min)",
+                        block_label, day_id, item2.get("subject_id"),
+                        old_room_name, new_room_name,
+                        travel_time, best_swap_travel
+                    )
+                    # Perform the swap
+                    # Update booked slots
+                    item2_start = item2.get("start_min", 0)
+                    item2_end = item2.get("end_min", 0)
+                    # Remove old booking
+                    old_slots = _booked_room_slots.get((rid2, day_id), [])
+                    _booked_room_slots[(rid2, day_id)] = [
+                        (s, e) for s, e in old_slots if not (s == item2_start and e == item2_end)
+                    ]
+                    # Add new booking
+                    _booked_room_slots[(best_swap_rid, day_id)].append((item2_start, item2_end))
+                    # Update the item
+                    all_scheduled_items[idx2]["room_id"] = best_swap_rid
+                    all_scheduled_items[idx2]["room"] = new_room_name
+                    proximity_swaps += 1
+        
+        logger.info(
+            "[PROXIMITY] Post-scheduling pass complete: %d violations found, %d rooms swapped",
+            proximity_violations, proximity_swaps
+        )
+    else:
+        logger.info("[PROXIMITY] No building distance data — skipping proximity pass")
 
     return all_scheduled_items, structured_diagnostics
 

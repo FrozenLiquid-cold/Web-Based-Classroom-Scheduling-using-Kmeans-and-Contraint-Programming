@@ -168,7 +168,7 @@ class SubjectCreate(BaseModel):
     is_major: Optional[bool] = None
     course_id: Optional[int] = None
     is_block_shared: Optional[bool] = False
-    # Note: block_id is no longer a subject property - it's selected during CP scheduling from time_blocks table
+    preferred_room_ids: Optional[List[int]] = None  # Rooms this subject is restricted to
 
 
 class SubjectUpdate(BaseModel):
@@ -181,7 +181,7 @@ class SubjectUpdate(BaseModel):
     is_major: Optional[bool] = None
     course_id: Optional[int] = None
     is_block_shared: Optional[bool] = None
-    # Note: block_id is no longer a subject property
+    preferred_room_ids: Optional[List[int]] = None  # Rooms this subject is restricted to
 
 
 class SubjectResponse(BaseModel):
@@ -195,10 +195,15 @@ class SubjectResponse(BaseModel):
     is_major: Optional[bool] = None
     course_id: Optional[int] = None
     is_block_shared: Optional[bool] = False
-    # Note: block_id is no longer a subject property - it's selected during CP scheduling
+    preferred_room_ids: Optional[List[int]] = None  # Rooms this subject is restricted to
 
     class Config:
         from_attributes = True
+
+
+class SubjectMerge(BaseModel):
+    source_id: int
+    target_id: int
 
 
 # Room schemas
