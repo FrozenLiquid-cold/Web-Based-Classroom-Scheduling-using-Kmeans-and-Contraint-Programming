@@ -1326,6 +1326,45 @@ def build_eligibility_maps(
                      and (subj_college is None or room_to_college_id.get(r.id) is None or room_to_college_id.get(r.id) == subj_college)
                  ]
 
+        # Distance-based room filtering: exclude far-away rooms from eligible list
+        # when closer same-type alternatives exist
+        if all_valid_rooms and db and subj_college is not None:
+            _elig_subj_bldg_id = None
+            # Find the building associated with this subject's college
+            for _b in db.query(models.Building).filter(models.Building.college_id == subj_college).all():
+                _elig_subj_bldg_id = _b.id
+                break
+            if _elig_subj_bldg_id:
+                _PROX_THRESHOLD = 15
+                _close = []
+                _far = []
+                for rid in all_valid_rooms:
+                    _rm = next((r for r in rooms if r.id == rid), None)
+                    r_bldg = _rm.building_id if _rm else None
+                    if r_bldg:
+                        if r_bldg == _elig_subj_bldg_id:
+                            _close.append(rid)
+                        else:
+                            _dist_rec = db.query(models.BuildingDistance).filter(
+                                ((models.BuildingDistance.from_building_id == r_bldg) &
+                                 (models.BuildingDistance.to_building_id == _elig_subj_bldg_id)) |
+                                ((models.BuildingDistance.from_building_id == _elig_subj_bldg_id) &
+                                 (models.BuildingDistance.to_building_id == r_bldg))
+                            ).first()
+                            _t = _dist_rec.travel_time_minutes if _dist_rec else 0
+                            if _t <= _PROX_THRESHOLD:
+                                _close.append(rid)
+                            else:
+                                _far.append(rid)
+                    else:
+                        _close.append(rid)
+                if _close and _far:
+                    logger.info(
+                        "[ELIGIBILITY PROXIMITY] Subject %s (ID:%d): Excluded %d far rooms (travel>%dmin), keeping %d close rooms",
+                        subj_code, sid, len(_far), _PROX_THRESHOLD, len(_close)
+                    )
+                    all_valid_rooms = _close
+
         subject_to_all_rooms[sid] = all_valid_rooms
 
     # ---------------------------------------------------------
@@ -2027,6 +2066,57 @@ def _cp_retry_mini_model(
                     _all_claimed.add(_p.room_id)
                 if _all_claimed:
                     eligible_rooms = [rid for rid in eligible_rooms if rid not in _all_claimed]
+
+        # Distance-based room filtering: exclude far-away rooms when closer alternatives exist
+        if eligible_rooms and db:
+            _retry_subj_bldg_id = None
+            if subject.course_id:
+                _rc = db.query(models.Course).get(subject.course_id)
+                if _rc and _rc.college_id:
+                    _rc_bldgs = db.query(models.Building).filter(
+                        models.Building.college_id == _rc.college_id
+                    ).all()
+                    if _rc_bldgs:
+                        _retry_subj_bldg_id = _rc_bldgs[0].id
+            
+            if _retry_subj_bldg_id:
+                # Compute travel time for each eligible room
+                _RETRY_PROXIMITY_THRESHOLD = 15
+                close_rooms = []
+                far_rooms = []
+                for rid in eligible_rooms:
+                    r_bldg = None
+                    _rm = db.query(models.Room).get(rid)
+                    if _rm and _rm.building_id:
+                        r_bldg = _rm.building_id
+                    if r_bldg:
+                        if r_bldg == _retry_subj_bldg_id:
+                            close_rooms.append(rid)
+                        else:
+                            # Look up ALL building distances from DB
+                            _bd = db.query(models.BuildingDistance).filter(
+                                ((models.BuildingDistance.from_building_id == r_bldg) &
+                                 (models.BuildingDistance.to_building_id == _retry_subj_bldg_id)) |
+                                ((models.BuildingDistance.from_building_id == _retry_subj_bldg_id) &
+                                 (models.BuildingDistance.to_building_id == r_bldg))
+                            ).first()
+                            travel = _bd.travel_time_minutes if _bd else 0
+                            if travel <= _RETRY_PROXIMITY_THRESHOLD:
+                                close_rooms.append(rid)
+                            else:
+                                far_rooms.append(rid)
+                    else:
+                        close_rooms.append(rid)  # Unknown building, keep
+                
+                if close_rooms:
+                    # Only use close rooms, drop far ones
+                    if far_rooms:
+                        logger.info(
+                            "[RETRY PROXIMITY] Subject %s: Filtered out %d far rooms, keeping %d close rooms",
+                            subj_code or subject.id, len(far_rooms), len(close_rooms)
+                        )
+                    eligible_rooms = close_rooms
+                # else: all rooms are far — keep them all as fallback
 
         stats["eligible_instrs"] = len(eligible_instrs)
         stats["eligible_rooms"] = len(eligible_rooms)
@@ -5846,10 +5936,16 @@ def run_cp_scheduler(
         if distribution_penalty is not None:
             penalty_exprs.append(DAY_TARGET_PENALTY_WEIGHT * distribution_penalty)
 
-        # Enforce Instructor Max Units
+        # Enforce Instructor Max Units (HARD CONSTRAINT)
+        # Uses DB max_units if set, otherwise derives from designation-based limit
         for inst_id, terms in instructor_unit_terms.items():
             max_units = instructor_prefs.get(inst_id, {}).get('max_units')
             if max_units is None:
+                # Fallback: derive from designation-based limit_minutes (24h - deduction)
+                limit_min = instructor_limit_minutes.get(inst_id, 24 * 60)
+                # Convert minutes to approximate units (1 unit ≈ 1 hour)
+                max_units = limit_min // 60
+            if max_units <= 0:
                 continue
                 
             current_units = instructor_current_units.get(inst_id, 0)
@@ -5857,6 +5953,10 @@ def run_cp_scheduler(
             
             if terms:
                 model.Add(sum(var * units for var, units in terms) <= remaining_capacity)
+                logger.debug(
+                    "[LOAD CONSTRAINT] Instructor %d: max_units=%d, current=%d, remaining=%d",
+                    inst_id, max_units, current_units, remaining_capacity
+                )
 
         overload_penalty_terms = []
         zero_var = model.NewIntVar(0, 0, f"cluster_{cluster_id}_zero")
@@ -5882,7 +5982,7 @@ def run_cp_scheduler(
             model.AddMaxEquality(over_min_var, [zero_var, diff_min_var])
             overload_penalty_terms.append(over_min_var)
 
-        overload_penalty_weight = 5
+        overload_penalty_weight = 500  # Strong penalty to discourage overloading
         if overload_penalty_terms:
             penalty_exprs.append(overload_penalty_weight * sum(overload_penalty_terms))
 
