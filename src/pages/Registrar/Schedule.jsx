@@ -1,11 +1,11 @@
-﻿import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { list } from "../../store/db";
 import {
   generateSchedule as generateScheduleApi,
   getScheduleStatus,
   loadSchedule as loadScheduleApi,
   saveSchedule,
-
+  mergeSubjects,
   validateScheduleItem,
   getSchedulingSuggestions,
   checkAvailability
@@ -68,6 +68,10 @@ export default function RegistrarSchedule() {
 
   // Recommendations modal state
   const [recommendationModalItem, setRecommendationModalItem] = useState(null);
+
+  // Merge modal state (post-scheduling)
+  const [mergeModal, setMergeModal] = useState({ open: false, sourceSubjectId: null, targetId: '' });
+  const [mergeProcessing, setMergeProcessing] = useState(false);
 
 
 
@@ -1357,6 +1361,20 @@ export default function RegistrarSchedule() {
             </span>
           )}
         </td>
+        <td className="px-2 py-2 text-sm" onClick={e => e.stopPropagation()}>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setMergeModal({ open: true, sourceSubjectId: subjectId, targetId: '' });
+            }}
+            className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-indigo-50 hover:bg-indigo-100 text-indigo-600 hover:text-indigo-800 transition-colors"
+            title="Merge this subject"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-3.5 h-3.5">
+              <path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z" />
+            </svg>
+          </button>
+        </td>
       </tr>
     );
   };
@@ -1655,6 +1673,8 @@ export default function RegistrarSchedule() {
                         <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                           Instructor
                         </th>
+                        <th className="px-2 py-2 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-10">
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="bg-white divide-y divide-gray-200">
@@ -1666,6 +1686,134 @@ export default function RegistrarSchedule() {
             ))}
         </div>
       )}
+
+      {/* Merge Modal (Post-Scheduling) */}
+      {mergeModal.open && (() => {
+        const sourceSubject = subjects.find(s => s.id === mergeModal.sourceSubjectId);
+        if (!sourceSubject) return null;
+
+        const courseName = (cid) => {
+          const c = courses.find(co => co.id === cid);
+          return c ? (c.code || c.name || `Course ${c.id}`) : '';
+        };
+
+        // Target options: same-type subjects from the same course (exclude source)
+        const targetOptions = subjects.filter(s => {
+          if (s.id === sourceSubject.id) return false;
+          return s.course_id === sourceSubject.course_id;
+        });
+
+        const handleConfirmMerge = async () => {
+          if (!mergeModal.targetId) { alert('Please select a target subject.'); return; }
+          if (mergeModal.targetId === mergeModal.sourceSubjectId) { alert('Cannot merge into itself.'); return; }
+          setMergeProcessing(true);
+          try {
+            const res = await mergeSubjects(mergeModal.sourceSubjectId, mergeModal.targetId);
+            alert(`Merged successfully! ${res.schedules_moved || 0} schedules moved.`);
+            setMergeModal({ open: false, sourceSubjectId: null, targetId: '' });
+            // Reload subjects + schedule
+            const [subjectList] = await Promise.all([list("subject")]);
+            setSubjects(subjectList || []);
+          } catch (err) {
+            alert(err.message || 'Merge failed');
+          } finally {
+            setMergeProcessing(false);
+          }
+        };
+
+        const selectedTarget = subjects.find(s => s.id === mergeModal.targetId);
+
+        return (
+          <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+            <div className="w-full max-w-2xl bg-white rounded-xl shadow-xl overflow-hidden">
+              <div className="bg-indigo-600 px-6 py-4 flex items-center justify-between">
+                <h3 className="text-xl font-semibold text-white flex items-center gap-2">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z" /></svg>
+                  Merge Subject
+                </h3>
+                <button onClick={() => setMergeModal({ open: false, sourceSubjectId: null, targetId: '' })} className="text-white/80 hover:text-white">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" /></svg>
+                </button>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div className="bg-orange-50 text-orange-800 p-3 rounded-lg text-sm border border-orange-200">
+                  <strong>Warning:</strong> The source subject will be deleted. Existing schedules will be moved to the target. This cannot be undone.
+                </div>
+
+                {/* Source subject */}
+                <div>
+                  <div className="text-xs font-semibold text-gray-500 uppercase mb-1">Source (Will be deleted)</div>
+                  <div className="bg-red-50 border border-red-200 rounded-lg p-3">
+                    <div className="font-medium text-gray-900">{sourceSubject.code}</div>
+                    <div className="text-sm text-gray-600">{sourceSubject.description} • {sourceSubject.type} • {sourceSubject.unit} Units</div>
+                    <div className="text-xs text-gray-500 mt-1">{courseName(sourceSubject.course_id)}</div>
+                  </div>
+                </div>
+
+                {/* Arrow */}
+                <div className="flex justify-center">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 13.5L12 21m0 0l-7.5-7.5M12 21V3" />
+                  </svg>
+                </div>
+
+                {/* Target options — horizontal scrollable cards */}
+                <div>
+                  <div className="text-xs font-semibold text-indigo-600 uppercase mb-2">Select Target (Will survive)</div>
+                  {targetOptions.length === 0 ? (
+                    <p className="text-sm text-gray-500">No eligible target subjects found in this course.</p>
+                  ) : (
+                    <div className="flex gap-2 overflow-x-auto pb-2">
+                      {targetOptions.map(opt => (
+                        <button
+                          key={opt.id}
+                          onClick={() => setMergeModal(prev => ({ ...prev, targetId: opt.id }))}
+                          className={`flex-shrink-0 rounded-lg border-2 p-3 text-left transition-all min-w-[160px] max-w-[200px] ${
+                            mergeModal.targetId === opt.id
+                              ? 'border-indigo-500 bg-indigo-50 ring-2 ring-indigo-200'
+                              : 'border-gray-200 bg-white hover:border-indigo-300 hover:bg-indigo-50/50'
+                          }`}
+                        >
+                          <div className="font-semibold text-sm text-gray-900">{opt.code}</div>
+                          <div className="text-xs text-gray-600 mt-0.5 line-clamp-2">{opt.description}</div>
+                          <div className="text-xs text-gray-500 mt-1">{opt.type} • {opt.unit}u</div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Selected target preview */}
+                {selectedTarget && (
+                  <div className="bg-green-50 border border-green-200 rounded-lg p-3">
+                    <div className="text-xs font-semibold text-green-700 uppercase mb-1">Target Selected</div>
+                    <div className="font-medium text-gray-900">{selectedTarget.code}</div>
+                    <div className="text-sm text-gray-600">{selectedTarget.description} • {selectedTarget.type} • {selectedTarget.unit} Units</div>
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-gray-50 px-6 py-4 flex justify-end gap-3 border-t">
+                <button
+                  onClick={() => setMergeModal({ open: false, sourceSubjectId: null, targetId: '' })}
+                  className="px-4 py-2 rounded text-gray-700 font-medium hover:bg-gray-200 transition-colors"
+                  disabled={mergeProcessing}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleConfirmMerge}
+                  className="px-4 py-2 rounded bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors disabled:opacity-50"
+                  disabled={mergeProcessing || !mergeModal.targetId}
+                >
+                  {mergeProcessing ? 'Merging...' : 'Confirm Merge'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {!isSubmitting && Object.keys(expandedSchedule).length === 0 && !error && (
         <p className="mt-6 text-sm text-gray-500">
