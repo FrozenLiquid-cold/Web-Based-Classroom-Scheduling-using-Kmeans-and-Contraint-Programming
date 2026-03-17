@@ -105,6 +105,13 @@ def _is_nstp_only_subject(subject) -> bool:
     return code.upper().startswith("NSTP")
 
 
+def _is_pe_subject(subject) -> bool:
+    """Check if a subject is a PE or PATHFIT subject (scheduled in PE phase with shared rooms)."""
+    code = getattr(subject, "code", "") or ""
+    code_upper = code.upper().strip()
+    return code_upper.startswith("PE") or code_upper.startswith("PATHFIT")
+
+
 def _time_str_to_minutes(value: str) -> Optional[int]:
     value = (value or "").strip()
     if not value:
@@ -1185,17 +1192,26 @@ def build_eligibility_maps(
             for p in all_prefs:
                 _subject_pref_room_ids.setdefault(p.subject_id, set()).add(p.room_id)
             # For subjects in this batch that aren't in _subject_pref_room_ids,
-            # try to inherit from a subject with the same code that HAS preferences
-            _code_to_pref: dict = {}
+            # try to inherit from a subject with the same code AND type that HAS
+            # preferences. Using code alone is unsafe for paired LEC/LAB subjects
+            # like CC 102 because clones can inherit the wrong room set.
+            _code_type_to_pref: dict = {}
             for sid, pref_set in _subject_pref_room_ids.items():
                 subj = db.query(models.Subject).get(sid)
                 if subj and subj.code:
-                    _code_to_pref[subj.code.strip().upper()] = pref_set
+                    key = (
+                        subj.code.strip().upper(),
+                        (getattr(subj, "type", "") or "").strip().upper(),
+                    )
+                    _code_type_to_pref[key] = pref_set
             for s in subjects:
                 if s.id not in _subject_pref_room_ids and s.code:
-                    code_key = s.code.strip().upper()
-                    if code_key in _code_to_pref:
-                        _subject_pref_room_ids[s.id] = _code_to_pref[code_key]
+                    key = (
+                        s.code.strip().upper(),
+                        (getattr(s, "type", "") or "").strip().upper(),
+                    )
+                    if key in _code_type_to_pref:
+                        _subject_pref_room_ids[s.id] = _code_type_to_pref[key]
     # Compute set of all "claimed" room IDs from the ENTIRE database — rooms that are
     # the exclusive preference of ANY subject (even subjects not in this batch).
     # This ensures e.g. FIELD stays reserved for NSTP even when scheduling a different course.
@@ -1214,6 +1230,11 @@ def build_eligibility_maps(
         subj_type = (subject.type or "").upper().strip()
         subj_course_id = subject.course_id
         subj_college = course_college_map.get(subj_course_id)
+        is_shared_room_subject = (
+            _is_nstp_only_subject(subject)
+            or subj_code.startswith("PE")
+            or subj_code.startswith("PATHFIT")
+        )
 
         eligible_instrs: List[int] = []
         preferred_rooms: List[int] = []
@@ -1263,6 +1284,9 @@ def build_eligibility_maps(
                 if norm_subj_code and assignable_set and norm_subj_code in assignable_set:
                     eligible_instrs.append(inst_id)
 
+        if not is_shared_room_subject:
+            preferred_rooms = [rid for rid in preferred_rooms if rid not in _shared_room_ids]
+
         subject_to_instructors[sid] = eligible_instrs
         subject_to_preferred_rooms[sid] = preferred_rooms
 
@@ -1284,23 +1308,36 @@ def build_eligibility_maps(
 
         # Room restriction logic: use DB-configured preferred rooms if available,
         # otherwise fall back to shared-building / non-shared building filtering.
-        subj_pref_ids = _subject_pref_room_ids.get(sid, set())
+        subj_pref_ids = set(_subject_pref_room_ids.get(sid, set()))
+        if not is_shared_room_subject and subj_pref_ids:
+            subj_pref_ids = {rid for rid in subj_pref_ids if rid not in _shared_room_ids}
         if subj_pref_ids:
             # Subject has explicit room preferences configured — restrict to those rooms only
             all_valid_rooms = [rid for rid in all_valid_rooms if rid in subj_pref_ids]
             subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid in subj_pref_ids]
-        elif _is_nstp_only_subject(subject):
-            # NSTP subjects without explicit prefs — use shared building rooms (FIELD)
+        elif is_shared_room_subject:
+            # NSTP / PE / PATHFIT subjects without explicit prefs — use shared building rooms
+            # (FIELD for NSTP, Inner Quad / GYM for PE/PATHFIT)
             if _shared_room_ids:
                 shared_valid = [rid for rid in all_valid_rooms if rid in _shared_room_ids]
                 if shared_valid:
                     all_valid_rooms = shared_valid
         else:
-            # All other subjects without explicit prefs — only exclude rooms claimed by other subjects.
-            # Shared-building rooms (GS ER 1-8 etc.) are available to all colleges.
-            if _all_claimed_room_ids:
-                all_valid_rooms = [rid for rid in all_valid_rooms if rid not in _all_claimed_room_ids]
-                subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in _all_claimed_room_ids]
+            # All other subjects without explicit prefs — exclude rooms claimed by
+            # other subjects AND shared-building rooms (FIELD, etc.) which are
+            # reserved for NSTP.
+            excluded = _all_claimed_room_ids | _shared_room_ids
+            if excluded:
+                before_count = len(all_valid_rooms)
+                all_valid_rooms = [rid for rid in all_valid_rooms if rid not in excluded]
+                if before_count != len(all_valid_rooms):
+                    logger.debug(
+                        "[ELIGIBILITY] Subject %s (ID:%d): Excluded %d rooms (shared=%s, claimed=%d). %d->%d rooms",
+                        subj_code, sid, before_count - len(all_valid_rooms),
+                        _shared_room_ids, len(_all_claimed_room_ids),
+                        before_count, len(all_valid_rooms)
+                    )
+                subject_to_preferred_rooms[sid] = [rid for rid in subject_to_preferred_rooms[sid] if rid not in excluded]
         
         # Also apply college filtering to preferred rooms
         if subj_college is not None:
@@ -1319,10 +1356,11 @@ def build_eligibility_maps(
                  # Use explicitly configured rooms as last resort
                  all_valid_rooms = list(subj_pref_ids)
             else:
-                 # Last resort: all rooms except claimed rooms, still respecting college filter
+                 # Last resort: all rooms except claimed + shared rooms, still respecting college filter
+                 _excluded_last = _all_claimed_room_ids | _shared_room_ids
                  all_valid_rooms = [
                      r.id for r in rooms
-                     if r.id not in _all_claimed_room_ids
+                     if r.id not in _excluded_last
                      and (subj_college is None or room_to_college_id.get(r.id) is None or room_to_college_id.get(r.id) == subj_college)
                  ]
 
@@ -1424,43 +1462,56 @@ def get_existing_bookings(
         exclude_years=exclude_years
     )
     
-    # Build time_label -> block_index mapping if slots_by_day provided
-    time_label_to_block_index = {}
+    # Build (day_id, start_min) -> block_index mapping from slots_by_day
+    # This replaces the broken string-based matching that silently failed
+    # because DB time formats ("7:00 AM - 8:30 AM") never matched solver
+    # slot labels ("M 7:00–8:30").
+    day_id_to_slots = {}  # day_id -> list of {start_min, end_min, index}
     if slots_by_day and day_id_map:
         for day_label, day_slots in slots_by_day.items():
             day_id = day_id_map.get(day_label)
             if day_id is not None:
-                for slot in day_slots:
-                    time_label_to_block_index[(day_id, slot["label"])] = slot["index"]
+                day_id_to_slots[day_id] = [
+                    {"start_min": s["start_min"], "end_min": s["end_min"], "index": s["index"]}
+                    for s in day_slots
+                ]
     
-    # Convert to sets with block_index (canonical numeric indices)
+    def _find_overlapping_slot_indices(day_id, time_label_str):
+        """Parse a DB time label and find all solver slot indices that overlap."""
+        parsed = _parse_time_range_minutes(time_label_str)
+        if parsed is None:
+            return []
+        booking_start, booking_end = parsed
+        slots = day_id_to_slots.get(day_id, [])
+        overlapping = []
+        for s in slots:
+            # Slots overlap if one starts before the other ends and vice versa
+            if s["start_min"] < booking_end and s["end_min"] > booking_start:
+                overlapping.append(s["index"])
+        return overlapping
+    
+    # Convert room bookings to solver slot indices
     for booking in room_bookings:
         day_id = booking["day_id"]
         time_label = booking["time_label"]
-        if isinstance(time_label, str) and " - " in time_label:
-            time_label = time_label.split(" - ", 1)[0].strip()
         
-        # Convert time_label to block_index if mapping available
-        if time_label_to_block_index:
-            block_index = time_label_to_block_index.get((day_id, time_label))
-            if block_index is not None:
-                booked_room_slots.add((booking["resource_name"], day_id, block_index))
+        if day_id_to_slots:
+            indices = _find_overlapping_slot_indices(day_id, time_label)
+            for idx in indices:
+                booked_room_slots.add((booking["resource_name"], day_id, idx))
         else:
             # Fallback: use time_label as string (for backward compatibility)
-            # This should not happen in normal flow, but kept for safety
             booked_room_slots.add((booking["resource_name"], day_id, time_label))
     
+    # Convert instructor bookings to solver slot indices
     for booking in instructor_bookings:
         day_id = booking["day_id"]
         time_label = booking["time_label"]
-        if isinstance(time_label, str) and " - " in time_label:
-            time_label = time_label.split(" - ", 1)[0].strip()
         
-        # Convert time_label to block_index if mapping available
-        if time_label_to_block_index:
-            block_index = time_label_to_block_index.get((day_id, time_label))
-            if block_index is not None:
-                booked_instr_slots.add((booking["resource_id"], day_id, block_index))
+        if day_id_to_slots:
+            indices = _find_overlapping_slot_indices(day_id, time_label)
+            for idx in indices:
+                booked_instr_slots.add((booking["resource_id"], day_id, idx))
         else:
             # Fallback: use time_label as string (for backward compatibility)
             booked_instr_slots.add((booking["resource_id"], day_id, time_label))
@@ -2054,8 +2105,57 @@ def _cp_retry_mini_model(
         if not eligible_rooms:
             eligible_rooms = course_to_rooms.get(subject.id, []) or []
 
+        # ------------------------------------------------------------------
+        # College-based room filtering (mirrors build_eligibility_maps logic)
+        # Only allow rooms from the same college's buildings, or from shared/
+        # unassigned buildings.  Without this, the SP returns ALL rooms of a
+        # matching type regardless of college ownership.
+        # ------------------------------------------------------------------
+        if eligible_rooms and db and subject.course_id:
+            _retry_course = db.query(models.Course).get(subject.course_id)
+            _retry_subj_college = _retry_course.college_id if _retry_course else None
+            if _retry_subj_college is not None:
+                _filtered_by_college = []
+                for rid in eligible_rooms:
+                    _rm_obj = db.query(models.Room).get(rid)
+                    if not _rm_obj or not _rm_obj.building_id:
+                        # No building info — allow (graceful fallback)
+                        _filtered_by_college.append(rid)
+                        continue
+                    _rm_bldg = db.query(models.Building).get(_rm_obj.building_id)
+                    if not _rm_bldg:
+                        _filtered_by_college.append(rid)
+                        continue
+                    # Shared buildings are always allowed
+                    if _rm_bldg.is_shared:
+                        _filtered_by_college.append(rid)
+                        continue
+                    # If building has no college assignment, allow it
+                    if _rm_bldg.college_id is None:
+                        _filtered_by_college.append(rid)
+                        continue
+                    # Both have a college — must match
+                    if _rm_bldg.college_id == _retry_subj_college:
+                        _filtered_by_college.append(rid)
+                    else:
+                        logger.debug(
+                            "[RETRY COLLEGE FILTER] Subject %s (ID:%s): Excluded room %d "
+                            "(building %s, college %s) - subject college is %s",
+                            subj_code, subject.id, rid,
+                            _rm_bldg.name if hasattr(_rm_bldg, 'name') else _rm_bldg.id,
+                            _rm_bldg.college_id, _retry_subj_college,
+                        )
+                if _filtered_by_college:
+                    before_count = len(eligible_rooms)
+                    eligible_rooms = _filtered_by_college
+                    if before_count != len(eligible_rooms):
+                        logger.info(
+                            "[RETRY COLLEGE FILTER] Subject %s (ID:%s): %d -> %d rooms after college filtering",
+                            subj_code, subject.id, before_count, len(eligible_rooms),
+                        )
+
         # Exclude rooms claimed as preferred by other subjects (exclusive reservation)
-        # Shared-building rooms are available to all — do NOT exclude them
+        # AND shared-building rooms (FIELD etc.) which are reserved for NSTP
         if not _is_nstp_only_subject(subject):
             _subj_pref_ids = set()
             if hasattr(subject, 'preferred_rooms') and subject.preferred_rooms:
@@ -2064,8 +2164,15 @@ def _cp_retry_mini_model(
                 _all_claimed = set()
                 for _p in db.query(models.SubjectRoomPreference).all():
                     _all_claimed.add(_p.room_id)
-                if _all_claimed:
-                    eligible_rooms = [rid for rid in eligible_rooms if rid not in _all_claimed]
+                # Also exclude shared-building rooms (FIELD)
+                _retry_shared = set()
+                _shared_bldgs = db.query(models.Building).filter(models.Building.is_shared == True).all()
+                for _sb in _shared_bldgs:
+                    for _sr in db.query(models.Room).filter(models.Room.building_id == _sb.id).all():
+                        _retry_shared.add(_sr.id)
+                _all_excluded = _all_claimed | _retry_shared
+                if _all_excluded:
+                    eligible_rooms = [rid for rid in eligible_rooms if rid not in _all_excluded]
 
         # Distance-based room filtering: exclude far-away rooms when closer alternatives exist
         if eligible_rooms and db:
@@ -4117,23 +4224,53 @@ def run_cp_scheduler(
         room_cluster_map = {r.id: (idx % num_clusters) for idx, r in enumerate(sorted_rooms)}
         logger.info(f"Deterministically assigned {len(rooms)} rooms to {num_clusters} clusters")
     
-    # Group subjects by cluster
-    subjects_by_cluster = defaultdict(list)
-    for subject in subjects:
-        cluster_id = subject.cluster if subject.cluster is not None else -1
-        subjects_by_cluster[cluster_id].append(subject)
-    
-    # Sort clusters; if a specific cluster is requested, keep only that one
-    cluster_items = sorted(subjects_by_cluster.items(), key=lambda x: x[0])
-    if cluster_id_filter is not None:
-        cluster_items = [(cid, subjs) for (cid, subjs) in cluster_items if cid == cluster_id_filter]
-    
-    # Global booking maps (inter-cluster propagation) - using block_index
+    # =========================================================================
+    # 4-PHASE SCHEDULING PIPELINE
+    # Phase 1: NSTP (already pre-scheduled above)
+    # Phase 2: PE / PATHFIT subjects (shared rooms: GYM, Inner Quad — NOT FIELD)
+    # Phase 3: Major subjects (college-specific rooms, scheduled first for priority)
+    # Phase 4: GE / Minor subjects (remaining rooms, most flexible)
+    #
+    # Each phase runs the full cluster loop independently.
+    # Booking state (room/instructor ranges) flows between phases so later
+    # phases respect earlier assignments.
+    # =========================================================================
+    _all_subjects_for_phases = list(subjects)  # Preserve full list for partitioning
+
+    _pe_subjects = [s for s in _all_subjects_for_phases if _is_pe_subject(s)]
+    _major_subjects = [s for s in _all_subjects_for_phases if not _is_pe_subject(s) and getattr(s, 'is_major', False)]
+    _ge_subjects = [s for s in _all_subjects_for_phases if not _is_pe_subject(s) and not getattr(s, 'is_major', False)]
+
+    _phase_plan = []
+    if _pe_subjects:
+        _phase_plan.append(("PE/PATHFIT", _pe_subjects))
+    if _major_subjects:
+        _phase_plan.append(("MAJORS", _major_subjects))
+    if _ge_subjects:
+        _phase_plan.append(("GE/MINORS", _ge_subjects))
+
+    # Fallback: if no subjects matched any phase (shouldn't happen), use all
+    if not _phase_plan:
+        _phase_plan.append(("ALL", _all_subjects_for_phases))
+
+    logger.info(
+        "\n" + "=" * 80 + "\n"
+        "4-PHASE SCHEDULING PIPELINE\n"
+        "Phase 1: NSTP - %d subjects (pre-scheduled)\n"
+        "Phase 2: PE/PATHFIT - %d subjects\n"
+        "Phase 3: MAJORS - %d subjects\n"
+        "Phase 4: GE/MINORS - %d subjects\n" +
+        "=" * 80,
+        len(nstp_subjects) if nstp_subjects else 0,
+        len(_pe_subjects), len(_major_subjects), len(_ge_subjects),
+    )
+
+    # Global booking maps (inter-cluster AND inter-phase propagation) - using block_index
     booked_room_slots_global = set(booked_room_slots)  # (room_name, day_id, block_index)
     booked_instr_slots_global = set(booked_instr_slots)  # (instr_id, day_id, block_index)
 
     # Additional global booking maps using real minute ranges.
-    # This is necessary because TIME_BLOCKS contains overlapping windows (e.g., 7:00–8:30 and 7:30–8:30),
+    # This is necessary because TIME_BLOCKS contains overlapping windows (e.g., 7:00-8:30 and 7:30-8:30),
     # so a conflict cannot be represented reliably by (day_id, block_index) alone.
     # CRITICAL: Use passed-in ranges if provided (for inter-run conflict prevention)
     if booked_room_ranges_global is None:
@@ -4231,79 +4368,88 @@ def run_cp_scheduler(
             _bldg = db.query(models.Building).get(r.building_id)
             if _bldg and _bldg.is_shared:
                 _solver_shared_room_ids.add(r.id)
+    print(f"[SOLVER INIT] Shared room IDs to exclude from regular subjects: {_solver_shared_room_ids}")
     field_room_id = -1
     if _solver_shared_room_ids:
         field_room_id = next(iter(_solver_shared_room_ids))  # Use first shared room for backward compat
 
-    # =========================================================================
-    # ADAPTIVE SOLVER: Calculate resource utilization pressure
-    # When resources are 80%+ utilized, the solver needs more options and time
-    # =========================================================================
-    total_room_keys = len(rooms) * len(days)  # Theoretical max room-day combinations
-    total_instr_keys = len(instructors) * len(days) if instructors else 1
-    
-    # Count actually booked room-day combinations
-    booked_room_count = sum(1 for k, v in booked_room_ranges_global.items() if v)
-    booked_instr_count = sum(1 for k, v in booked_instr_ranges_global.items() if v)
-    
-    room_utilization = booked_room_count / max(1, total_room_keys)
-    instr_utilization = booked_instr_count / max(1, total_instr_keys)
-    resource_pressure = max(room_utilization, instr_utilization)
-    
-    # Determine adaptive limits based on resource pressure
-    if resource_pressure >= 0.8:
-        ADAPTIVE_MAX_VARS_PER_SUBJECT = 3000  # Full exploration for tight resources
-        ADAPTIVE_TIME_MULTIPLIER = 2.0
-        ADAPTIVE_GAP_LIMIT = 0.02  # Tighter optimality (2%)
-        logger.info(f"[ADAPTIVE] HIGH resource pressure ({resource_pressure:.1%}): FULL exploration mode")
-    elif resource_pressure >= 0.6:
-        ADAPTIVE_MAX_VARS_PER_SUBJECT = 2000  # Moderate exploration
-        ADAPTIVE_TIME_MULTIPLIER = 1.5
-        ADAPTIVE_GAP_LIMIT = 0.03
-        logger.info(f"[ADAPTIVE] MEDIUM resource pressure ({resource_pressure:.1%}): Enhanced exploration")
-    else:
-        ADAPTIVE_MAX_VARS_PER_SUBJECT = 1000  # Standard
-        ADAPTIVE_TIME_MULTIPLIER = 1.0
-        ADAPTIVE_GAP_LIMIT = 0.05
-        logger.info(f"[ADAPTIVE] LOW resource pressure ({resource_pressure:.1%}): Standard exploration")
-    
-    logger.info(f"[ADAPTIVE] Room utilization: {room_utilization:.1%} ({booked_room_count}/{total_room_keys}), "
-                f"Instructor utilization: {instr_utilization:.1%} ({booked_instr_count}/{total_instr_keys})")
-
-    # Main cluster loop
-    current_student_block_index = None
-    block_cluster_plan = []
-    # GLOBAL SOLVING OPTIMIZATION: 
-    # Instead of solving Block 1 then Block 2 sequentially (which is greedy and can lock out later blocks),
-    # we now solve ALL blocks together in one CP model.
-    # The internal constraints (subject_vars_by_cohort) already differentiate by student_block,
-    # so parallel blocks are supported naturally.
-    
-    # We use a dummy block index 0 to indicate "Mixed/Global" batch.
-    # The logging will show "Moving to student block 0", but the subjects contain their real block IDs.
-    
-    if block_count >= 2:
-        logger.info(f"Multi-block course detected ({block_count} blocks). Using GLOBAL SOLVING strategy (all blocks in one batch) to optimize resource allocation.")
-        
-    for cid, subjs in cluster_items:
-        if subjs:
-            # Pass 0 as student_block_index to indicate global batch
-            block_cluster_plan.append((0, cid, subjs))
-
-
     all_diagnostics: Dict[int, Dict[str, int]] = {}
     
-    # CRITICAL: Initialize clone map BEFORE the loop so it accumulates across ALL blocks/clusters
+    # CRITICAL: Initialize clone map BEFORE the loop so it accumulates across ALL phases/blocks/clusters
     # This ensures that even if a clone fails in Block A, we remember its mapping to the original subject
     # for final diagnostics pruning.
     clone_to_original_map = {}
-    
+
+    # =========================================================================
+    # Build the block_cluster_plan with phase ordering:
+    # PE/PATHFIT clusters first, then MAJORS, then GE/MINORS.
+    # Each entry is (student_block_index, cluster_id, subjects, phase_name).
+    # The existing cluster loop processes them in this exact order, so 
+    # PE subjects are scheduled first, majors second, GE last.
+    # Booking state flows naturally since the loop is sequential.
+    # =========================================================================
+    block_cluster_plan = []
+    _current_phase_logged = None  # Track for phase transition logging
+
+    for _phase_name, _phase_subjects in _phase_plan:
+        # Group THIS phase's subjects by cluster
+        _phase_by_cluster = defaultdict(list)
+        for _ps in _phase_subjects:
+            _pcid = _ps.cluster if _ps.cluster is not None else -1
+            _phase_by_cluster[_pcid].append(_ps)
+        _phase_cluster_items = sorted(_phase_by_cluster.items(), key=lambda x: x[0])
+        if cluster_id_filter is not None:
+            _phase_cluster_items = [(cid, subjs) for (cid, subjs) in _phase_cluster_items if cid == cluster_id_filter]
+        for cid, subjs in _phase_cluster_items:
+            if subjs:
+                block_cluster_plan.append((0, cid, subjs, _phase_name))
+
+    if not block_cluster_plan:
+        logger.warning("[4-PHASE] No subjects in any phase cluster plan - nothing to schedule")
+
     # CRITICAL: Initialize these BEFORE the loop so they accumulate across ALL blocks
     # This ensures Block B sees Block A's bookings, preventing double-booking conflicts
     cross_cluster_scheduled_ranges = defaultdict(list)
     day_distribution_tracker = defaultdict(set)
+    current_student_block_index = None
+    # Default adaptive values (will be recalculated at each phase transition)
+    ADAPTIVE_MAX_VARS_PER_SUBJECT = 1000
+    ADAPTIVE_TIME_MULTIPLIER = 1.0
+    ADAPTIVE_GAP_LIMIT = 0.05
 
-    for student_block_index, cluster_id, cluster_subjects in block_cluster_plan:
+    for student_block_index, cluster_id, cluster_subjects, *_phase_info in block_cluster_plan:
+        # --- Phase transition logging ---
+        _iter_phase = _phase_info[0] if _phase_info else "UNKNOWN"
+        if _iter_phase != _current_phase_logged:
+            _current_phase_logged = _iter_phase
+            logger.info("\n" + "=" * 80)
+            logger.info("PHASE: %s", _iter_phase)
+            logger.info("=" * 80)
+            report_progress(f"Phase: {_iter_phase}...")
+
+            # Recalculate adaptive solver pressure at each phase transition
+            total_room_keys = len(rooms) * len(days)
+            total_instr_keys = len(instructors) * len(days) if instructors else 1
+            booked_room_count = sum(1 for k, v in booked_room_ranges_global.items() if v)
+            booked_instr_count = sum(1 for k, v in booked_instr_ranges_global.items() if v)
+            room_utilization = booked_room_count / max(1, total_room_keys)
+            instr_utilization = booked_instr_count / max(1, total_instr_keys)
+            resource_pressure = max(room_utilization, instr_utilization)
+            if resource_pressure >= 0.8:
+                ADAPTIVE_MAX_VARS_PER_SUBJECT = 3000
+                ADAPTIVE_TIME_MULTIPLIER = 2.0
+                ADAPTIVE_GAP_LIMIT = 0.02
+            elif resource_pressure >= 0.6:
+                ADAPTIVE_MAX_VARS_PER_SUBJECT = 2000
+                ADAPTIVE_TIME_MULTIPLIER = 1.5
+                ADAPTIVE_GAP_LIMIT = 0.03
+            else:
+                ADAPTIVE_MAX_VARS_PER_SUBJECT = 1000
+                ADAPTIVE_TIME_MULTIPLIER = 1.0
+                ADAPTIVE_GAP_LIMIT = 0.05
+            logger.info(f"[ADAPTIVE] Phase {_iter_phase}: resource pressure={resource_pressure:.1%}, "
+                        f"vars/subj={ADAPTIVE_MAX_VARS_PER_SUBJECT}")
+
         # DEBUG: Check ranges before loop
         debug_ranges = booked_room_ranges_global.get(("GS ER 7", 1), [])
         if debug_ranges:
@@ -4320,7 +4466,7 @@ def run_cp_scheduler(
             logger.info(f"=== Moving to student block {student_block_index} (preserving {len(cross_cluster_scheduled_ranges)} cross-cluster bookings) ===")
             logger.info(f"[ROOM STATE] Phys Lab Friday bookings: {phys_lab_friday}")
 
-        logger.info("=== Solving cluster %s (%d subjects) ===", cluster_id, len(cluster_subjects))
+        logger.info("=== Solving cluster %s (%d subjects, phase=%s) ===", cluster_id, len(cluster_subjects), _iter_phase)
         
         # Initialize CP-SAT model for this cluster
         model = cp_model.CpModel()
@@ -4434,15 +4580,23 @@ def run_cp_scheduler(
             code = id_to_code.get(subject_id, f"ID_{subject_id}")  # For logging/debugging
             
             # Always get a LIST - ensure type safety
-            # CRITICAL: Maps are now keyed by subject.id
+            # CRITICAL: Maps are keyed by ORIGINAL subject.id, but clones have different IDs.
+            # Fall back to original_subject_id for cloned subjects.
+            _orig_sid = getattr(subject, 'original_subject_id', None) or subject_id
             eligible_rooms = course_to_all_rooms.get(subject_id, [])
+            if not eligible_rooms and _orig_sid != subject_id:
+                eligible_rooms = course_to_all_rooms.get(_orig_sid, [])
             preferred_rooms_list = course_to_preferred_rooms.get(subject_id, [])
+            if not preferred_rooms_list and _orig_sid != subject_id:
+                preferred_rooms_list = course_to_preferred_rooms.get(_orig_sid, [])
             preferred_rooms_set = set(preferred_rooms_list) if preferred_rooms_list else set()
 
             if not isinstance(eligible_rooms, list):
                 eligible_rooms = list(eligible_rooms) if eligible_rooms else []
             
             eligible_instrs = course_to_instructors.get(subject_id, [])
+            if not eligible_instrs and _orig_sid != subject_id:
+                eligible_instrs = course_to_instructors.get(_orig_sid, [])
             if not isinstance(eligible_instrs, list):
                 eligible_instrs = list(eligible_instrs) if eligible_instrs else []
             
@@ -4482,7 +4636,21 @@ def run_cp_scheduler(
                         if room_cluster_map.get(rid, -1) == subj_cluster
                     ]
                     if rooms_in_same_cluster:
-                        eligible_rooms = rooms_in_same_cluster
+                        # For non-sports subjects, strip shared rooms from cluster result
+                        _c_code = (getattr(subject, 'code', '') or '').upper().strip()
+                        _c_is_sports = (
+                            _c_code.startswith("NSTP") or
+                            _c_code.startswith("PE") or
+                            _c_code.startswith("PATHFIT")
+                        )
+                        if not _c_is_sports and _solver_shared_room_ids:
+                            rooms_in_same_cluster = [
+                                rid for rid in rooms_in_same_cluster
+                                if rid not in _solver_shared_room_ids
+                            ]
+                        # Only use cluster-filtered rooms if non-empty after shared room exclusion
+                        if rooms_in_same_cluster:
+                            eligible_rooms = rooms_in_same_cluster
                         logger.debug(
                             "Subject %s: Cluster filtering reduced rooms from %d to %d (cluster %d)",
                             code, original_eligible_rooms_count, len(eligible_rooms), subj_cluster
@@ -4542,15 +4710,29 @@ def run_cp_scheduler(
                     if _db_pref_ids:
                         eligible_rooms = [room.id for room in rooms if room.id in _db_pref_ids]
                     else:
-                        # Exclude rooms claimed by other subjects
+                        # Exclude rooms claimed by other subjects AND shared-building rooms
                         _all_claimed = set()
                         if db:
                             for _p in db.query(models.SubjectRoomPreference).all():
                                 _all_claimed.add(_p.room_id)
+                        # Also exclude shared-building rooms (FIELD, GYM, Inner Quad)
+                        # unless this is an NSTP/PE/PATHFIT subject
+                        _subj_code_upper = (getattr(subject, 'code', '') or '').upper().strip()
+                        _is_sports_or_nstp = (
+                            _subj_code_upper.startswith("NSTP") or
+                            _subj_code_upper.startswith("PE") or
+                            _subj_code_upper.startswith("PATHFIT")
+                        )
+                        _shared_exclude = set()
+                        if not _is_sports_or_nstp and db:
+                            for _bldg in db.query(models.Building).filter(models.Building.is_shared == True).all():
+                                for _sr in db.query(models.Room).filter(models.Room.building_id == _bldg.id).all():
+                                    _shared_exclude.add(_sr.id)
+                        _fallback_excluded = _all_claimed | _shared_exclude
                         eligible_rooms = [
                             room.id for room in rooms
                             if (_room_college_map.get(room.id) is None or _room_college_map.get(room.id) == _subj_college_id)
-                            and room.id not in _all_claimed
+                            and room.id not in _fallback_excluded
                         ]
                     logger.warning(f"  - Fallback: using {len(eligible_rooms)} rooms (college-filtered, college_id={_subj_college_id})")
                 else:
@@ -4563,16 +4745,56 @@ def run_cp_scheduler(
                     if _db_pref_ids:
                         eligible_rooms = [room.id for room in rooms if room.id in _db_pref_ids]
                     else:
-                        # Exclude rooms claimed by other subjects
+                        # Exclude rooms claimed by other subjects AND shared-building rooms
                         _all_claimed = set()
                         if db:
                             for _p in db.query(models.SubjectRoomPreference).all():
                                 _all_claimed.add(_p.room_id)
-                        eligible_rooms = [room.id for room in rooms if room.id not in _all_claimed]
+                        _subj_code_upper = (getattr(subject, 'code', '') or '').upper().strip()
+                        _is_sports_or_nstp = (
+                            _subj_code_upper.startswith("NSTP") or
+                            _subj_code_upper.startswith("PE") or
+                            _subj_code_upper.startswith("PATHFIT")
+                        )
+                        _shared_exclude = set()
+                        if not _is_sports_or_nstp and db:
+                            for _bldg in db.query(models.Building).filter(models.Building.is_shared == True).all():
+                                for _sr in db.query(models.Room).filter(models.Room.building_id == _bldg.id).all():
+                                    _shared_exclude.add(_sr.id)
+                        _fallback_excluded = _all_claimed | _shared_exclude
+                        eligible_rooms = [room.id for room in rooms if room.id not in _fallback_excluded]
                     logger.warning(f"  - Fallback: using all {len(eligible_rooms)} rooms (no college context)")
                 subjects_without_options.append((code, "no eligible rooms (used fallback)"))
             
-            # Get options for this subject
+            # ====================================================================
+            # HARD FILTER: Strip shared-building rooms (FIELD, GYM, Inner Quad)
+            # from ANY subject that is NOT NSTP/PE/PATHFIT.
+            # This is the FINAL safety net — catches all fallback paths.
+            # ====================================================================
+            # FIX: Use the logging code variable which is correctly mapped from id_to_code
+            # This ensures we use the correct code for the subject_id being processed
+            _code_upper = (code or '').upper().strip()
+            _is_sports_nstp = (
+                _code_upper.startswith("NSTP") or
+                _code_upper.startswith("PE") or
+                _code_upper.startswith("PATHFIT")
+            )
+            if not _is_sports_nstp and _solver_shared_room_ids:
+                _before = len(eligible_rooms)
+                eligible_rooms = [rid for rid in eligible_rooms if rid not in _solver_shared_room_ids]
+                if _before != len(eligible_rooms):
+                    print(f"[HARD FILTER] {_code_upper} (ID:{subject_id}): Removed {_before - len(eligible_rooms)} shared rooms -> {len(eligible_rooms)} remaining")
+                    logger.info(
+                        "[HARD FILTER] %s (ID:%d): Removed %d shared rooms, %d remaining",
+                        _code_upper, subject_id, _before - len(eligible_rooms), len(eligible_rooms)
+                    )
+            # FIELD is reserved for NSTP ONLY — exclude it for PE/PATHFIT too
+            if _is_sports_nstp and not _code_upper.startswith("NSTP"):
+                _field_ids = {rid for rid in eligible_rooms if room_id_to_name.get(rid, "").upper().strip() == "FIELD"}
+                if _field_ids:
+                    eligible_rooms = [rid for rid in eligible_rooms if rid not in _field_ids]
+                    logger.info("[HARD FILTER] %s (ID:%d): Excluded FIELD (reserved for NSTP), %d rooms remaining",
+                                _code_upper, subject_id, len(eligible_rooms))
             subj_opts = all_start_options.get(subject_id, [])
             if not subj_opts:
                 logger.warning(f"Subject {code} ({subject_id}) has no valid time windows - generating fallback options")
@@ -7653,7 +7875,24 @@ def run_cp_scheduler(
         if "NSTP" not in code:
             try:
                 eligible_room_ids = course_to_all_rooms.get(subject.id, [])
+                # Fallback: cloned subjects may not be in the map, try original_subject_id
+                if not eligible_room_ids:
+                    _orig_sid = getattr(subject, 'original_subject_id', None) or subject.id
+                    eligible_room_ids = course_to_all_rooms.get(_orig_sid, [])
                 eligible_instr_ids = course_to_instructors.get(subject.id, [])
+                if not eligible_instr_ids:
+                    _orig_sid = getattr(subject, 'original_subject_id', None) or subject.id
+                    eligible_instr_ids = course_to_instructors.get(_orig_sid, [])
+                
+                # HARD FILTER: Strip shared rooms for non-NSTP/PE/PATHFIT subjects
+                _rec_code = (getattr(subject, 'code', '') or '').upper().strip()
+                _rec_is_sports = (
+                    _rec_code.startswith("NSTP") or
+                    _rec_code.startswith("PE") or
+                    _rec_code.startswith("PATHFIT")
+                )
+                if not _rec_is_sports and _solver_shared_room_ids:
+                    eligible_room_ids = [rid for rid in eligible_room_ids if rid not in _solver_shared_room_ids]
                 
                 # Get availability data (re-check as bookings may have updated if we auto-scheduled others)
                 room_availability = get_available_slots(rooms, days, booked_room_ranges_global or {})
@@ -8079,7 +8318,7 @@ def run_cp_scheduler(
                 gap_min = start2 - end1
                 
                 logger.warning(
-                    "[PROXIMITY] Block %s Day %s: %s (room=%s, bldg=%s, %s-%s) → %s (room=%s, bldg=%s, %s-%s) "
+                    "[PROXIMITY] Block %s Day %s: %s (room=%s, bldg=%s, %s-%s) -> %s (room=%s, bldg=%s, %s-%s) "
                     "travel=%d min, gap=%d min",
                     block_label, day_id,
                     item1.get("subject_id"), rid1, bldg1,
@@ -8096,6 +8335,23 @@ def run_cp_scheduler(
                 
                 for candidate_rid, candidate_bldg in _room_to_bldg_id.items():
                     if candidate_rid == rid2:
+                        continue
+                    # HARD FILTER: Never swap TO a shared room for non-sports subjects
+                    _item2_code = (item2.get("subject_code", "") or "").upper().strip()
+                    if not _item2_code:
+                        _item2_sid = item2.get("subject_id")
+                        _item2_subj = db.query(models.Subject).get(_item2_sid) if _item2_sid and db else None
+                        _item2_code = (getattr(_item2_subj, 'code', '') or '').upper().strip() if _item2_subj else ''
+                    _item2_is_sports = (
+                        _item2_code.startswith("NSTP") or
+                        _item2_code.startswith("PE") or
+                        _item2_code.startswith("PATHFIT")
+                    )
+                    if not _item2_is_sports and candidate_rid in _solver_shared_room_ids:
+                        continue
+                    # FIELD is reserved for NSTP only — PE/PATHFIT must NOT be swapped to FIELD
+                    _candidate_name = room_id_to_name.get(candidate_rid, "").upper().strip()
+                    if _candidate_name == "FIELD" and not _item2_code.startswith("NSTP"):
                         continue
                     # Check the room type matches
                     candidate_room = room_by_id.get(candidate_rid)
@@ -8133,8 +8389,8 @@ def run_cp_scheduler(
                     old_room_name = room_id_to_name.get(rid2, f"ID:{rid2}")
                     new_room_name = room_id_to_name.get(best_swap_rid, f"ID:{best_swap_rid}")
                     logger.info(
-                        "[PROXIMITY SWAP] Block %s Day %s: Swapped %s room from %s → %s "
-                        "(travel %d→%d min)",
+                        "[PROXIMITY SWAP] Block %s Day %s: Swapped %s room from %s -> %s "
+                        "(travel %d->%d min)",
                         block_label, day_id, item2.get("subject_id"),
                         old_room_name, new_room_name,
                         travel_time, best_swap_travel

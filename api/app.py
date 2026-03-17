@@ -15,6 +15,7 @@ from .migrate_instructor_load_fields import ensure_instructor_load_fields
 from .migrate_schedule_details_view import ensure_schedule_details_view
 from .migrate_subject_major_flag import ensure_subject_major_flag
 from .migrate_subject_year_sem_fields import ensure_subject_year_sem_fields
+from .migrate_fix_schedule_constraints import ensure_fixed_schedule_constraints
 from .routes.auth import auth_bp
 from .routes.entities import entities_bp
 from .routes.schedule import schedule_bp
@@ -32,6 +33,10 @@ except ImportError:  # pragma: no cover - optional blueprint
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("scheduler.log", mode="w", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,7 @@ ensure_instructor_load_fields()
 ensure_schedule_details_view()
 ensure_subject_major_flag()
 ensure_subject_year_sem_fields()
+ensure_fixed_schedule_constraints()
 
 # Request timing middleware
 @app.before_request

@@ -1,17 +1,27 @@
 """Course-scoped scheduling workflow using K-Means + CP-SAT."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple, Any, Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 from ortools.sat.python import cp_model
 
 from .. import models
+
+logger = logging.getLogger(__name__)
+
+try:
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+    _SKLEARN_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - depends on local Python wheels
+    KMeans = None
+    StandardScaler = None
+    _SKLEARN_IMPORT_ERROR = exc
 
 
 @dataclass
@@ -89,6 +99,13 @@ def _cluster_candidates(
 
     if not candidates:
         return []
+    if KMeans is None or StandardScaler is None:
+        logger.warning(
+            "scikit-learn unavailable in course_scheduler (%s). "
+            "Falling back to unclustered candidate selection.",
+            _SKLEARN_IMPORT_ERROR,
+        )
+        return candidates
 
     feature_matrix = [
         [cand.room_capacity, cand.day, cand.start_min] for cand in candidates

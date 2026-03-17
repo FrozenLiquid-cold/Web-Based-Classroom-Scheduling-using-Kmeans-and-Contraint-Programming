@@ -689,6 +689,24 @@ def save_schedule(
     room_bookings_by_slot = {}  # (room_id, day_id, time) -> schedule_item
     skipped_duplicates = []
     
+    # Pre-load shared room IDs (rooms in shared buildings, e.g. FIELD)
+    # These rooms are exempt from double-booking checks
+    _shared_room_ids = set()
+    try:
+        _shared_bldgs = db.query(models.Building.id).filter(
+            models.Building.is_shared == True
+        ).all()
+        _shared_bldg_ids = {b[0] for b in _shared_bldgs}
+        if _shared_bldg_ids:
+            _shared_rooms = db.query(models.Room.id).filter(
+                models.Room.building_id.in_(_shared_bldg_ids)
+            ).all()
+            _shared_room_ids = {r[0] for r in _shared_rooms}
+            if _shared_room_ids:
+                logger.info(f"[SAVE] Shared rooms (exempt from double-booking check): {_shared_room_ids}")
+    except Exception as e:
+        logger.warning(f"[SAVE] Could not load shared rooms: {e}")
+    
     for item in schedule_items:
         # CRITICAL: Validate that we're using solver results, not subject defaults
         subject_id = item.get("subject_id")
@@ -710,24 +728,26 @@ def save_schedule(
             continue
         
         # ROOM CONFLICT CHECK: Prevent double-booking of same room/day/time
+        # Skip check for shared rooms (e.g. FIELD used by multiple NSTP blocks)
         room_id = item.get("room_id")
         if room_id is not None and day_id is not None and time_str:
-            room_slot_key = (room_id, day_id, time_str)
-            if room_slot_key in room_bookings_by_slot:
-                existing_item = room_bookings_by_slot[room_slot_key]
-                logger.warning(
-                    f"[SAVE CONFLICT] Room double-booking prevented! "
-                    f"Room {room_id} Day {day_id} Time {time_str} already assigned to Subject {existing_item.get('subject_id')} Block {existing_item.get('block')}. "
-                    f"Skipping Subject {subject_id} Block {block_value}."
-                )
-                skipped_duplicates.append({
-                    "skipped_item": item,
-                    "existing_item": existing_item,
-                    "reason": "room_double_booking"
-                })
-                continue
-            # Register this room slot as booked
-            room_bookings_by_slot[room_slot_key] = item
+            if room_id not in _shared_room_ids:
+                room_slot_key = (room_id, day_id, time_str)
+                if room_slot_key in room_bookings_by_slot:
+                    existing_item = room_bookings_by_slot[room_slot_key]
+                    logger.warning(
+                        f"[SAVE CONFLICT] Room double-booking prevented! "
+                        f"Room {room_id} Day {day_id} Time {time_str} already assigned to Subject {existing_item.get('subject_id')} Block {existing_item.get('block')}. "
+                        f"Skipping Subject {subject_id} Block {block_value}."
+                    )
+                    skipped_duplicates.append({
+                        "skipped_item": item,
+                        "existing_item": existing_item,
+                        "reason": "room_double_booking"
+                    })
+                    continue
+                # Register this room slot as booked
+                room_bookings_by_slot[room_slot_key] = item
         
         # Log first few items to verify we're saving solver results
         if len(schedules) < 3:
@@ -877,18 +897,39 @@ def get_suggestions(
     # Apply subject-specific room preferences from DB (replaces hardcoded PE/GYM/QUAD logic)
     subject_obj = db.query(models.Subject).get(subject_id)
     preferred_ids = set()
+    shared_room_ids = set()
+    for room in rooms:
+        if not room.building_id:
+            continue
+        building = db.query(models.Building).get(room.building_id)
+        if building and building.is_shared:
+            shared_room_ids.add(room.id)
+    is_shared_room_subject = bool(
+        subject_obj
+        and (
+            getattr(subject_obj, "is_block_shared", False)
+            or (subject_obj.code or "").strip().upper().startswith("NSTP")
+            or (subject_obj.code or "").strip().upper().startswith("PE")
+            or (subject_obj.code or "").strip().upper().startswith("PATHFIT")
+        )
+    )
     if subject_obj and subject_obj.preferred_rooms:
         preferred_ids = {pref.room_id for pref in subject_obj.preferred_rooms}
     elif subject_obj and subject_obj.code:
-        # Inherit preferences from another subject with the same code
+        # Inherit preferences only from the same code AND type. Using code alone
+        # is unsafe for paired LEC/LAB subjects that share a catalog code.
         code_upper = subject_obj.code.strip().upper()
+        subject_type = (getattr(subject_obj, "type", "") or "").strip().upper()
         same_code_subjects = db.query(models.Subject).filter(
             models.Subject.code.ilike(code_upper)
         ).all()
         for scs in same_code_subjects:
-            if scs.preferred_rooms:
+            scs_type = (getattr(scs, "type", "") or "").strip().upper()
+            if scs_type == subject_type and scs.preferred_rooms:
                 preferred_ids = {pref.room_id for pref in scs.preferred_rooms}
                 break
+    if preferred_ids and not is_shared_room_subject:
+        preferred_ids = {rid for rid in preferred_ids if rid not in shared_room_ids}
     if preferred_ids:
         rooms = [r for r in rooms if r.id in preferred_ids]
     else:
@@ -1150,17 +1191,20 @@ def check_resource_availability(
                  # use DB room preferences (preferred_rooms relationship).
                  is_nstp_subj = getattr(subject, 'is_block_shared', False) or subject_code.startswith("NSTP")
                  
-                 # Check if subject has explicit room preferences configured
-                 # Also inherit from same-code subjects if this subject ID doesn't have direct prefs
+                 # Check if subject has explicit room preferences configured.
+                 # Also inherit from same-code subjects of the same type if this
+                 # subject ID doesn't have direct prefs.
                  subject_pref_room_ids = set()
                  if hasattr(subject, 'preferred_rooms') and subject.preferred_rooms:
                      subject_pref_room_ids = {pref.room_id for pref in subject.preferred_rooms}
                  elif subject_code:
+                     subject_type = (getattr(subject, "type", "") or "").strip().upper()
                      same_code_subs = db.query(models.Subject).filter(
                          models.Subject.code.ilike(subject_code)
                      ).all()
                      for scs in same_code_subs:
-                         if hasattr(scs, 'preferred_rooms') and scs.preferred_rooms:
+                         scs_type = (getattr(scs, "type", "") or "").strip().upper()
+                         if scs_type == subject_type and hasattr(scs, 'preferred_rooms') and scs.preferred_rooms:
                              subject_pref_room_ids = {pref.room_id for pref in scs.preferred_rooms}
                              break
                  
@@ -1171,11 +1215,20 @@ def check_resource_availability(
                          bldg = db.query(models.Building).get(r.building_id)
                          if bldg and bldg.is_shared:
                              shared_room_ids.add(r.id)
+                 is_shared_room_subject = (
+                     is_nstp_subj
+                     or subject_code.startswith("PE")
+                     or subject_code.startswith("PATHFIT")
+                 )
+                 if subject_pref_room_ids and not is_shared_room_subject:
+                     subject_pref_room_ids = {
+                         rid for rid in subject_pref_room_ids if rid not in shared_room_ids
+                     }
                  
                  if subject_pref_room_ids:
                      # Subject has explicit room preferences — use them regardless
                      avail_rooms = [rid for rid in avail_rooms if rid in subject_pref_room_ids]
-                 elif is_nstp_subj and shared_room_ids:
+                 elif is_shared_room_subject and shared_room_ids:
                      # NSTP subjects without explicit prefs — use shared building rooms
                      avail_shared = [rid for rid in avail_rooms if rid in shared_room_ids]
                      if avail_shared:
@@ -1183,14 +1236,15 @@ def check_resource_availability(
                      else:
                          avail_rooms = []
                  else:
-                     # All other subjects — shared-building rooms are available to all.
-                     # Only exclude rooms claimed as preferred by other subjects.
+                     # All other subjects — exclude shared-building rooms and rooms
+                     # claimed as preferred by other subjects.
                      all_claimed_ids = set()
                      all_srp = db.query(models.SubjectRoomPreference).all()
                      for _p in all_srp:
                          all_claimed_ids.add(_p.room_id)
-                     if all_claimed_ids:
-                         avail_rooms = [rid for rid in avail_rooms if rid not in all_claimed_ids]
+                     excluded_room_ids = all_claimed_ids | shared_room_ids
+                     if excluded_room_ids:
+                         avail_rooms = [rid for rid in avail_rooms if rid not in excluded_room_ids]
              _subj_college_id = None
              if subject.course_id:
                  _course = db.query(models.Course).filter(models.Course.id == subject.course_id).first()
