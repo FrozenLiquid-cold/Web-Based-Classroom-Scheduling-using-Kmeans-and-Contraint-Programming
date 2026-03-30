@@ -171,8 +171,8 @@ export default function Dashboard() {
                 />
                 <StatCard
                     title="Active Instructors"
-                    value={`${stats.instructors.active}`}
-                    subtext={`${stats.instructors.total} total instructors registered`}
+                    value={`${stats.instructors.active} / ${stats.instructors.total}`}
+                    subtext="Instructors assigned to classes"
                     color="text-blue-600"
                     icon="👨‍🏫"
                 />

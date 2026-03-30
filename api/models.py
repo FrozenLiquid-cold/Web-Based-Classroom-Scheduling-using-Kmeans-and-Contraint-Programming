@@ -99,6 +99,7 @@ class Subject(Base):
     year_level = Column(Integer, nullable=True)  # Year level (1-4) for clustering
     semester = Column(Integer, nullable=True)  # Semester (1-2) for clustering
     is_block_shared = Column(Boolean, default=False, nullable=False, server_default="false")  # All blocks share same room/time, different instructors
+    merge_code = Column(String(100), nullable=True)  # e.g. "MERGED_FROM:CC102_LEC" — set on the surviving subject after a merge
     
     __table_args__ = (
         CheckConstraint("type IN ('LEC', 'LAB')", name="check_subject_type"),
@@ -232,6 +233,7 @@ class Schedule(Base):
     year = Column(Integer, nullable=False)  # 1, 2, 3, 4
     semester = Column(Integer, nullable=False)  # 1, 2
     block = Column(String(50), nullable=True)
+    merge_tag = Column(String(200), nullable=True)  # e.g. "[M] CC101+IAS1" — set on schedule entries during merge
     
     subject = relationship("Subject", back_populates="schedules")
     instructor = relationship("Instructor", back_populates="schedules")

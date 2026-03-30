@@ -22,6 +22,10 @@ class JobRecord:
         self.created_at = time.time()
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
+        # Progressive phase updates
+        self.partial_items: list = []  # Items scheduled so far
+        self.current_phase: str = ""  # e.g. "PE/PATHFIT", "MAJORS", "GE/MINORS"
+        self.total_subjects: int = 0  # Total subjects to schedule
 
 
 class QueueManager:
@@ -69,6 +73,9 @@ class QueueManager:
             "created_at": job.created_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+            "partial_items": job.partial_items,
+            "current_phase": job.current_phase,
+            "total_subjects": job.total_subjects,
         }
     
     def update_status_message(self, job_id: str, message: str) -> None:
@@ -134,6 +141,12 @@ class QueueManager:
                     def progress_callback(message: str) -> None:
                         job.status_message = message
 
+                    # Create a phase callback for progressive timetable updates
+                    def phase_callback(phase_name: str, items_so_far: list, total_subjects: int) -> None:
+                        job.current_phase = phase_name
+                        job.partial_items = list(items_so_far)  # Copy to avoid mutation
+                        job.total_subjects = total_subjects
+
                     items, diagnostics = run_scheduler(
                         db=db,
                         course_id=job.payload["course_id"],
@@ -150,6 +163,7 @@ class QueueManager:
                         block_capacity_overrides=job.payload.get("block_capacities"),
                         blocks_count=job.payload.get("blocks_count"),
                         progress_callback=progress_callback,
+                        phase_callback=phase_callback,
                     )
                     job.result = {"items": items, "count": len(items), "diagnostics": diagnostics}
                     job.status_message = f"Completed! Scheduled {len(items)} items."

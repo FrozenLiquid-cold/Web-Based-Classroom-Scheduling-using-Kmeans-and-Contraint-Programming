@@ -2432,7 +2432,7 @@ def _cp_retry_mini_model(
                                 booked_room_ranges_global, room_name, check_day.id, block_start_min, block_end_min
                             )
                             if isinstance(conflict_metadata, dict):
-                                reason = conflict_metadata.get("description") or f"Course {conflict_metadata.get('course_id')}"
+                                reason = conflict_metadata.get("description") or f"{course_id_to_code.get(conflict_metadata.get('course_id'), 'Other')} {_year_label(conflict_metadata.get('year'))}"
                             elif conflict_metadata is True:
                                 reason = "Existing Schedule"
                                 
@@ -3216,6 +3216,7 @@ def run_cp_scheduler(
     progress_callback: Optional[Any] = None,
     booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
+    phase_callback: Optional[Any] = None,
 ) -> List[Dict]:
     # Debug: Log input parameters
     logger.info("\n" + "="*80)
@@ -3260,6 +3261,86 @@ def run_cp_scheduler(
         if progress_callback is not None:
             try:
                 progress_callback(message)
+            except Exception:
+                pass  # Ignore callback errors
+    
+    # Helper function for phase completion reporting (progressive timetable)
+    def report_phase(phase_name: str, items: list, total_subjects: int) -> None:
+        if phase_callback is not None:
+            try:
+                # Build subject lookup — start from saved full list, then fill gaps from DB
+                try:
+                    _subj_lookup = {s.id: s for s in _all_subjects_for_enrichment}
+                except NameError:
+                    _subj_lookup = {s.id: s for s in subjects}
+
+                # Find missing subject IDs and query them from DB
+                missing_sids = set()
+                for item in items:
+                    sid = item.get('subject_id')
+                    if sid is not None and sid not in _subj_lookup:
+                        missing_sids.add(int(sid))
+                if missing_sids:
+                    try:
+                        extra = db.query(models.Subject).filter(models.Subject.id.in_(list(missing_sids))).all()
+                        for s in extra:
+                            _subj_lookup[s.id] = s
+                    except Exception:
+                        pass
+
+                # Room names — use in-scope map or query DB
+                try:
+                    _room_names = dict(room_id_to_name)
+                except NameError:
+                    _room_names = {}
+                if not _room_names:
+                    try:
+                        _room_names = {r.id: r.name for r in db.query(models.Room).all()}
+                    except Exception:
+                        pass
+
+                # Instructor names — use in-scope map or query DB
+                try:
+                    _instr_names = dict(instr_id_to_name)
+                except NameError:
+                    _instr_names = {}
+                if not _instr_names:
+                    try:
+                        _instr_names = {i.id: f"{getattr(i, 'last_name', '')} {getattr(i, 'first_name', '')}" for i in db.query(models.Instructor).all()}
+                    except Exception:
+                        pass
+                # Fill missing instructor IDs from DB
+                missing_iids = set()
+                for item in items:
+                    iid = item.get('instructor_id')
+                    if iid is not None and iid not in _instr_names:
+                        missing_iids.add(int(iid))
+                if missing_iids:
+                    try:
+                        extra_i = db.query(models.Instructor).filter(models.Instructor.id.in_(list(missing_iids))).all()
+                        for i in extra_i:
+                            _instr_names[i.id] = f"{getattr(i, 'last_name', '')} {getattr(i, 'first_name', '')}"
+                    except Exception:
+                        pass
+
+                enriched = []
+                for item in items:
+                    enriched_item = dict(item)
+                    sid = item.get('subject_id')
+                    if sid is not None and sid in _subj_lookup:
+                        subj = _subj_lookup[sid]
+                        enriched_item['subject_code'] = getattr(subj, 'code', '') or f'S{sid}'
+                        enriched_item['descriptive_title'] = getattr(subj, 'description', '') or ''
+                        enriched_item['subject_type'] = getattr(subj, 'type', '') or ''
+                        enriched_item['units'] = getattr(subj, 'unit', '') or ''
+                    rid = item.get('room_id')
+                    if rid is not None:
+                        enriched_item['room_name'] = _room_names.get(int(rid), f'Room {rid}')
+                    iid = item.get('instructor_id')
+                    if iid is not None:
+                        enriched_item['instructor_name'] = _instr_names.get(int(iid), f'Instructor {iid}')
+                    enriched.append(enriched_item)
+                phase_callback(phase_name, enriched, total_subjects)
             except Exception:
                 pass  # Ignore callback errors
     
@@ -3382,6 +3463,8 @@ def run_cp_scheduler(
     # =========================================================================
     # NSTP SPECIAL HANDLING
     # =========================================================================
+    # Save full subject list for report_phase enrichment (before NSTP filters it)
+    _all_subjects_for_enrichment = list(subjects)
     # NSTP subjects (NSTP1, NSTP 2, NSTP 12, etc.) get special treatment:
     # - Fixed day: Saturday (SAT)
     # - Fixed room: FIELD
@@ -3606,6 +3689,10 @@ def run_cp_scheduler(
                         logger.error(f"Failed to write nstp_debug.log: {e}")
         
         logger.info(f"NSTP pre-scheduling complete: {len(nstp_scheduled_items)} scheduled, {len([s for s in nstp_subjects if s not in non_nstp_subjects])} subjects handled")
+        # Emit NSTP phase results for progressive timetable
+        report_phase("NSTP", list(nstp_scheduled_items), len(_all_subjects_for_enrichment))
+        import time as _phase_time
+        _phase_time.sleep(3)  # Let frontend poll and display
     
     # Use non-NSTP subjects for the main CP solver
     subjects = non_nstp_subjects
@@ -3937,6 +4024,14 @@ def run_cp_scheduler(
     # Create room_id_to_name and room_by_id mappings
     room_id_to_name = {room.id: room.name for room in rooms}
     room_by_id = {room.id: room for room in rooms}
+
+    # Build course code and instructor name lookups for user-friendly diagnostics
+    _all_courses = db.query(models.Course).all() if db else []
+    course_id_to_code = {c.id: (getattr(c, 'code', '') or f'Course {c.id}') for c in _all_courses}
+    instr_id_to_name = {i.id: f"{getattr(i, 'last_name', '')} {getattr(i, 'first_name', '')}" for i in instructors}
+    def _year_label(y):
+        labels = {1: '1st Year', 2: '2nd Year', 3: '3rd Year', 4: '4th Year'}
+        return labels.get(y, f'Year {y}')
     
     # Pre-load building distances and room-to-building mapping for proximity enforcement
     _bldg_dist_map: Dict[Tuple[int, int], int] = {}  # (from_bldg_id, to_bldg_id) -> travel_time_minutes
@@ -4421,6 +4516,9 @@ def run_cp_scheduler(
         # --- Phase transition logging ---
         _iter_phase = _phase_info[0] if _phase_info else "UNKNOWN"
         if _iter_phase != _current_phase_logged:
+            # Emit partial results for the PREVIOUS phase before transitioning
+            if _current_phase_logged is not None:
+                report_phase(_current_phase_logged, list(all_scheduled_items) + list(nstp_scheduled_items), len(_all_subjects_for_enrichment))
             _current_phase_logged = _iter_phase
             logger.info("\n" + "=" * 80)
             logger.info("PHASE: %s", _iter_phase)
@@ -6803,11 +6901,13 @@ def run_cp_scheduler(
 
                     # Update range-based global bookings
                     # Update range-based global bookings with metadata for better diagnostics
+                    _cid = row.get("course_id")
+                    _yr = row.get("year")
                     booking_metadata = {
-                        "course_id": row.get("course_id"),
-                        "year": row.get("year"),
+                        "course_id": _cid,
+                        "year": _yr,
                         "subject_id": row.get("subject_id"),
-                        "description": f"Course {row.get('course_id')} Year {row.get('year')}"
+                        "description": f"{course_id_to_code.get(_cid, 'Unknown')} {_year_label(_yr)}"
                     }
                     booked_room_ranges_global[(room_name, day_id_int)].append((int(start_min_day), int(end_min_day), booking_metadata))
                     
@@ -6979,6 +7079,12 @@ def run_cp_scheduler(
                 all_scheduled_items.append(retry_val)
         
         _trace_all_scheduled_items(f"After Cluster {cluster_id}")
+
+        # Emit partial results after each cluster for progressive timetable updates
+        if _current_phase_logged is not None:
+            report_phase(_current_phase_logged, list(all_scheduled_items) + list(nstp_scheduled_items), len(_all_subjects_for_enrichment))
+            import time as _phase_time
+            _phase_time.sleep(3)  # Let frontend poll and display
         
         # =====================================================================
         # CRITICAL FIX: Update global booking ranges with retry results
@@ -7006,11 +7112,13 @@ def run_cp_scheduler(
                     room_name = room_id_to_name.get(int(room_id), f"Room{room_id}")
                     key = (room_name, int(day_id))
                     # Include metadata for retry-pass bookings
+                    _cid = item.get("course_id")
+                    _yr = item.get("year")
                     booking_metadata = {
-                        "course_id": item.get("course_id"),
-                        "year": item.get("year"),
+                        "course_id": _cid,
+                        "year": _yr,
                         "subject_id": item.get("subject_id"),
-                        "description": f"Course {item.get('course_id')} Year {item.get('year')}"
+                        "description": f"{course_id_to_code.get(_cid, 'Unknown')} {_year_label(_yr)}"
                     }
                     booked_room_ranges_global[key].append((int(start_min), int(end_min), booking_metadata))
                     logger.info(f"[RETRY BOOKING] Added room booking: {room_name} day {day_id} [{start_min}-{end_min}]")
@@ -7365,6 +7473,10 @@ def run_cp_scheduler(
     logger.info("="*80)
     logger.info(formatted_schedule)
     
+    # Emit final phase results for progressive timetable
+    if _current_phase_logged is not None:
+        report_phase(_current_phase_logged, list(all_scheduled_items) + list(nstp_scheduled_items), len(_all_subjects_for_enrichment))
+
     # Add NSTP pre-scheduled items to the final result BEFORE calculating summary
     if nstp_scheduled_items:
         logger.info(f"Adding {len(nstp_scheduled_items)} NSTP pre-scheduled items to final result")
@@ -7720,34 +7832,46 @@ def run_cp_scheduler(
         
         # Merge logic: Keep the "highest priority" reason seen for this subject ID
         
-        # Generate detailed tooltip
+        # Generate user-friendly detail text
         detail_parts = []
         if reason == "Solver Conflict":
-            detail_parts.append("Constraint solver could not find a valid slot combination.")
-            if stats.get("candidates", 0) > 0:
-                detail_parts.append(f"Found {stats.get('candidates')} candidates but they conflicted with other assignments.")
+            cands = stats.get('candidates', 0)
+            if cands > 0:
+                detail_parts.append(f"The system tried {cands} possible schedules but all were taken by other classes.")
+            else:
+                detail_parts.append("All possible schedules conflict with existing classes.")
         
         if stats.get("eligible_rooms", 0) == 0:
-            detail_parts.append("No rooms configured for this subject.")
+            detail_parts.append("No rooms are set up for this subject.")
         elif stats.get("room_conflicts", 0) > 0:
-            # ENHANCED: Use rejection_counters to explain WHY rooms were blocked
             rejections = stats.get("rejection_counters", {})
             if rejections:
                 top_reasons = sorted(rejections.items(), key=lambda x: x[1], reverse=True)[:3]
-                reason_str = ", ".join([f"{k} ({v}x)" for k, v in top_reasons])
-                detail_parts.append(f"Room conflicts: {reason_str}")
+                # Translate "Course X Year Y" and "Blocked by Course X Year Y" to readable course codes
+                def _translate_reason_key(key_str):
+                    import re
+                    m = re.match(r'(?:Blocked by\s+)?Course\s+(\d+)\s+Year\s+(\d+)', key_str)
+                    if m:
+                        cid, yr = int(m.group(1)), int(m.group(2))
+                        return f"{course_id_to_code.get(cid, f'Course {cid}')} {_year_label(yr)}"
+                    # Also translate "BSCS 1st Year" style that already has "Blocked by" prefix
+                    if key_str.startswith("Blocked by "):
+                        return key_str[len("Blocked by "):]
+                    return key_str
+                reason_str = ", ".join([f"{_translate_reason_key(k)} ({v} times)" for k, v in top_reasons])
+                detail_parts.append(f"Rooms are being used by: {reason_str}.")
             else:
-                detail_parts.append(f"Room conflicts found: {stats.get('room_conflicts')}.")
+                detail_parts.append("All eligible rooms are occupied by other classes.")
 
         if stats.get("eligible_instrs", 0) == 0:
-            detail_parts.append("No instructors eligible.")
+            detail_parts.append("No instructor is assigned to this subject.")
         elif stats.get("instr_conflicts", 0) > 0:
-            detail_parts.append(f"Instructor conflicts found: {stats.get('instr_conflicts')}.")
+            detail_parts.append("All assigned instructors are busy at every available time.")
         
         if stats.get("student_conflicts", 0) > 0:
-             detail_parts.append(f"Student conflicts: {stats.get('student_conflicts')} slots blocked.")
+             detail_parts.append(f"{stats.get('student_conflicts')} time slots overlap with other classes for the same students.")
 
-        detail = " ".join(detail_parts) if detail_parts else "No detailed info available."
+        detail = " ".join(detail_parts) if detail_parts else "Could not find an available schedule."
 
         # Merge logic: Keep the "highest priority" reason seen for this subject ID
         current_entry = final_diagnostics.get(original_id_str)
@@ -7828,29 +7952,39 @@ def run_cp_scheduler(
             code = (getattr(subject, "code", "") or "").upper()
             
             # ---- Build a SPECIFIC reason using actual eligibility data ----
-            eligible_room_ids = course_to_all_rooms.get(subject.id, [])
-            eligible_instr_ids = course_to_instructors.get(subject.id, [])
+            # For cloned subjects, eligibility maps may be keyed by original_subject_id
+            _orig_sid = getattr(subject, 'original_subject_id', None) or subject.id
+            eligible_room_ids = course_to_all_rooms.get(subject.id, []) or course_to_all_rooms.get(_orig_sid, [])
+            eligible_instr_ids = course_to_instructors.get(subject.id, []) or course_to_instructors.get(_orig_sid, [])
             num_rooms = len(eligible_room_ids) if eligible_room_ids else 0
             num_instrs = len(eligible_instr_ids) if eligible_instr_ids else 0
             
             if "NSTP" in code:
                 reason = "No Valid Time"
-                detail = "No valid Sunday time slots found, or no eligible instructor matches Sunday schedule."
+                detail = "No available Sunday time slot, or no instructor is free on Sunday."
             elif num_instrs == 0 and num_rooms == 0:
                 reason = "No Instructor & No Rooms"
-                detail = f"This subject has no eligible instructors and no eligible rooms assigned."
+                detail = "This subject has no instructor assigned and no rooms set up. It needs both before it can be scheduled."
             elif num_instrs == 0:
                 reason = "No Instructor"
-                detail = f"No instructor is assigned to teach this subject. {num_rooms} eligible room(s) found but scheduling cannot proceed without an instructor."
+                # Name eligible rooms
+                room_names = [room_id_to_name.get(rid, f'Room {rid}') for rid in eligible_room_ids[:5]]
+                rooms_str = ", ".join(room_names)
+                detail = f"No instructor is assigned to teach this subject. {num_rooms} room(s) available ({rooms_str}) but scheduling needs at least one instructor."
             elif num_rooms == 0:
                 reason = "No Rooms"
-                detail = f"{num_instrs} instructor(s) can teach this subject, but no eligible rooms are available."
+                # Name eligible instructors
+                inames = [instr_id_to_name.get(iid, f'ID {iid}') for iid in eligible_instr_ids[:5]]
+                instrs_str = ", ".join(inames)
+                detail = f"{num_instrs} instructor(s) can teach this ({instrs_str}), but no rooms are set up for this subject type."
             else:
                 # Has both rooms and instructors but still failed -> all slots booked
                 reason = "All Slots Booked"
+                inames = [instr_id_to_name.get(iid, f'ID {iid}') for iid in eligible_instr_ids[:3]]
+                room_names = [room_id_to_name.get(rid, f'Room {rid}') for rid in eligible_room_ids[:3]]
                 detail = (
-                    f"Only {num_instrs} instructor(s) and {num_rooms} eligible room(s) available. "
-                    f"All their time slots are already occupied by other subjects in this block."
+                    f"Only {num_instrs} instructor(s) ({', '.join(inames)}) and {num_rooms} room(s) ({', '.join(room_names)}) are available, "
+                    f"but all their time slots are already taken by other classes in this block."
                 )
             
             diagnostic_entry = {
@@ -8092,12 +8226,61 @@ def run_cp_scheduler(
             except (ValueError, TypeError):
                 pass
             
+            # Build suggestion with specific instructor/room names when available
+            failure_reason = entry.get("failure_reason", "")
+            _entry_metrics = entry.get("metrics", {})
+
+            # Try to get specific instructor/room names for this subject
+            _subj_instr_ids = []
+            _subj_room_ids = []
+            try:
+                sid_int = int(sid_str)
+                for subj in subjects:
+                    _oid = getattr(subj, 'original_subject_id', None) or subj.id
+                    if _oid == sid_int or subj.id == sid_int:
+                        _subj_instr_ids = course_to_instructors.get(subj.id, []) or course_to_instructors.get(_oid, [])
+                        _subj_room_ids = course_to_all_rooms.get(subj.id, []) or course_to_all_rooms.get(_oid, [])
+                        break
+            except (ValueError, TypeError):
+                pass
+
+            # Build registrar-friendly suggestion
+            if failure_reason in ("Solver Conflict", "Room Conflict", "All Slots Booked"):
+                parts = []
+                if _subj_instr_ids:
+                    inames = [instr_id_to_name.get(iid, f'ID {iid}') for iid in _subj_instr_ids[:4]]
+                    parts.append(f"Assigned instructors: {', '.join(inames)} — all are fully booked.")
+                if _subj_room_ids:
+                    rnames = [room_id_to_name.get(rid, f'Room {rid}') for rid in _subj_room_ids[:4]]
+                    parts.append(f"Eligible rooms: {', '.join(rnames)} — all are occupied.")
+                parts.append("Try assigning additional instructors or rooms to free up time slots.")
+                suggestion_text = " ".join(parts)
+            elif failure_reason == "Instructor Conflict":
+                if _subj_instr_ids:
+                    inames = [instr_id_to_name.get(iid, f'ID {iid}') for iid in _subj_instr_ids[:4]]
+                    suggestion_text = f"Assigned instructors ({', '.join(inames)}) are all fully booked. Assign another instructor who has free time."
+                else:
+                    suggestion_text = "All assigned instructors are fully booked. Assign another instructor who has free time."
+            elif failure_reason == "No Instructor":
+                suggestion_text = "No instructor is assigned to this subject yet. Go to the Instructors page and add this subject to an instructor's specialization."
+            elif failure_reason == "No Rooms":
+                subj_type_str = (subject_type or 'LEC').upper()
+                suggestion_text = f"No {subj_type_str} rooms are set up for this subject. Add a {subj_type_str} room in the Rooms page."
+            elif failure_reason == "No Instructor & No Rooms":
+                suggestion_text = "This subject needs both an instructor and a room before it can be scheduled."
+            elif failure_reason == "Student Conflict":
+                suggestion_text = "Every available time overlaps with another class for the same students. Try reducing the number of overlapping subjects."
+            elif failure_reason == "No Valid Time":
+                suggestion_text = "No suitable time slot is available. Check if enough consecutive hours are free."
+            else:
+                suggestion_text = "Check that this subject has instructors and rooms assigned."
+
             unscheduled_reasons[sid_str] = {
                 "subject_code": subject_code or f"Subject {sid_str}",
                 "subject_type": (subject_type or "").upper(),
                 "reason": entry.get("failure_reason", "Unscheduled"),
                 "reason_text": entry.get("detail", ""),
-                "suggestion": _get_suggestion_for_reason(entry.get("failure_reason", "")),
+                "suggestion": suggestion_text,
                 "recommendations": entry.get("recommendations", []),
             }
     

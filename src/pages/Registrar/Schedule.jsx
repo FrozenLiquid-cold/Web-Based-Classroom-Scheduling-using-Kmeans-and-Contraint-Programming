@@ -6,11 +6,14 @@ import {
   loadSchedule as loadScheduleApi,
   saveSchedule,
   mergeSubjects,
+  mergePreview,
+  getScheduledSubjectIds,
   validateScheduleItem,
   getSchedulingSuggestions,
   checkAvailability
 } from "../../services/api";
 import SchedulerDiagnostics from "../../components/SchedulerDiagnostics";
+import ScheduleTimetable from "../../components/ScheduleTimetable";
 
 const YEARS = [1, 2, 3, 4];
 const BLOCK_OPTIONS = [1, 2, 3, 4];
@@ -51,6 +54,10 @@ export default function RegistrarSchedule() {
   const [savedScheduleMessage, setSavedScheduleMessage] = useState("");
   const [hasCheckedSavedSchedule, setHasCheckedSavedSchedule] = useState(false);
   const [diagnostics, setDiagnostics] = useState({});
+  // Progressive timetable state
+  const [partialItems, setPartialItems] = useState([]);
+  const [currentPhase, setCurrentPhase] = useState('');
+  const [totalSubjects, setTotalSubjects] = useState(0);
 
   // Animation states for progressive subject reveal
   const [revealedCount, setRevealedCount] = useState(0);
@@ -69,9 +76,155 @@ export default function RegistrarSchedule() {
   // Recommendations modal state
   const [recommendationModalItem, setRecommendationModalItem] = useState(null);
 
-  // Merge modal state (post-scheduling)
-  const [mergeModal, setMergeModal] = useState({ open: false, sourceSubjectId: null, targetId: '' });
+  // Merge modal state
+  // selectedBlocks: Set of "source_A", "target_B" — only these participate
+  // resourcePicks: { instructor: "source_A", room: "target_B", time: "source_A" }
+  //   Each value is a block key — the ONE block whose resource survives for that type.
+  //   All other selected blocks' resources of that type get freed.
+  const defaultMergeState = {
+    open: false, sourceSubjectId: null, targetId: null,
+    showAllCourses: false, targetSearch: '',
+    preview: null, previewLoading: false,
+    selectedBlocks: new Set(),
+    resourcePicks: { instructor: null, room: null, time: null },
+    compatChecked: false, conflicts: [], safe: false,
+    scheduledIds: null,
+  };
+  const [mergeModal, setMergeModal] = useState(defaultMergeState);
   const [mergeProcessing, setMergeProcessing] = useState(false);
+
+  function openMergeModal(sourceSubjectId) {
+    setMergeModal({ ...defaultMergeState, open: true, sourceSubjectId });
+    const sem = Number(form.semester);
+    getScheduledSubjectIds(sem || undefined).then(ids => {
+      setMergeModal(prev => ({ ...prev, scheduledIds: new Set(ids) }));
+    }).catch(err => console.error('Failed to fetch scheduled IDs:', err));
+  }
+
+  function selectMergeTarget(targetId) {
+    setMergeModal(prev => ({
+      ...prev, targetId,
+      compatChecked: false, conflicts: [], safe: false,
+      preview: null, selectedBlocks: new Set(),
+      resourcePicks: { instructor: null, room: null, time: null },
+    }));
+    if (mergeModal.sourceSubjectId && targetId) {
+      loadMergePreviewData(mergeModal.sourceSubjectId, targetId);
+    }
+  }
+
+  async function loadMergePreviewData(srcId, tgtId) {
+    setMergeModal(prev => ({ ...prev, previewLoading: true }));
+    try {
+      // On re-check, pass current selections so conflict detection only checks selected blocks
+      const isRecheck = mergeModal.preview != null;
+      const opts = {};
+      if (isRecheck && mergeModal.selectedBlocks.size > 0) {
+        opts.selected_blocks = [...mergeModal.selectedBlocks];
+        opts.resource_picks = mergeModal.resourcePicks;
+      }
+      const data = await mergePreview(srcId, tgtId, opts);
+      setMergeModal(prev => {
+        const wasRecheck = !!prev.preview;
+        return {
+          ...prev, preview: data, previewLoading: false,
+          selectedBlocks: wasRecheck ? prev.selectedBlocks : new Set(),
+          resourcePicks: wasRecheck ? prev.resourcePicks : { instructor: null, room: null, time: null },
+          conflicts: data.conflicts || [], safe: data.safe, compatChecked: true,
+        };
+      });
+    } catch (err) {
+      console.error('Preview failed:', err);
+      setMergeModal(prev => ({ ...prev, previewLoading: false }));
+    }
+  }
+
+  function swapMergeDirection() {
+    setMergeModal(prev => {
+      if (!prev.targetId) return prev;
+      const swapKey = k => {
+        if (!k) return null;
+        if (k.startsWith('source_')) return k.replace('source_', 'target_');
+        if (k.startsWith('target_')) return k.replace('target_', 'source_');
+        return k;
+      };
+      const newSelected = new Set();
+      prev.selectedBlocks.forEach(key => newSelected.add(swapKey(key)));
+      return {
+        ...prev,
+        sourceSubjectId: prev.targetId,
+        targetId: prev.sourceSubjectId,
+        selectedBlocks: newSelected,
+        resourcePicks: {
+          instructor: swapKey(prev.resourcePicks.instructor),
+          room: swapKey(prev.resourcePicks.room),
+          time: swapKey(prev.resourcePicks.time),
+        },
+        compatChecked: false, conflicts: [], safe: false, preview: null,
+      };
+    });
+  }
+
+  function toggleBlockSelection(sideBlockKey) {
+    setMergeModal(prev => {
+      const next = new Set(prev.selectedBlocks);
+      if (next.has(sideBlockKey)) {
+        next.delete(sideBlockKey);
+        // Clear any resource picks pointing to the deselected block
+        const newPicks = { ...prev.resourcePicks };
+        if (newPicks.instructor === sideBlockKey) newPicks.instructor = null;
+        if (newPicks.room === sideBlockKey) newPicks.room = null;
+        if (newPicks.time === sideBlockKey) newPicks.time = null;
+        return { ...prev, selectedBlocks: next, resourcePicks: newPicks, compatChecked: false };
+      } else {
+        next.add(sideBlockKey);
+        return { ...prev, selectedBlocks: next, compatChecked: false };
+      }
+    });
+  }
+
+  // Pick a resource: e.g. pickResource('instructor', 'source_A')
+  function pickResource(type, blockKey) {
+    setMergeModal(prev => ({
+      ...prev,
+      compatChecked: false,
+      resourcePicks: { ...prev.resourcePicks, [type]: blockKey },
+    }));
+  }
+
+  async function handleConfirmMerge() {
+    if (!mergeModal.sourceSubjectId || !mergeModal.targetId) { alert('Please select a target subject.'); return; }
+    if (mergeModal.targetId === mergeModal.sourceSubjectId) { alert('Cannot merge into itself.'); return; }
+    if (mergeModal.selectedBlocks.size === 0) { alert('Please select at least one block to merge.'); return; }
+    const picks = mergeModal.resourcePicks;
+    if (!picks.instructor) { alert('Please pick an instructor from one of the selected blocks.'); return; }
+    if (!picks.room) { alert('Please pick a room from one of the selected blocks.'); return; }
+    if (!picks.time) { alert('Please pick a time from one of the selected blocks.'); return; }
+    if (!mergeModal.compatChecked) { alert('Please check compatibility first.'); return; }
+    if (!mergeModal.safe) { alert('Cannot merge: conflicts detected.'); return; }
+    setMergeProcessing(true);
+    try {
+      const res = await mergeSubjects(mergeModal.sourceSubjectId, mergeModal.targetId, {
+        resource_picks: mergeModal.resourcePicks,
+        selected_blocks: [...mergeModal.selectedBlocks],
+      });
+      alert(`Merged successfully! ${res.schedules_moved || 0} schedules moved.`);
+      setMergeModal(defaultMergeState);
+      const [subjectList] = await Promise.all([list("subject")]);
+      setSubjects(subjectList || []);
+      const courseId = Number(form.course_id);
+      const year = Number(form.year);
+      const semester = Number(form.semester);
+      if (courseId && year && semester) {
+        const resp = await loadScheduleApi(courseId, semester, year);
+        if (resp && resp.status === 'success') setSchedule(withUiIds(resp.items || []));
+      }
+    } catch (err) {
+      alert(err.message || 'Merge failed');
+    } finally {
+      setMergeProcessing(false);
+    }
+  }
 
 
 
@@ -138,6 +291,9 @@ export default function RegistrarSchedule() {
     setIsLoadingSavedSchedule(true);
     setSavedScheduleMessage("");
     setHasCheckedSavedSchedule(false);
+    // Clear diagnostics from previous generation so OPTIMAL banner doesn't persist
+    setDiagnostics({});
+    setJobStatus(null);
 
     async function loadSavedSchedule() {
       try {
@@ -197,6 +353,10 @@ export default function RegistrarSchedule() {
     setStatusMessage("Initializing scheduler...");
     setProgress(10);
     setJobId(null);
+    // Reset progressive timetable
+    setPartialItems([]);
+    setCurrentPhase('');
+    setTotalSubjects(0);
 
     try {
       const courseId = Number(form.course_id);
@@ -272,12 +432,23 @@ export default function RegistrarSchedule() {
             resultDiagnostics = finalResult.diagnostics || status.diagnostics || {};
           }
 
-          setJobStatus("succeeded");
-          setSchedule(withUiIds(scheduledItems));
-          setDiagnostics(resultDiagnostics);
-          setProgress(100);
-          setJobId(null);
-          setSubmitting(false);
+          // Progressive reveal: push final items to skeleton timetable first,
+          // then delay the full table transition so user sees items slide in
+          setPartialItems(scheduledItems);
+          setTotalSubjects(scheduledItems.length);
+          setCurrentPhase('Complete');
+
+          // Brief delay to show the progressive reveal animation
+          setTimeout(() => {
+            if (!cancelled) {
+              setJobStatus("succeeded");
+              setSchedule(withUiIds(scheduledItems));
+              setDiagnostics(resultDiagnostics);
+              setProgress(100);
+              setJobId(null);
+              setSubmitting(false);
+            }
+          }, 1500);
           return;
         }
 
@@ -304,6 +475,16 @@ export default function RegistrarSchedule() {
         if (status.status_message) {
           setStatusMessage(status.status_message);
         }
+        // Update progressive timetable from partial results
+        if (status.partial_items && status.partial_items.length > 0) {
+          setPartialItems(status.partial_items);
+        }
+        if (status.current_phase) {
+          setCurrentPhase(status.current_phase);
+        }
+        if (status.total_subjects) {
+          setTotalSubjects(status.total_subjects);
+        }
       } catch (err) {
         if (!cancelled) {
           setError(err.message || "Failed to poll scheduler status.");
@@ -316,7 +497,7 @@ export default function RegistrarSchedule() {
     };
 
     pollStatus();
-    pollTimer = setInterval(pollStatus, 2000);
+    pollTimer = setInterval(pollStatus, 800);
 
     return () => {
       cancelled = true;
@@ -564,7 +745,8 @@ export default function RegistrarSchedule() {
           course_id: Number(form.course_id),
           year: Number(form.year),
           semester: Number(form.semester),
-          block: item._blockLabel || item.block || null
+          block: item._blockLabel || item.block || null,
+          merge_tag: item.merge_tag || null
         });
 
         // Merge backend messages (avoid duplicates)
@@ -614,6 +796,13 @@ export default function RegistrarSchedule() {
       if (item.subject_id === editedItem.subject_id &&
         originalDayIds.includes(item.day_id)) {
         return; // Skip self
+      }
+
+      // Skip items that share the same merge_tag — merged entries are exempt
+      const editMergeTag = editedItem.merge_tag || null;
+      const itemMergeTag = item.merge_tag || null;
+      if (editMergeTag && itemMergeTag && editMergeTag === itemMergeTag) {
+        return; // Merged entries don't conflict with each other
       }
 
       // Check if this item shares any day with our proposed days
@@ -1277,7 +1466,12 @@ export default function RegistrarSchedule() {
         }}
 
       >
-        <td className="px-4 py-2 text-sm text-gray-700">{subjectCode}</td>
+        <td className="px-4 py-2 text-sm text-gray-700">
+          {subjectCode}
+          {slot.merge_tag && (
+            <span className="ml-1 text-[10px] font-semibold text-purple-700 bg-purple-100 border border-purple-200 px-1.5 py-0.5 rounded-full">{slot.merge_tag}</span>
+          )}
+        </td>
         <td className="px-4 py-2 text-sm text-gray-700">{subjectDescription}</td>
         <td className="px-4 py-2 text-sm text-gray-700">{subjectType}</td>
         <td className="px-4 py-2 text-sm text-gray-700">{subjectUnit}</td>
@@ -1355,6 +1549,10 @@ export default function RegistrarSchedule() {
                 </span>
               )}
             </div>
+          ) : isUnscheduled ? (
+            <span className="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-gray-100 text-gray-500 border border-gray-200">
+              Unscheduled
+            </span>
           ) : (
             <span className="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-700 border border-red-200">
               No Instructor
@@ -1365,7 +1563,7 @@ export default function RegistrarSchedule() {
           <button
             onClick={(e) => {
               e.stopPropagation();
-              setMergeModal({ open: true, sourceSubjectId: subjectId, targetId: '' });
+              openMergeModal(subjectId);
             }}
             className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-indigo-50 hover:bg-indigo-100 text-indigo-600 hover:text-indigo-800 transition-colors"
             title="Merge this subject"
@@ -1483,104 +1681,27 @@ export default function RegistrarSchedule() {
         </div>
       </form>
 
-      {/* Enhanced Progress Bar with Skeleton Timetable */}
+      {/* Progressive Skeleton Timetable during scheduling */}
       {(isSubmitting ||
         ["initializing", "queued", "running"].includes(jobStatus)) && (
           <div className="mt-6">
-            {/* Modern gradient progress bar with shimmer effect */}
-            <div className="relative mb-6">
-              <div className="flex justify-between items-center mb-2">
-                <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse" />
-                  <span className="text-sm font-medium text-gray-700">
-                    {statusMessage || (
-                      jobStatus === "running" ? "Scheduling subjects..." :
-                        jobStatus === "queued" ? "Preparing scheduler..." :
-                          "Initializing..."
-                    )}
-                  </span>
-                </div>
-                <span className="text-sm font-semibold text-blue-600">
-                  {Math.round(progress)}%
-                </span>
-              </div>
-              <div className="w-full h-3 bg-gray-200 rounded-full overflow-hidden shadow-inner">
-                <div
-                  className="h-full rounded-full transition-all duration-300 ease-out relative"
-                  style={{
-                    width: `${Math.min(Math.max(progress, 0), 100)}%`,
-                    background: 'linear-gradient(90deg, #3b82f6 0%, #8b5cf6 50%, #3b82f6 100%)',
-                    backgroundSize: '200% 100%',
-                    animation: 'shimmer 1.5s infinite linear'
-                  }}
-                >
-                  <div
-                    className="absolute inset-0 rounded-full"
-                    style={{
-                      background: 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.4) 50%, transparent 100%)',
-                      animation: 'shimmer-glow 1.5s infinite linear'
-                    }}
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Skeleton timetable preview with blur effect */}
-            <div className="relative rounded-lg overflow-hidden border border-gray-200 shadow-sm">
-              <div
-                className="absolute inset-0 backdrop-blur-sm bg-white/60 z-10 flex items-center justify-center"
-                style={{ backdropFilter: 'blur(4px)' }}
-              >
-                <div className="text-center">
-                  <div className="inline-flex items-center gap-2 px-4 py-2 bg-white/90 rounded-full shadow-lg">
-                    <svg className="w-5 h-5 text-blue-500 animate-spin" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                    <span className="text-sm font-medium text-gray-700">Generating timetable...</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Skeleton table structure */}
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    {["Code", "Description", "Type", "Unit", "Days", "Time", "Room", "Instructor"].map((header) => (
-                      <th key={header} className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                        {header}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-100">
-                  {[...Array(6)].map((_, idx) => (
-                    <tr key={idx} className="animate-pulse">
-                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-16" /></td>
-                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-32" /></td>
-                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-12" /></td>
-                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-8" /></td>
-                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-12" /></td>
-                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-24" /></td>
-                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-16" /></td>
-                      <td className="px-4 py-3"><div className="h-4 bg-gray-200 rounded w-28" /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            {/* CSS for shimmer animation */}
-            <style>{`
-            @keyframes shimmer {
-              0% { background-position: 200% 0; }
-              100% { background-position: -200% 0; }
-            }
-            @keyframes shimmer-glow {
-              0% { transform: translateX(-100%); }
-              100% { transform: translateX(200%); }
-            }
-          `}</style>
+            <ScheduleTimetable
+              partialItems={partialItems}
+              totalSubjects={totalSubjects}
+              currentPhase={currentPhase}
+              statusMessage={statusMessage || (
+                jobStatus === "running" ? "Scheduling subjects..." :
+                  jobStatus === "queued" ? "Preparing scheduler..." :
+                    "Initializing..."
+              )}
+              isComplete={false}
+              blocksCount={Number(form.blocks_count) || 1}
+              subjectCount={subjects.filter(s =>
+                String(s.course_id) === String(form.course_id) &&
+                String(s.semester) === String(form.semester) &&
+                (!form.year || form.year.toString().split(',').map(Number).includes(Number(s.year_level)))
+              ).length}
+            />
           </div>
         )}
 
@@ -1692,123 +1813,244 @@ export default function RegistrarSchedule() {
         const sourceSubject = subjects.find(s => s.id === mergeModal.sourceSubjectId);
         if (!sourceSubject) return null;
 
-        const courseName = (cid) => {
+        const mergeCourseName = (cid) => {
           const c = courses.find(co => co.id === cid);
           return c ? (c.code || c.name || `Course ${c.id}`) : '';
         };
 
-        // Target options: same-type subjects from the same course (exclude source)
+        // Target options: filter by search, course, same semester, and scheduled-only
+        const currentSemester = Number(form.semester);
+        const tSearch = (mergeModal.targetSearch || '').toLowerCase();
         const targetOptions = subjects.filter(s => {
           if (s.id === sourceSubject.id) return false;
-          return s.course_id === sourceSubject.course_id;
-        });
+          // Only subjects that have schedule entries
+          if (mergeModal.scheduledIds && !mergeModal.scheduledIds.has(s.id)) return false;
+          // Only subjects in the same semester
+          const subSem = Number(s.semester ?? s.sem);
+          if (currentSemester && subSem && subSem !== currentSemester) return false;
+          if (!mergeModal.showAllCourses && s.course_id !== sourceSubject.course_id) return false;
+          if (tSearch && !(s.code + ' ' + s.description).toLowerCase().includes(tSearch)) return false;
+          return true;
+        }).sort((a, b) => (a.code || '').localeCompare(b.code || ''));
 
-        const handleConfirmMerge = async () => {
-          if (!mergeModal.targetId) { alert('Please select a target subject.'); return; }
-          if (mergeModal.targetId === mergeModal.sourceSubjectId) { alert('Cannot merge into itself.'); return; }
-          setMergeProcessing(true);
-          try {
-            const res = await mergeSubjects(mergeModal.sourceSubjectId, mergeModal.targetId);
-            alert(`Merged successfully! ${res.schedules_moved || 0} schedules moved.`);
-            setMergeModal({ open: false, sourceSubjectId: null, targetId: '' });
-            // Reload subjects + schedule
-            const [subjectList] = await Promise.all([list("subject")]);
-            setSubjects(subjectList || []);
-          } catch (err) {
-            alert(err.message || 'Merge failed');
-          } finally {
-            setMergeProcessing(false);
-          }
+        // Schedule resource card — block selection + clickable cross-block resource picks
+        const ScheduleResCard = ({ scheduleList, side }) => {
+          if (!scheduleList || scheduleList.length === 0) return <div className="text-xs text-gray-400 italic py-2">No schedule entries</div>;
+
+          const grouped = {};
+          scheduleList.forEach(s => {
+            const key = s.block || '_none';
+            if (!grouped[key]) grouped[key] = { block: s.block, instructor: s.instructor, room: s.room, days: [] };
+            grouped[key].days.push({ day: s.day, time: s.time });
+          });
+
+          const picks = mergeModal.resourcePicks;
+
+          return (
+            <div className="space-y-2">
+              {Object.entries(grouped).map(([blockKey, g]) => {
+                const decKey = `${side}_${blockKey}`;
+                const isSelected = mergeModal.selectedBlocks.has(decKey);
+                // For each resource type: is THIS block the picked one?
+                const isPicked = (type) => picks[type] === decKey;
+                // Another block is picked for this type (so this one will be freed)
+                const isFreed = (type) => isSelected && picks[type] && picks[type] !== decKey;
+
+                const resStyle = (type) => {
+                  if (!isSelected) return '';
+                  if (isPicked(type)) return 'bg-green-100 border-green-400 ring-1 ring-green-300 font-semibold cursor-pointer';
+                  if (isFreed(type)) return 'bg-red-50 line-through opacity-50 cursor-pointer';
+                  return 'bg-gray-50 hover:bg-blue-50 cursor-pointer border-dashed border-gray-300';
+                };
+
+                return (
+                  <div key={blockKey} className={`text-xs rounded-lg p-2 border transition-all ${isSelected ? 'bg-white border-indigo-300 ring-1 ring-indigo-200' : 'bg-gray-100 border-gray-200 opacity-60'}`}>
+                    <label className="flex items-center gap-2 cursor-pointer mb-1">
+                      <input type="checkbox" checked={isSelected} onChange={() => toggleBlockSelection(decKey)} className="w-4 h-4 accent-indigo-600" />
+                      <span className={`font-semibold ${isSelected ? 'text-indigo-700' : 'text-gray-500'}`}>
+                        {g.block ? `Block ${g.block}` : 'Schedule'}
+                        {!isSelected && <span className="ml-2 text-[10px] font-normal text-gray-400">(will not be affected)</span>}
+                      </span>
+                    </label>
+                    <div className={`pl-6 space-y-1 mt-1 ${!isSelected ? 'text-gray-400 text-[10px]' : ''}`}>
+                      <div
+                        className={`rounded px-2 py-1 border transition-all ${resStyle('instructor')}`}
+                        onClick={() => isSelected && pickResource('instructor', decKey)}
+                      >
+                        {isPicked('instructor') && <span className="text-green-600 mr-1">✓</span>}
+                        {"\uD83D\uDC68\u200D\uD83C\uDFEB"} {g.instructor ? g.instructor.name : '(none)'}
+                      </div>
+                      <div
+                        className={`rounded px-2 py-1 border transition-all ${resStyle('room')}`}
+                        onClick={() => isSelected && pickResource('room', decKey)}
+                      >
+                        {isPicked('room') && <span className="text-green-600 mr-1">✓</span>}
+                        {"\uD83C\uDFE2"} {g.room ? g.room.name : '(none)'}
+                      </div>
+                      <div
+                        className={`rounded px-2 py-1 border transition-all ${resStyle('time')}`}
+                        onClick={() => isSelected && pickResource('time', decKey)}
+                      >
+                        {isPicked('time') && <span className="text-green-600 mr-1">✓</span>}
+                        {"\uD83D\uDD50"} {g.days.map(d => `${d.day ? d.day.label : '?'}`).join('-')} {g.days[0]?.time || '(none)'}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          );
         };
-
-        const selectedTarget = subjects.find(s => s.id === mergeModal.targetId);
 
         return (
           <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
-            <div className="w-full max-w-2xl bg-white rounded-xl shadow-xl overflow-hidden">
+            <div className="w-full max-w-4xl bg-white rounded-xl shadow-xl overflow-hidden">
+              {/* Header */}
               <div className="bg-indigo-600 px-6 py-4 flex items-center justify-between">
                 <h3 className="text-xl font-semibold text-white flex items-center gap-2">
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z" /></svg>
-                  Merge Subject
+                  Merge Subjects
                 </h3>
-                <button onClick={() => setMergeModal({ open: false, sourceSubjectId: null, targetId: '' })} className="text-white/80 hover:text-white">
-                  <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" /></svg>
-                </button>
+                <button onClick={() => setMergeModal(defaultMergeState)} className="text-white/80 hover:text-white text-xl">{"\u2715"}</button>
               </div>
 
-              <div className="p-6 space-y-4">
+              {/* Info */}
+              <div className="px-6 pt-4">
                 <div className="bg-orange-50 text-orange-800 p-3 rounded-lg text-sm border border-orange-200">
-                  <strong>Warning:</strong> The source subject will be deleted. Existing schedules will be moved to the target. This cannot be undone.
+                  <strong>How to merge:</strong> Select blocks to include, then <strong>click one resource per type</strong> (instructor, room, time) across all selected blocks. The clicked resource is <strong>copied to all selected blocks</strong>. Merged entries are tagged <code className="bg-orange-100 px-1 rounded">[M]</code>.
                 </div>
+              </div>
 
-                {/* Source subject */}
-                <div>
-                  <div className="text-xs font-semibold text-gray-500 uppercase mb-1">Source (Will be deleted)</div>
-                  <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-                    <div className="font-medium text-gray-900">{sourceSubject.code}</div>
-                    <div className="text-sm text-gray-600">{sourceSubject.description} • {sourceSubject.type} • {sourceSubject.unit} Units</div>
-                    <div className="text-xs text-gray-500 mt-1">{courseName(sourceSubject.course_id)}</div>
-                  </div>
-                </div>
+              {/* Horizontal layout: Source \u2192 Target */}
+              <div className="p-6 overflow-y-auto max-h-[60vh]">
+                <div className="flex gap-4 items-stretch">
 
-                {/* Arrow */}
-                <div className="flex justify-center">
-                  <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 13.5L12 21m0 0l-7.5-7.5M12 21V3" />
-                  </svg>
-                </div>
-
-                {/* Target options — horizontal scrollable cards */}
-                <div>
-                  <div className="text-xs font-semibold text-indigo-600 uppercase mb-2">Select Target (Will survive)</div>
-                  {targetOptions.length === 0 ? (
-                    <p className="text-sm text-gray-500">No eligible target subjects found in this course.</p>
-                  ) : (
-                    <div className="flex gap-2 overflow-x-auto pb-2">
-                      {targetOptions.map(opt => (
-                        <button
-                          key={opt.id}
-                          onClick={() => setMergeModal(prev => ({ ...prev, targetId: opt.id }))}
-                          className={`flex-shrink-0 rounded-lg border-2 p-3 text-left transition-all min-w-[160px] max-w-[200px] ${
-                            mergeModal.targetId === opt.id
-                              ? 'border-indigo-500 bg-indigo-50 ring-2 ring-indigo-200'
-                              : 'border-gray-200 bg-white hover:border-indigo-300 hover:bg-indigo-50/50'
-                          }`}
-                        >
-                          <div className="font-semibold text-sm text-gray-900">{opt.code}</div>
-                          <div className="text-xs text-gray-600 mt-0.5 line-clamp-2">{opt.description}</div>
-                          <div className="text-xs text-gray-500 mt-1">{opt.type} • {opt.unit}u</div>
-                        </button>
-                      ))}
+                  {/* SOURCE (left) */}
+                  <div className="flex-1 border rounded-xl overflow-hidden bg-gray-50">
+                    <div className="bg-gray-200 px-4 py-2">
+                      <div className="text-xs font-bold text-gray-600 uppercase">Source (Schedules move to target)</div>
                     </div>
-                  )}
+                    <div className="p-4 space-y-2">
+                      <div className="font-semibold text-gray-900">{sourceSubject.code}</div>
+                      <div className="text-sm text-gray-600">{sourceSubject.description}</div>
+                      <div className="text-xs text-gray-500">{sourceSubject.type} {"\u2022"} {sourceSubject.unit} Units</div>
+                      <div className="text-xs text-gray-400">{mergeCourseName(sourceSubject.course_id)}</div>
+                      {mergeModal.preview && (
+                        <div className="mt-3 pt-3 border-t">
+                          <div className="text-xs font-semibold text-gray-500 mb-2">Schedule Resources {"\u2014"} check to keep:</div>
+                          <ScheduleResCard scheduleList={mergeModal.preview.source.schedules} side="source" />
+                        </div>
+                      )}
+                      {mergeModal.previewLoading && <div className="text-xs text-gray-400 mt-2">Loading schedules...</div>}
+                    </div>
+                  </div>
+
+                  {/* Arrow + Swap */}
+                  <div className="flex flex-col items-center justify-center gap-2 px-2">
+                    <div className="text-2xl text-gray-400">{"\u2192"}</div>
+                    <button onClick={swapMergeDirection} className="bg-white border shadow-sm rounded-full p-2 hover:bg-gray-50 hover:text-indigo-600 transition-colors" title="Swap source and target">
+                      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" />
+                      </svg>
+                    </button>
+                  </div>
+
+                  {/* TARGET (right) */}
+                  <div className="flex-1 border rounded-xl overflow-hidden border-indigo-200">
+                    <div className="bg-indigo-50 px-4 py-2 flex items-center justify-between">
+                      <div className="text-xs font-bold text-indigo-700 uppercase">Target (Will survive)</div>
+                      <button
+                        onClick={() => setMergeModal(prev => ({ ...prev, showAllCourses: !prev.showAllCourses }))}
+                        className="text-[10px] bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full hover:bg-indigo-200 transition-colors"
+                      >
+                        {mergeModal.showAllCourses ? 'All courses' : 'Same course'}
+                      </button>
+                    </div>
+                    <div className="p-4 space-y-3">
+                      {/* Search input */}
+                      <input
+                        className="w-full px-3 py-2 rounded-lg border border-gray-300 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                        placeholder="Search target subject..."
+                        value={mergeModal.targetSearch}
+                        onChange={e => setMergeModal(prev => ({ ...prev, targetSearch: e.target.value }))}
+                      />
+
+                      {/* Scrollable subject list */}
+                      <div className="max-h-36 overflow-y-auto space-y-1 border rounded-lg p-2 bg-gray-50">
+                        {targetOptions.length === 0 && (
+                          <div className="text-xs text-gray-400 text-center py-3">No matching subjects</div>
+                        )}
+                        {targetOptions.map(opt => (
+                          <div
+                            key={opt.id}
+                            onClick={() => selectMergeTarget(opt.id)}
+                            className={`px-3 py-2 rounded-lg cursor-pointer text-sm transition-colors ${
+                              mergeModal.targetId === opt.id
+                                ? 'bg-indigo-100 border-indigo-300 border text-indigo-900 font-semibold'
+                                : 'hover:bg-white border border-transparent'
+                            }`}
+                          >
+                            <div className="font-medium">{opt.code}</div>
+                            <div className="text-xs text-gray-500">{opt.description} {"\u2022"} {opt.type} {"\u2022"} {opt.unit} Units {mergeModal.showAllCourses ? `[${mergeCourseName(opt.course_id)}]` : ''}</div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Target schedule resources */}
+                      {mergeModal.preview && mergeModal.targetId && (
+                        <div className="mt-2 pt-2 border-t">
+                          <div className="text-xs font-semibold text-gray-500 mb-2">Schedule Resources {"\u2014"} check to keep:</div>
+                          <ScheduleResCard scheduleList={mergeModal.preview.target.schedules} side="target" />
+                        </div>
+                      )}
+                      {mergeModal.previewLoading && <div className="text-xs text-gray-400 mt-2">Loading schedules...</div>}
+                    </div>
+                  </div>
+
                 </div>
 
-                {/* Selected target preview */}
-                {selectedTarget && (
-                  <div className="bg-green-50 border border-green-200 rounded-lg p-3">
-                    <div className="text-xs font-semibold text-green-700 uppercase mb-1">Target Selected</div>
-                    <div className="font-medium text-gray-900">{selectedTarget.code}</div>
-                    <div className="text-sm text-gray-600">{selectedTarget.description} • {selectedTarget.type} • {selectedTarget.unit} Units</div>
+                {/* Compatibility status */}
+                {mergeModal.compatChecked && mergeModal.targetId && (
+                  <div className={`mt-4 p-3 rounded-lg border text-sm ${mergeModal.safe ? 'bg-green-50 border-green-200 text-green-800' : 'bg-red-50 border-red-200 text-red-800'}`}>
+                    {mergeModal.safe ? (
+                      <div className="flex items-center gap-2">{"\u2705"} <strong>Compatible</strong> {"\u2014"} No instructor or room conflicts detected.</div>
+                    ) : (
+                      <div>
+                        <div className="flex items-center gap-2 mb-2">{"\u26A0\uFE0F"} <strong>Conflicts detected {"\u2014"} merge blocked</strong></div>
+                        <ul className="list-disc list-inside space-y-1 text-xs">
+                          {mergeModal.conflicts.map((c, i) => <li key={i}>{c.message || c}</li>)}
+                        </ul>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
-              <div className="bg-gray-50 px-6 py-4 flex justify-end gap-3 border-t">
+              {/* Footer */}
+              <div className="bg-gray-50 px-6 py-4 flex items-center justify-between border-t">
                 <button
-                  onClick={() => setMergeModal({ open: false, sourceSubjectId: null, targetId: '' })}
-                  className="px-4 py-2 rounded text-gray-700 font-medium hover:bg-gray-200 transition-colors"
-                  disabled={mergeProcessing}
+                  onClick={() => mergeModal.sourceSubjectId && mergeModal.targetId && loadMergePreviewData(mergeModal.sourceSubjectId, mergeModal.targetId)}
+                  className="px-4 py-2 rounded bg-gray-200 text-gray-700 font-medium hover:bg-gray-300 transition-colors disabled:opacity-50"
+                  disabled={!mergeModal.targetId || mergeModal.previewLoading}
                 >
-                  Cancel
+                  {mergeModal.previewLoading ? 'Checking...' : '\uD83D\uDD0D Re-check Compatibility'}
                 </button>
-                <button
-                  onClick={handleConfirmMerge}
-                  className="px-4 py-2 rounded bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors disabled:opacity-50"
-                  disabled={mergeProcessing || !mergeModal.targetId}
-                >
-                  {mergeProcessing ? 'Merging...' : 'Confirm Merge'}
-                </button>
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setMergeModal(defaultMergeState)}
+                    className="px-4 py-2 rounded text-gray-700 font-medium hover:bg-gray-200 transition-colors"
+                    disabled={mergeProcessing}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleConfirmMerge}
+                    className="px-4 py-2 rounded bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors disabled:opacity-50"
+                    disabled={mergeProcessing || !mergeModal.targetId || !mergeModal.safe || mergeModal.selectedBlocks.size === 0 || !mergeModal.resourcePicks.instructor || !mergeModal.resourcePicks.room || !mergeModal.resourcePicks.time}
+                  >
+                    {mergeProcessing ? 'Merging...' : 'Confirm Merge'}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1820,16 +2062,6 @@ export default function RegistrarSchedule() {
           {hasCheckedSavedSchedule
             ? "No schedule to display for the current selection."
             : "Run the scheduler to see results."}
-        </p>
-      )}
-
-      {jobStatus && (
-        <p className="mt-4 text-sm text-gray-500">
-          Scheduler status:{" "}
-          <span className="font-semibold capitalize">{jobStatus}</span>
-          {jobStatus === "queued" || jobStatus === "running"
-            ? " \u2014 please keep this page open while we generate the schedule."
-            : ""}
         </p>
       )}
 

@@ -196,6 +196,7 @@ class SubjectResponse(BaseModel):
     course_id: Optional[int] = None
     is_block_shared: Optional[bool] = False
     preferred_room_ids: Optional[List[int]] = None  # Rooms this subject is restricted to
+    merge_code: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -204,6 +205,11 @@ class SubjectResponse(BaseModel):
 class SubjectMerge(BaseModel):
     source_id: int
     target_id: int
+    # Per-type resource picks: { "instructor": "source_A", "room": "target_B", "time": "source_A" }
+    # Each value is the block key whose resource survives; all others are freed.
+    resource_picks: Optional[dict] = None
+    # List of selected block keys: ["source_A", "target_B", ...]
+    selected_blocks: Optional[list] = None
 
 
 # Room schemas
@@ -356,3 +362,4 @@ class ScheduleValidationRequest(BaseModel):
     year: int
     semester: int
     block: Optional[str] = None
+    merge_tag: Optional[str] = None  # If set, entries with same merge_tag are exempt from conflicts

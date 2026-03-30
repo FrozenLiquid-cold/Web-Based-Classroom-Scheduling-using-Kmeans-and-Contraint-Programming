@@ -75,6 +75,7 @@ def get_room_schedule():
                 "type": s.subject.type if s.subject else "",
                 "instructor_name": instructor_name,
                 "block": s.block,
+                "merge_tag": getattr(s, "merge_tag", None),
                 "year": s.year,
                 "semester": s.semester
             })
@@ -421,6 +422,7 @@ def load_schedule_route():
                     "year": sched.year,
                     "semester": sched.semester,
                     "block": getattr(sched, "block", None),
+                    "merge_tag": getattr(sched, "merge_tag", None),
                 }
                 for sched in schedules
             ]
@@ -459,6 +461,7 @@ def load_schedule_route():
                     "year": sched.year,
                     "semester": sched.semester,
                     "block": getattr(sched, "block", None),
+                    "merge_tag": getattr(sched, "merge_tag", None),
                 }
                 for sched in unique_schedules
             ]
@@ -543,6 +546,7 @@ def load_instructor_schedule():
                 "year": sched.year,
                 "semester": sched.semester,
                 "block": getattr(sched, "block", None),
+                "merge_tag": getattr(sched, "merge_tag", None),
             })
         
         response = jsonify({

@@ -41,6 +41,7 @@ def run_scheduler(
     block_capacity_overrides: Optional[List[Dict[str, Any]]] = None,
     blocks_count: Optional[int] = None,
     progress_callback: Optional[Any] = None,
+    phase_callback: Optional[Any] = None,
 ) -> Tuple[List[Dict], Dict[int, Dict]]:
     """
     Generate schedules for one or more year levels using K-Means clustering
@@ -390,7 +391,7 @@ def run_scheduler(
                                 "course_id": sched.course_id,
                                 "year": sched.year,
                                 "subject_id": sched.subject_id,
-                                "description": f"Course {sched.course_id} Year {sched.year}"
+                                "description": f"Existing schedule"
                             })
                             
                             # Append
@@ -418,7 +419,7 @@ def run_scheduler(
                     "course_id": sched.course_id,
                     "year": sched.year,
                     "subject_id": sched.subject_id,
-                    "description": f"Course {sched.course_id} Year {sched.year}"
+                    "description": f"Existing schedule"
                 }
                 
                 # Add to room ranges
@@ -457,6 +458,7 @@ def run_scheduler(
                 progress_callback=report_progress,
                 booked_room_ranges_global=booked_room_ranges,
                 booked_instr_ranges_global=booked_instr_ranges,
+                phase_callback=phase_callback,
             )
             
             cp_elapsed = time.time() - cp_start

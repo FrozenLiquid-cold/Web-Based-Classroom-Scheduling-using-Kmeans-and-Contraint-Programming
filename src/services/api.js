@@ -130,11 +130,31 @@ export async function update(entity, id, data) {
   })
 }
 
-export async function mergeSubjects(sourceId, targetId) {
+export async function mergeSubjects(sourceId, targetId, opts = {}) {
   return apiCall(`/subjects/merge`, {
     method: 'POST',
-    body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
+    body: JSON.stringify({
+      source_id: sourceId,
+      target_id: targetId,
+      resource_picks: opts.resource_picks || null,
+      selected_blocks: opts.selected_blocks || null,
+    }),
   })
+}
+
+export async function mergePreview(sourceId, targetId, opts = {}) {
+  const body = { source_id: sourceId, target_id: targetId };
+  if (opts.selected_blocks) body.selected_blocks = opts.selected_blocks;
+  if (opts.resource_picks) body.resource_picks = opts.resource_picks;
+  return apiCall(`/subjects/merge/preview`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export async function getScheduledSubjectIds(semester) {
+  const params = semester ? `?semester=${semester}` : '';
+  return apiCall(`/subjects/scheduled-ids${params}`)
 }
 
 export async function remove(entity, id) {

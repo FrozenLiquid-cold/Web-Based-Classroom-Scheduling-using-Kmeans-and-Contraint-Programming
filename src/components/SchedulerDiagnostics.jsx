@@ -2,10 +2,11 @@ import React, { useState } from 'react';
 
 /**
  * SchedulerDiagnostics - Visual feedback for scheduler results
- * Shows solver status, scheduled counts, and failure reasons
+ * Shows solver status, scheduled counts, failure reasons, and specific recommendations
  */
 export default function SchedulerDiagnostics({ diagnostics, isVisible = true }) {
     const [isExpanded, setIsExpanded] = useState(true);
+    const [expandedSubjects, setExpandedSubjects] = useState(new Set());
 
     if (!diagnostics || !isVisible) return null;
 
@@ -38,6 +39,31 @@ export default function SchedulerDiagnostics({ diagnostics, isVisible = true }) 
     const unscheduledList = Object.entries(unscheduled_reasons);
     const hasUnscheduled = unscheduledList.length > 0;
     const allScheduled = subjects_scheduled === subjects_total && subjects_total > 0;
+
+    const toggleSubjectExpanded = (subjectId) => {
+        setExpandedSubjects(prev => {
+            const next = new Set(prev);
+            if (next.has(subjectId)) next.delete(subjectId);
+            else next.add(subjectId);
+            return next;
+        });
+    };
+
+    // Get reason-specific icon
+    const getReasonIcon = (reason) => {
+        switch (reason) {
+            case 'No Instructor': return '👨‍🏫';
+            case 'No Rooms': return '🏢';
+            case 'No Instructor & No Rooms': return '🚫';
+            case 'Solver Conflict': return '⚡';
+            case 'Room Conflict': return '🏢';
+            case 'Instructor Conflict': return '👨‍🏫';
+            case 'Student Conflict': return '👥';
+            case 'All Slots Booked': return '📅';
+            case 'No Valid Time': return '🕐';
+            default: return '❓';
+        }
+    };
 
     return (
         <div style={{
@@ -130,55 +156,201 @@ export default function SchedulerDiagnostics({ diagnostics, isVisible = true }) 
                             </div>
 
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                                {unscheduledList.map(([subjectId, info]) => (
-                                    <div
-                                        key={subjectId}
-                                        style={{
-                                            padding: '10px 12px',
-                                            backgroundColor: 'white',
-                                            borderRadius: '6px',
-                                            border: '1px solid #e5e7eb',
-                                        }}
-                                    >
-                                        <div style={{
-                                            fontSize: '13px',
-                                            fontWeight: '600',
-                                            color: '#111827',
-                                        }}>
-                                            {info.subject_code || `Subject ID: ${subjectId}`}
-                                            {info.subject_type && (
-                                                <span style={{
-                                                    marginLeft: '8px',
-                                                    padding: '2px 6px',
-                                                    fontSize: '11px',
-                                                    backgroundColor: info.subject_type === 'LAB' ? '#dbeafe' : '#f3e8ff',
-                                                    color: info.subject_type === 'LAB' ? '#1d4ed8' : '#7c3aed',
-                                                    borderRadius: '4px',
+                                {unscheduledList.map(([subjectId, info]) => {
+                                    const recs = info.recommendations || [];
+                                    const hasRecs = recs.length > 0;
+                                    const isSubjExpanded = expandedSubjects.has(subjectId);
+
+                                    return (
+                                        <div
+                                            key={subjectId}
+                                            style={{
+                                                padding: '10px 12px',
+                                                backgroundColor: 'white',
+                                                borderRadius: '6px',
+                                                border: '1px solid #e5e7eb',
+                                            }}
+                                        >
+                                            {/* Subject header */}
+                                            <div style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                justifyContent: 'space-between',
+                                            }}>
+                                                <div style={{
+                                                    fontSize: '13px',
+                                                    fontWeight: '600',
+                                                    color: '#111827',
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    gap: '6px',
                                                 }}>
-                                                    {info.subject_type}
-                                                </span>
-                                            )}
-                                        </div>
+                                                    <span>{getReasonIcon(info.reason)}</span>
+                                                    {info.subject_code || `Subject ID: ${subjectId}`}
+                                                    {info.subject_type && (
+                                                        <span style={{
+                                                            padding: '2px 6px',
+                                                            fontSize: '11px',
+                                                            backgroundColor: info.subject_type === 'LAB' ? '#dbeafe' : '#f3e8ff',
+                                                            color: info.subject_type === 'LAB' ? '#1d4ed8' : '#7c3aed',
+                                                            borderRadius: '4px',
+                                                        }}>
+                                                            {info.subject_type}
+                                                        </span>
+                                                    )}
+                                                    {info.reason && (
+                                                        <span style={{
+                                                            padding: '2px 8px',
+                                                            fontSize: '10px',
+                                                            backgroundColor: '#fef2f2',
+                                                            color: '#dc2626',
+                                                            borderRadius: '9999px',
+                                                            fontWeight: '500',
+                                                        }}>
+                                                            {info.reason}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                {hasRecs && (
+                                                    <button
+                                                        onClick={() => toggleSubjectExpanded(subjectId)}
+                                                        style={{
+                                                            background: 'none',
+                                                            border: '1px solid #d1d5db',
+                                                            borderRadius: '4px',
+                                                            padding: '2px 8px',
+                                                            fontSize: '11px',
+                                                            color: '#4b5563',
+                                                            cursor: 'pointer',
+                                                        }}
+                                                    >
+                                                        {isSubjExpanded ? '▼ Hide' : `▶ ${recs.length} suggestion${recs.length > 1 ? 's' : ''}`}
+                                                    </button>
+                                                )}
+                                            </div>
 
-                                        <div style={{
-                                            marginTop: '4px',
-                                            fontSize: '12px',
-                                            color: '#6b7280',
-                                        }}>
-                                            <strong>Reason:</strong> {info.reason_text || info.reason || 'Unknown'}
-                                        </div>
-
-                                        {info.suggestion && (
+                                            {/* Reason text */}
                                             <div style={{
                                                 marginTop: '4px',
                                                 fontSize: '12px',
-                                                color: '#059669',
+                                                color: '#6b7280',
                                             }}>
-                                                <strong>💡 Suggestion:</strong> {info.suggestion}
+                                                <strong>Reason:</strong> {info.reason_text || info.reason || 'Unknown'}
                                             </div>
-                                        )}
-                                    </div>
-                                ))}
+
+                                            {/* Static suggestion */}
+                                            {info.suggestion && (
+                                                <div style={{
+                                                    marginTop: '4px',
+                                                    fontSize: '12px',
+                                                    color: '#059669',
+                                                }}>
+                                                    <strong>💡 Suggestion:</strong> {info.suggestion}
+                                                </div>
+                                            )}
+
+                                            {/* Specific Recommendations (expandable) */}
+                                            {isSubjExpanded && hasRecs && (
+                                                <div style={{
+                                                    marginTop: '8px',
+                                                    borderTop: '1px solid #e5e7eb',
+                                                    paddingTop: '8px',
+                                                }}>
+                                                    <div style={{
+                                                        fontSize: '11px',
+                                                        fontWeight: '600',
+                                                        color: '#374151',
+                                                        marginBottom: '6px',
+                                                    }}>
+                                                        📋 Available slot suggestions:
+                                                    </div>
+                                                    <div style={{
+                                                        display: 'grid',
+                                                        gap: '4px',
+                                                        maxHeight: '200px',
+                                                        overflowY: 'auto',
+                                                    }}>
+                                                        {recs.slice(0, 5).map((rec, idx) => (
+                                                            <div
+                                                                key={idx}
+                                                                style={{
+                                                                    display: 'flex',
+                                                                    alignItems: 'center',
+                                                                    gap: '8px',
+                                                                    padding: '6px 8px',
+                                                                    backgroundColor: idx === 0 ? '#f0fdf4' : '#f9fafb',
+                                                                    borderRadius: '4px',
+                                                                    border: idx === 0 ? '1px solid #86efac' : '1px solid #e5e7eb',
+                                                                    fontSize: '12px',
+                                                                }}
+                                                            >
+                                                                <span style={{
+                                                                    width: '20px',
+                                                                    height: '20px',
+                                                                    borderRadius: '50%',
+                                                                    backgroundColor: idx === 0 ? '#22c55e' : '#d1d5db',
+                                                                    color: 'white',
+                                                                    display: 'flex',
+                                                                    alignItems: 'center',
+                                                                    justifyContent: 'center',
+                                                                    fontSize: '10px',
+                                                                    fontWeight: '700',
+                                                                    flexShrink: 0,
+                                                                }}>
+                                                                    {idx + 1}
+                                                                </span>
+                                                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', alignItems: 'center' }}>
+                                                                    <span style={{
+                                                                        padding: '1px 6px',
+                                                                        backgroundColor: '#dbeafe',
+                                                                        color: '#1d4ed8',
+                                                                        borderRadius: '3px',
+                                                                        fontSize: '11px',
+                                                                        fontWeight: '500',
+                                                                    }}>
+                                                                        🏢 {rec.room_name || `Room ${rec.room_id}`}
+                                                                    </span>
+                                                                    <span style={{
+                                                                        padding: '1px 6px',
+                                                                        backgroundColor: '#fef3c7',
+                                                                        color: '#92400e',
+                                                                        borderRadius: '3px',
+                                                                        fontSize: '11px',
+                                                                        fontWeight: '500',
+                                                                    }}>
+                                                                        👨‍🏫 {rec.instructor_name || `Instr ${rec.instructor_id}`}
+                                                                    </span>
+                                                                    <span style={{
+                                                                        padding: '1px 6px',
+                                                                        backgroundColor: '#ede9fe',
+                                                                        color: '#5b21b6',
+                                                                        borderRadius: '3px',
+                                                                        fontSize: '11px',
+                                                                        fontWeight: '500',
+                                                                    }}>
+                                                                        🕐 {rec.day_label || ''} {rec.time || ''}
+                                                                    </span>
+                                                                    {idx === 0 && (
+                                                                        <span style={{
+                                                                            padding: '1px 6px',
+                                                                            backgroundColor: '#dcfce7',
+                                                                            color: '#166534',
+                                                                            borderRadius: '3px',
+                                                                            fontSize: '10px',
+                                                                            fontWeight: '600',
+                                                                        }}>
+                                                                            ★ Best match
+                                                                        </span>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
                             </div>
                         </div>
                     )}

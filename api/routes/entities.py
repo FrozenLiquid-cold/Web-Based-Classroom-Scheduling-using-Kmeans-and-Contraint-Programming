@@ -846,6 +846,229 @@ def delete_subject(subject_id: int):
         return "", 204
 
 
+@entities_bp.route("/subjects/scheduled-ids", methods=["GET"])
+def get_scheduled_subject_ids():
+    """Return a list of subject IDs that have at least one schedule entry."""
+    semester = request.args.get("semester", type=int)
+    with _get_session() as db:
+        query = db.query(models.Schedule.subject_id).distinct()
+        if semester:
+            query = query.filter(models.Schedule.semester == semester)
+        ids = [row[0] for row in query.all() if row[0] is not None]
+        return jsonify(ids)
+
+
+@entities_bp.route("/subjects/merge/preview", methods=["POST"])
+def merge_preview():
+    """Preview a merge: return schedule details for both subjects + conflict analysis."""
+    payload = request.get_json(force=True) or {}
+    source_id = payload.get("source_id")
+    target_id = payload.get("target_id")
+
+    if not source_id or not target_id:
+        return jsonify({"detail": "source_id and target_id are required"}), 400
+    if source_id == target_id:
+        return jsonify({"detail": "Source and target must be different"}), 400
+
+    with _get_session() as db:
+        source = db.query(models.Subject).filter(models.Subject.id == source_id).first()
+        target = db.query(models.Subject).filter(models.Subject.id == target_id).first()
+        if not source:
+            return jsonify({"detail": "Source subject not found"}), 404
+        if not target:
+            return jsonify({"detail": "Target subject not found"}), 404
+
+        def _sched_to_dict(s):
+            instr = None
+            if s.instructor_id:
+                i = db.query(models.Instructor).get(s.instructor_id)
+                if i:
+                    instr = {"id": i.id, "name": f"{i.first_name or ''} {i.last_name or ''}".strip()}
+            room = None
+            if s.room_id:
+                r = db.query(models.Room).get(s.room_id)
+                if r:
+                    room = {"id": r.id, "name": r.name}
+            day = None
+            if s.day_id:
+                d = db.query(models.Day).get(s.day_id)
+                if d:
+                    day = {"id": d.id, "label": d.label}
+            return {
+                "id": s.id,
+                "instructor": instr,
+                "room": room,
+                "day": day,
+                "time": s.time,
+                "block": s.block,
+                "year": s.year,
+                "semester": s.semester,
+            }
+
+        source_schedules = db.query(models.Schedule).filter(models.Schedule.subject_id == source_id).all()
+        target_schedules = db.query(models.Schedule).filter(models.Schedule.subject_id == target_id).all()
+
+        source_list = [_sched_to_dict(s) for s in source_schedules]
+        target_list = [_sched_to_dict(s) for s in target_schedules]
+
+        # Detect conflicts: instructor or room double-booking (only for selected blocks if provided)
+        selected_blocks = payload.get("selected_blocks")
+        resource_picks = payload.get("resource_picks") or {}
+        sel = set(selected_blocks) if selected_blocks else None
+
+        def _is_sel_preview(side, sched):
+            if sel is None:
+                return True  # No selection filter = check all
+            bk = sched.block or '_none'
+            return f"{side}_{bk}" in sel
+
+        def _resource_survives(side, sched, res_type):
+            """Check if the resource type survives on this block after picks are applied."""
+            if not resource_picks:
+                return True  # No picks yet = assume everything survives
+            bk = sched.block or '_none'
+            dec_key = f"{side}_{bk}"
+            pick = resource_picks.get(res_type)
+            if not pick:
+                return True  # No pick for this type = assume survives
+            return pick == dec_key
+
+        conflicts = []
+        for ss in source_schedules:
+            if not _is_sel_preview('source', ss):
+                continue
+            for ts in target_schedules:
+                if not _is_sel_preview('target', ts):
+                    continue
+                if ss.day_id and ts.day_id and ss.day_id == ts.day_id and ss.time and ts.time and ss.time == ts.time:
+                    # Only flag instructor conflict if instructor survives on BOTH blocks
+                    if (ss.instructor_id and ts.instructor_id and ss.instructor_id == ts.instructor_id
+                            and _resource_survives('source', ss, 'instructor')
+                            and _resource_survives('target', ts, 'instructor')):
+                        instr = db.query(models.Instructor).get(ss.instructor_id)
+                        name = f"{instr.first_name} {instr.last_name}" if instr else f"ID {ss.instructor_id}"
+                        conflicts.append({
+                            "type": "instructor",
+                            "message": f"Instructor {name} is double-booked on day {ss.day_id} at {ss.time}"
+                        })
+                    # Only flag room conflict if room survives on BOTH blocks
+                    if (ss.room_id and ts.room_id and ss.room_id == ts.room_id
+                            and _resource_survives('source', ss, 'room')
+                            and _resource_survives('target', ts, 'room')):
+                        room = db.query(models.Room).get(ss.room_id)
+                        rname = room.name if room else f"ID {ss.room_id}"
+                        conflicts.append({
+                            "type": "room",
+                            "message": f"Room {rname} is double-booked on day {ss.day_id} at {ss.time}"
+                        })
+        # --- Global conflict check: picked resources vs ALL other schedules ---
+        global_conflicts = []
+        if resource_picks and sel:
+            from api.routes.validation import parse_time, _parse_schedule_time, times_overlap
+            from sqlalchemy.orm import joinedload as jl
+
+            # Group schedules by block key to extract winning values
+            all_by_key = {}
+            for s in source_schedules:
+                key = f"source_{s.block or '_none'}"
+                all_by_key.setdefault(key, []).append(s)
+            for s in target_schedules:
+                key = f"target_{s.block or '_none'}"
+                all_by_key.setdefault(key, []).append(s)
+
+            win_instr_id = None
+            if resource_picks.get('instructor') and resource_picks['instructor'] in all_by_key:
+                win_instr_id = all_by_key[resource_picks['instructor']][0].instructor_id
+
+            win_room_id = None
+            if resource_picks.get('room') and resource_picks['room'] in all_by_key:
+                win_room_id = all_by_key[resource_picks['room']][0].room_id
+
+            win_time_entries = []
+            if resource_picks.get('time') and resource_picks['time'] in all_by_key:
+                win_time_entries = [(s.day_id, s.time) for s in all_by_key[resource_picks['time']]]
+
+            # IDs to exclude (source + target subjects)
+            exclude_subj_ids = [source_id, target_id]
+
+            all_days_map = {d.id: d.label for d in db.query(models.Day).all()}
+            DAY_NAMES = {"M": "Monday", "T": "Tuesday", "W": "Wednesday", "TH": "Thursday", "F": "Friday"}
+
+            for day_id, time_str in win_time_entries:
+                if not day_id or not time_str:
+                    continue
+                t_start, t_end = _parse_schedule_time(time_str)
+                if not t_start or not t_end:
+                    continue
+
+                day_label = all_days_map.get(day_id, str(day_id))
+                day_full = DAY_NAMES.get(day_label, day_label)
+
+                # Check room conflicts
+                if win_room_id:
+                    room_hits = db.query(models.Schedule).filter(
+                        models.Schedule.day_id == day_id,
+                        models.Schedule.room_id == win_room_id,
+                        ~models.Schedule.subject_id.in_(exclude_subj_ids)
+                    ).options(jl(models.Schedule.subject), jl(models.Schedule.course)).all()
+
+                    for hit in room_hits:
+                        h_start, h_end = _parse_schedule_time(hit.time)
+                        if times_overlap(t_start, t_end, h_start, h_end):
+                            subj_code = hit.subject.code if hit.subject else f"ID {hit.subject_id}"
+                            course_code = hit.course.code if hit.course else ""
+                            desc = f"{course_code} - {subj_code}" if course_code else subj_code
+                            room_name = db.query(models.Room).get(win_room_id).name if win_room_id else "?"
+                            global_conflicts.append({
+                                "type": "room",
+                                "message": f"Room Conflict ({day_full}): {room_name} occupied by {desc} ({hit.time})"
+                            })
+
+                # Check instructor conflicts
+                if win_instr_id:
+                    instr_hits = db.query(models.Schedule).filter(
+                        models.Schedule.day_id == day_id,
+                        models.Schedule.instructor_id == win_instr_id,
+                        ~models.Schedule.subject_id.in_(exclude_subj_ids)
+                    ).options(jl(models.Schedule.subject), jl(models.Schedule.course)).all()
+
+                    for hit in instr_hits:
+                        h_start, h_end = _parse_schedule_time(hit.time)
+                        if times_overlap(t_start, t_end, h_start, h_end):
+                            subj_code = hit.subject.code if hit.subject else f"ID {hit.subject_id}"
+                            course_code = hit.course.code if hit.course else ""
+                            desc = f"{course_code} - {subj_code}" if course_code else subj_code
+                            instr = db.query(models.Instructor).get(win_instr_id)
+                            instr_name = f"{instr.first_name} {instr.last_name}" if instr else f"ID {win_instr_id}"
+                            global_conflicts.append({
+                                "type": "instructor",
+                                "message": f"Instructor Conflict ({day_full}): {instr_name} teaching {desc} ({hit.time})"
+                            })
+
+        all_conflicts = conflicts + global_conflicts
+
+        return jsonify({
+            "source": {
+                "id": source.id,
+                "code": source.code,
+                "description": source.description,
+                "type": source.type,
+                "unit": source.unit,
+                "schedules": source_list,
+            },
+            "target": {
+                "id": target.id,
+                "code": target.code,
+                "description": target.description,
+                "type": target.type,
+                "unit": target.unit,
+                "schedules": target_list,
+            },
+            "conflicts": all_conflicts,
+            "safe": len(all_conflicts) == 0,
+        })
+
+
 @entities_bp.route("/subjects/merge", methods=["POST"])
 def merge_subjects():
     payload = request.get_json(force=True) or {}
@@ -866,33 +1089,122 @@ def merge_subjects():
         if not target_subject:
             return jsonify({"detail": "Target subject not found"}), 404
 
-        # Find all schedules referencing the source subject
-        schedules = db.query(models.Schedule).filter(models.Schedule.subject_id == merge_data.source_id).all()
+        # --- Conflict detection (block if instructor or room double-booking) ---
+        source_schedules = db.query(models.Schedule).filter(
+            models.Schedule.subject_id == merge_data.source_id
+        ).all()
+        target_schedules = db.query(models.Schedule).filter(
+            models.Schedule.subject_id == merge_data.target_id
+        ).all()
+
+        # Only check conflicts between SELECTED blocks
+        selected = set(merge_data.selected_blocks or [])
+        def _is_sel(side, sched):
+            bk = sched.block or '_none'
+            return f"{side}_{bk}" in selected
+
+        conflicts = []
+        for ss in source_schedules:
+            if not _is_sel('source', ss):
+                continue
+            for ts in target_schedules:
+                if not _is_sel('target', ts):
+                    continue
+                if ss.day_id and ts.day_id and ss.day_id == ts.day_id and ss.time and ts.time and ss.time == ts.time:
+                    if ss.instructor_id and ts.instructor_id and ss.instructor_id == ts.instructor_id:
+                        conflicts.append("instructor")
+                    if ss.room_id and ts.room_id and ss.room_id == ts.room_id:
+                        conflicts.append("room")
+
+        if conflicts:
+            return jsonify({
+                "detail": "Merge blocked: conflicts detected",
+                "conflicts": conflicts,
+            }), 409
+
+        # --- Apply cross-block resource picks to selected blocks only ---
+        # resource_picks: { "instructor": "source_A", "room": "target_B", "time": "source_A" }
+        picks = merge_data.resource_picks or {}
+        selected = set(merge_data.selected_blocks or [])
         moved_count = 0
-        skipped_count = 0
 
-        for sched in schedules:
-            # Check for unique constraint violation (room, day, time, year, semester)
-            # if we just blindly change the subject_id, we might hit a unique constraint
-            # Actually, the unique constraint is on (room_id, day_id, time, year, semester)
-            # changing subject_id DOES NOT violate this constraint.
-            # BUT it could violate instructor double-booking.
-            # Wait, the unique constraint doesn't involve subject_id at all.
-            # uq_room_time: ("room_id", "day_id", "time", "year", "semester")
-            # uq_instructor_time: ("instructor_id", "day_id", "time", "year", "semester")
-            # So changing subject_id is perfectly safe from a DB constraint perspective.
-            
-            sched.subject_id = target_subject.id
-            moved_count += 1
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[MERGE] selected_blocks={selected}, picks={picks}")
 
-        db.delete(source_subject)
+        # --- Group all schedules by block key ---
+        all_by_key = {}
+        for s in source_schedules:
+            key = f"source_{s.block or '_none'}"
+            all_by_key.setdefault(key, []).append(s)
+        for s in target_schedules:
+            key = f"target_{s.block or '_none'}"
+            all_by_key.setdefault(key, []).append(s)
+
+        # --- Extract winning resource values ---
+        win_instructor_id = None
+        if picks.get('instructor') and picks['instructor'] in all_by_key:
+            win_instructor_id = all_by_key[picks['instructor']][0].instructor_id
+            logger.info(f"[MERGE] Winning instructor_id={win_instructor_id} from {picks['instructor']}")
+
+        win_room_id = None
+        if picks.get('room') and picks['room'] in all_by_key:
+            win_room_id = all_by_key[picks['room']][0].room_id
+            logger.info(f"[MERGE] Winning room_id={win_room_id} from {picks['room']}")
+
+        win_time_entries = []
+        if picks.get('time') and picks['time'] in all_by_key:
+            win_time_entries = [(s.day_id, s.time) for s in all_by_key[picks['time']]]
+            logger.info(f"[MERGE] Winning time entries={win_time_entries} from {picks['time']}")
+
+        merge_tag = f"[M] {source_subject.code} + {target_subject.code}"
+
+        # --- Apply winning values to all selected blocks ---
+        def apply_winning(sched, block_key):
+            """Copy winning resource values to this schedule entry."""
+            if win_instructor_id is not None:
+                sched.instructor_id = win_instructor_id
+            if win_room_id is not None:
+                sched.room_id = win_room_id
+            # For time: match by index within the block
+            if win_time_entries:
+                block_entries = all_by_key.get(block_key, [])
+                idx = block_entries.index(sched) if sched in block_entries else -1
+                if 0 <= idx < len(win_time_entries):
+                    sched.day_id = win_time_entries[idx][0]
+                    sched.time = win_time_entries[idx][1]
+
+        for sched in source_schedules:
+            bk = sched.block or '_none'
+            key = f"source_{bk}"
+            if key in selected:
+                logger.info(f"[MERGE] PROCESSING source sched id={sched.id} block={bk} key={key}")
+                apply_winning(sched, key)
+                sched.subject_id = target_subject.id
+                sched.merge_tag = merge_tag
+                moved_count += 1
+            else:
+                logger.info(f"[MERGE] SKIPPING source sched id={sched.id} block={bk} key={key} (not selected)")
+
+        for sched in target_schedules:
+            bk = sched.block or '_none'
+            key = f"target_{bk}"
+            if key in selected:
+                logger.info(f"[MERGE] PROCESSING target sched id={sched.id} block={bk} key={key}")
+                apply_winning(sched, key)
+                sched.merge_tag = merge_tag
+            else:
+                logger.info(f"[MERGE] SKIPPING target sched id={sched.id} block={bk} key={key} (not selected)")
+
+        # Subjects are NOT modified — merge only affects schedule entries
+        # This keeps subjects clean for future semesters
         db.commit()
 
         return jsonify({
             "detail": "Merge successful",
             "schedules_moved": moved_count,
-            "deleted_subject_code": source_subject.code,
-            "target_subject_code": target_subject.code
+            "source_subject_code": source_subject.code,
+            "target_subject_code": target_subject.code,
         }), 200
 
 

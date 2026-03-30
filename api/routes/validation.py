@@ -113,6 +113,9 @@ def validate_schedule_item():
                      room_query = room_query.filter(models.Schedule.id != req.id)
                      
                  room_conflicts = room_query.all()
+                 # Exclude entries sharing the same merge_tag (merged entries exempt)
+                 if req.merge_tag:
+                     room_conflicts = [c for c in room_conflicts if not (c.merge_tag and c.merge_tag == req.merge_tag)]
                  logger.info(f"Checking Room {req.room_id} on Day {check_day_id}. Found {len(room_conflicts)} potential items.")
                  
                  for item in room_conflicts:
@@ -146,6 +149,9 @@ def validate_schedule_item():
                      instr_query = instr_query.filter(models.Schedule.id != req.id)
 
                  instr_conflicts = instr_query.all()
+                 # Exclude entries sharing the same merge_tag (merged entries exempt)
+                 if req.merge_tag:
+                     instr_conflicts = [c for c in instr_conflicts if not (c.merge_tag and c.merge_tag == req.merge_tag)]
                  for item in instr_conflicts:
                      i_start, i_end = _parse_schedule_time(item.time)
                      if times_overlap(start_time, end_time, i_start, i_end):
@@ -228,6 +234,9 @@ def validate_schedule_item():
                  student_query = student_query.filter(models.Schedule.block == req.block)
              
              student_conflicts = student_query.all()
+             # Exclude entries sharing the same merge_tag (merged entries exempt)
+             if req.merge_tag:
+                 student_conflicts = [c for c in student_conflicts if not (c.merge_tag and c.merge_tag == req.merge_tag)]
              for item in student_conflicts:
                   i_start, i_end = _parse_schedule_time(item.time)
                   if times_overlap(start_time, end_time, i_start, i_end):
