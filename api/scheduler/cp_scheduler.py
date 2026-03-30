@@ -6927,7 +6927,18 @@ def run_cp_scheduler(
                         subj_year = int(subj_year)
                     except (TypeError, ValueError):
                         subj_year = int(default_year)
-                    cross_cluster_scheduled_ranges[(subj_year, student_block_index, day_id_int)].append((int(start_min_day), int(end_min_day)))
+
+                    # CRITICAL FIX: For block-shared subjects (PE, PATHFIT, NSTP),
+                    # register the time slot for ALL student blocks, not just the current one.
+                    # These subjects occupy the same time across all blocks, so the booking
+                    # must prevent other subjects from using that slot in ANY block.
+                    if subject and _is_block_shared_subject(subject):
+                        for _bi in range(1, block_count + 1):
+                            cross_cluster_scheduled_ranges[(subj_year, _bi, day_id_int)].append((int(start_min_day), int(end_min_day)))
+                        logger.info(f"[BLOCK-SHARED BOOKING] {getattr(subject, 'code', 'ID:' + str(subject_id))} "
+                                   f"booked for ALL {block_count} blocks at day {day_id_int} {start_min_day}-{end_min_day}")
+                    else:
+                        cross_cluster_scheduled_ranges[(subj_year, student_block_index, day_id_int)].append((int(start_min_day), int(end_min_day)))
         
         # Validate: Check for conflicts in extracted results
         conflicts_found = []

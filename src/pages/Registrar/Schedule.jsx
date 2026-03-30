@@ -432,10 +432,8 @@ export default function RegistrarSchedule() {
             resultDiagnostics = finalResult.diagnostics || status.diagnostics || {};
           }
 
-          // Progressive reveal: push final items to skeleton timetable first,
-          // then delay the full table transition so user sees items slide in
-          setPartialItems(scheduledItems);
-          setTotalSubjects(scheduledItems.length);
+          // Progressive reveal: keep the already-enriched partialItems from report_phase,
+          // don't overwrite with raw result (which lacks subject_code, room_name etc.)
           setCurrentPhase('Complete');
 
           // Brief delay to show the progressive reveal animation
