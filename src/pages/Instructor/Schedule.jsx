@@ -524,7 +524,20 @@ export default function Schedule() {
                                     </div>
                                     <div className={`backdrop-blur-xl rounded-xl border p-4 ${theme.card}`}>
                                         <p className={theme.textMuted + ' text-sm'}>Total Units</p>
-                                        <p className="text-2xl font-bold text-emerald-500">{rows.reduce((sum, r) => sum + (parseInt(getSubject(r.subjectId || r.subject_id)?.unit) || 0), 0)}</p>
+                                        <p className="text-2xl font-bold text-emerald-500">{(() => {
+                                            const seen = new Set()
+                                            let total = 0
+                                            rows.forEach(r => {
+                                                const subId = r.subjectId || r.subject_id
+                                                const block = r.block || ''
+                                                const key = `${subId}_${block}`
+                                                if (!seen.has(key)) {
+                                                    seen.add(key)
+                                                    total += parseInt(getSubject(subId)?.unit) || 0
+                                                }
+                                            })
+                                            return total
+                                        })()}</p>
                                     </div>
                                 </div>
                             )}

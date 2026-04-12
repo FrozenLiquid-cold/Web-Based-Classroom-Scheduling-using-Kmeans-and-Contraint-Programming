@@ -1320,14 +1320,15 @@ export default function RegistrarSchedule() {
     return ids.size;
   }, [subjects, filteredSchedule, form.course_id, form.year, form.semester]);
 
-  // Fetch global room utilization from backend when semester/schoolYear changes
+  // Fetch room utilization from backend (filtered by course when selected)
   useEffect(() => {
     const sem = Number(form.semester);
     if (!sem) return;
-    getRoomUtilizationByDay(sem, schoolYear)
+    const courseId = Number(form.course_id) || null;
+    getRoomUtilizationByDay(sem, schoolYear, courseId)
       .then(data => setGlobalRoomUtil(Array.isArray(data) ? data : []))
       .catch(err => console.error('Failed to load room utilization', err));
-  }, [form.semester, schoolYear]);
+  }, [form.semester, form.course_id, schoolYear]);
 
   // Room saturation analysis — detect when rooms are fully booked
   const roomAnalysis = useMemo(() => {
@@ -1353,6 +1354,34 @@ export default function RegistrarSchedule() {
       if (r.is_available !== false && r.is_available !== 0) {
         if (!allRoomsOfType[t]) allRoomsOfType[t] = new Set();
         allRoomsOfType[t].add(r.id);
+      }
+    }
+
+    // Compute course-eligible rooms (rooms whose building belongs to the same
+    // college as the selected course, or whose building is shared)
+    const eligibleRoomsOfType = {};  // type -> Set of room_ids eligible for this course
+    const selectedCourseId = Number(form.course_id);
+    const selectedCourse = selectedCourseId
+      ? (courses || []).find(c => c.id === selectedCourseId)
+      : null;
+    const courseCollegeId = selectedCourse?.college_id;
+    if (courseCollegeId) {
+      const bldgCollegeMap = {};  // building_id -> college_id
+      const bldgSharedMap = {};   // building_id -> is_shared
+      for (const b of (buildings || [])) {
+        bldgCollegeMap[b.id] = b.college_id;
+        bldgSharedMap[b.id] = b.is_shared;
+      }
+      for (const r of (rooms || [])) {
+        if (r.is_available === false || r.is_available === 0) continue;
+        const t = (r.type || 'LEC').toUpperCase();
+        const bCol = bldgCollegeMap[r.building_id];
+        const bShared = bldgSharedMap[r.building_id];
+        // Eligible if: same college, shared building, or no building assigned
+        if (bCol === courseCollegeId || bShared || !r.building_id) {
+          if (!eligibleRoomsOfType[t]) eligibleRoomsOfType[t] = new Set();
+          eligibleRoomsOfType[t].add(r.id);
+        }
       }
     }
 
@@ -1533,14 +1562,14 @@ export default function RegistrarSchedule() {
           ? Math.round(weekdayUtils.reduce((a, u) => a + u.percentage, 0) / weekdayUtils.length)
           : 0;
 
-        // Build a meaningful usage description using global data
+        // Build a meaningful usage description
         let usageDescription;
         if (avgWeekdayPct >= 80) {
-          usageDescription = `full (${avgWeekdayPct}% avg usage across all courses)`;
+          usageDescription = `full (${avgWeekdayPct}% avg usage)`;
         } else if (avgWeekdayPct >= 50) {
-          usageDescription = `heavily booked (${avgWeekdayPct}% avg usage across all courses)`;
+          usageDescription = `heavily booked (${avgWeekdayPct}% avg usage)`;
         } else if (avgWeekdayPct > 0) {
-          usageDescription = `at ${avgWeekdayPct}% avg usage across all courses`;
+          usageDescription = `at ${avgWeekdayPct}% avg usage`;
         } else {
           usageDescription = `fully unavailable on weekdays (booked by other schedules)`;
         }
@@ -1573,18 +1602,26 @@ export default function RegistrarSchedule() {
       }
     }
 
-    // 3. All rooms of a type booked on a weekday
+    // 3. All rooms of a type booked on a weekday — one recommendation per type
+    const fullDaysByType = {};  // type -> [day labels]
     for (const u of utilization) {
       if (u.isWeekend) continue;
       if (u.roomsUsed >= u.totalRooms && u.totalRooms > 0) {
-        recommendations.push({
-          type: 'room_full',
-          severity: 'warning',
-          roomType: u.type,
-          day: u.day,
-          message: `All ${u.totalRooms} ${u.typeLabel.toLowerCase()} room${u.totalRooms > 1 ? 's' : ''} are in use on ${u.day} (${u.percentage}% capacity). NEED to add a new ${u.type === 'LAB' ? 'computer lab' : 'lecture room'}.`,
-        });
+        if (!fullDaysByType[u.type]) fullDaysByType[u.type] = { typeLabel: u.typeLabel, totalRooms: u.totalRooms, days: [], avgPct: 0, count: 0 };
+        fullDaysByType[u.type].days.push(u.day);
+        fullDaysByType[u.type].avgPct += u.percentage;
+        fullDaysByType[u.type].count++;
       }
+    }
+    for (const [rType, info] of Object.entries(fullDaysByType)) {
+      const avgPct = Math.round(info.avgPct / info.count);
+      const daysList = info.days.join(', ');
+      recommendations.push({
+        type: 'room_full',
+        severity: 'warning',
+        roomType: rType,
+        message: `All ${info.totalRooms} ${info.typeLabel.toLowerCase()} room${info.totalRooms > 1 ? 's' : ''} are in use on ${daysList} (${avgPct}% avg capacity). NEED to add a new ${rType === 'LAB' ? 'computer lab' : 'lecture room'}.`,
+      });
     }
 
     // 4. Fallback rooms used
@@ -1625,8 +1662,8 @@ export default function RegistrarSchedule() {
     const severityOrder = { critical: 0, warning: 1, info: 2 };
     deduped.sort((a, b) => (severityOrder[a.severity] ?? 3) - (severityOrder[b.severity] ?? 3));
 
-    return { recommendations: deduped, utilization };
-  }, [filteredSchedule, rooms, days, diagnostics, subjects, globalRoomUtil]);
+    return { recommendations: deduped, utilization, eligibleRoomsOfType };
+  }, [filteredSchedule, rooms, days, diagnostics, subjects, globalRoomUtil, buildings, courses, form.course_id]);
 
   // Feature 1: Detect subjects with no eligible active instructor (pre-scheduling)
   const normalizeCode = (str) => str.toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -2144,12 +2181,15 @@ export default function RegistrarSchedule() {
                       acc[u.type].days.push(u);
                       return acc;
                     }, {})
-                ).map(([type, data]) => (
+                ).map(([type, data]) => {
+                  const selectedCourse = courses?.find(c => c.id === Number(form.course_id));
+                  const courseLabel = selectedCourse?.code || null;
+                  return (
                   <div key={type} className="mb-4 last:mb-0">
-                    <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-2">
+                    <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 flex flex-wrap items-center gap-2">
                       {type === 'LAB' ? '🖥' : '📖'} {data.label} Rooms
                       <span className="text-[10px] font-normal normal-case text-gray-400">
-                        ({data.activeRooms}/{data.totalRooms} active)
+                        ({data.activeRooms}/{data.totalRooms} active{courseLabel ? ` for ${courseLabel}` : ''})
                       </span>
                     </div>
                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
@@ -2204,7 +2244,8 @@ export default function RegistrarSchedule() {
                       </div>
                     )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </details>
           )}

@@ -439,9 +439,24 @@ def get_room_utilization_by_day():
     try:
         semester = request.args.get("semester", default=1, type=int)
         school_year = request.args.get("school_year", default=None, type=str)
+        course_id = request.args.get("course_id", default=None, type=int)
 
         all_days = db.query(models.Day).all()
         WEEKEND_LABELS = {'SAT', 'SUN', 'S'}
+
+        # If course_id is given, find its college to filter eligible rooms
+        course_college_id = None
+        if course_id:
+            course = db.query(models.Course).filter(models.Course.id == course_id).first()
+            if course:
+                course_college_id = course.college_id
+
+        # Build building lookup for college-based room filtering
+        bldg_college_map = {}  # building_id -> college_id
+        bldg_shared_map = {}   # building_id -> is_shared
+        for b in db.query(models.Building).all():
+            bldg_college_map[b.id] = b.college_id
+            bldg_shared_map[b.id] = b.is_shared
 
         all_rooms = db.query(models.Room).all()
         room_type_map = {}       # room_id -> type
@@ -450,6 +465,13 @@ def get_room_utilization_by_day():
             t = (r.type or 'LEC').upper()
             room_type_map[r.id] = t
             if r.is_available:
+                # If course filtering is active, only include rooms from the
+                # same college, shared buildings, or rooms with no building
+                if course_college_id:
+                    b_col = bldg_college_map.get(r.building_id)
+                    b_shared = bldg_shared_map.get(r.building_id, False)
+                    if not (b_col == course_college_id or b_shared or not r.building_id):
+                        continue
                 available_rooms_of_type.setdefault(t, set()).add(r.id)
 
         # Fetch ALL schedules for the semester (global, not course-filtered)

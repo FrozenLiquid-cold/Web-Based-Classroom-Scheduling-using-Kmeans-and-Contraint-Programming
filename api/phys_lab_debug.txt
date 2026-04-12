@@ -1655,3 +1655,75 @@
 [SOURCE DEBUG] scheduled_rows[21]: subject_id=47, time=2:30 PM - 3:30 PM, block=B
 === Block 2 SOURCE DEBUG ===
 [SOURCE DEBUG] scheduled_rows[2]: subject_id=45, time=4:00 PM - 5:00 PM, block=B
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[21]: subject_id=47, time=2:30 PM - 3:30 PM, block=B
+=== Block 2 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[18]: subject_id=47, time=1:00 PM - 2:30 PM, block=B
+[SOURCE DEBUG] retry_results[93]: subject_id=42, time=2:30 PM - 4:00 PM, block=A
+[SOURCE DEBUG] retry_results[146]: subject_id=44, time=4:00 PM - 7:00 PM, block=B
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 3 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 3 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 3 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 3 SOURCE DEBUG ===
+=== Block 1 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=42, time=5:30 PM - 7:00 PM, block=A
+=== Block 1 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
+=== Block 1 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
+=== Block 2 SOURCE DEBUG ===
+=== Block 4 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[14]: subject_id=187, time=1:00 PM - 2:00 PM, block=C
+=== Block 4 SOURCE DEBUG ===
+=== Block 3 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[0]: subject_id=184, time=1:00 PM - 2:30 PM, block=A
+=== Block 3 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[9]: subject_id=187, time=1:00 PM - 2:00 PM, block=B
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
+=== Block 2 SOURCE DEBUG ===
+=== Block 2 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
+=== Block 2 SOURCE DEBUG ===

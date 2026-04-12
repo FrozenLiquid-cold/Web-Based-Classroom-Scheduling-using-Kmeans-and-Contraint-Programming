@@ -8257,7 +8257,30 @@ def run_cp_scheduler(
             detail_parts.append("No rooms are set up for this subject.")
         elif stats.get("room_conflicts", 0) > 0:
             rejections = stats.get("rejection_counters", {})
-            if rejections:
+            eligible_instrs = stats.get("eligible_instrs", 0)
+            room_checks_total = stats.get("room_checks", 0)
+            room_conflicts_total = stats.get("room_conflicts", 0)
+            # Detect instructor-room intersection bottleneck:
+            # Rooms have free slots overall, but ALL room checks failed,
+            # and the subject only has 1-3 instructors. The real problem
+            # is that rooms are booked at the specific times those few
+            # instructors are available.
+            is_intersection = (
+                eligible_instrs > 0
+                and eligible_instrs <= 3
+                and room_checks_total > 0
+                and room_conflicts_total >= room_checks_total
+            )
+            if is_intersection:
+                reason = "All Slots Booked"
+                instr_count_label = f"Only {eligible_instrs} instructor(s)"
+                room_count = stats.get("eligible_rooms", 0)
+                detail_parts.append(
+                    f"{instr_count_label} and {room_count} room(s) are available, "
+                    f"but rooms are fully booked at the times the instructor(s) are free. "
+                    f"The rooms do have open slots at other times — the bottleneck is instructor availability."
+                )
+            elif rejections:
                 top_reasons = sorted(rejections.items(), key=lambda x: x[1], reverse=True)[:3]
                 # Translate "Course X Year Y" and "Blocked by Course X Year Y" to readable course codes
                 def _translate_reason_key(key_str):
@@ -8394,10 +8417,18 @@ def run_cp_scheduler(
                 reason = "All Slots Booked"
                 inames = [instr_id_to_name.get(iid, f'ID {iid}') for iid in eligible_instr_ids[:3]]
                 room_names = [room_id_to_name.get(rid, f'Room {rid}') for rid in eligible_room_ids[:3]]
-                detail = (
-                    f"Only {num_instrs} instructor(s) ({', '.join(inames)}) and {num_rooms} room(s) ({', '.join(room_names)}) are available, "
-                    f"but all their time slots are already taken by other classes in this block."
-                )
+                if num_instrs <= 3:
+                    # Instructor-room intersection: rooms have space but not at instructor's free times
+                    detail = (
+                        f"Only {num_instrs} instructor(s) ({', '.join(inames)}) and {num_rooms} room(s) ({', '.join(room_names)}) are available, "
+                        f"but rooms are fully booked at the times the instructor(s) are free. "
+                        f"The rooms do have open slots at other times \u2014 the bottleneck is instructor availability."
+                    )
+                else:
+                    detail = (
+                        f"Only {num_instrs} instructor(s) ({', '.join(inames)}) and {num_rooms} room(s) ({', '.join(room_names)}) are available, "
+                        f"but all their time slots are already taken by other classes in this block."
+                    )
             
             diagnostic_entry = {
                 "failure_reason": reason,
@@ -8719,13 +8750,35 @@ def run_cp_scheduler(
             # Build registrar-friendly suggestion
             if failure_reason in ("Solver Conflict", "Room Conflict", "All Slots Booked"):
                 parts = []
-                if _subj_instr_ids:
+                # Detect instructor-room intersection: rooms have space but
+                # not at the times the few assigned instructors are free
+                metrics = entry.get("metrics", {})
+                # Handle both solver metrics and fallback metrics formats
+                n_instrs = metrics.get("eligible_instrs", 0) or metrics.get("eligible_instructors", 0)
+                has_room_check_data = metrics.get("room_checks", 0) > 0
+                is_intersection = (
+                    n_instrs > 0
+                    and n_instrs <= 3
+                    and (
+                        # Solver path: all room checks failed
+                        (has_room_check_data and metrics.get("room_conflicts", 0) >= metrics.get("room_checks", 0))
+                        # Fallback path: subject was skipped with few instructors
+                        or (metrics.get("fallback_generated") and not has_room_check_data)
+                    )
+                )
+                if is_intersection and _subj_instr_ids:
                     inames = [instr_id_to_name.get(iid, f'ID {iid}') for iid in _subj_instr_ids[:4]]
-                    parts.append(f"Assigned instructors: {', '.join(inames)} — all are fully booked.")
-                if _subj_room_ids:
-                    rnames = [room_id_to_name.get(rid, f'Room {rid}') for rid in _subj_room_ids[:4]]
-                    parts.append(f"Eligible rooms: {', '.join(rnames)} — all are occupied.")
-                parts.append("Try assigning additional instructors or rooms to free up time slots.")
+                    parts.append(f"Only {len(_subj_instr_ids)} instructor(s) assigned: {', '.join(inames)}.")
+                    parts.append(f"Rooms are available but fully booked at the times {'this instructor is' if len(_subj_instr_ids) == 1 else 'these instructors are'} free.")
+                    parts.append("Assign additional instructors to this subject so the scheduler can find a time when both a room and instructor are available.")
+                else:
+                    if _subj_instr_ids:
+                        inames = [instr_id_to_name.get(iid, f'ID {iid}') for iid in _subj_instr_ids[:4]]
+                        parts.append(f"Assigned instructors: {', '.join(inames)} — all are fully booked.")
+                    if _subj_room_ids:
+                        rnames = [room_id_to_name.get(rid, f'Room {rid}') for rid in _subj_room_ids[:4]]
+                        parts.append(f"Eligible rooms: {', '.join(rnames)} — all are occupied.")
+                    parts.append("Try assigning additional instructors or rooms to free up time slots.")
                 suggestion_text = " ".join(parts)
             elif failure_reason == "Instructor Conflict":
                 if _subj_instr_ids:

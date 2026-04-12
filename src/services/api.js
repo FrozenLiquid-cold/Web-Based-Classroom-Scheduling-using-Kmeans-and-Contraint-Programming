@@ -437,9 +437,10 @@ export async function getStaffingAnalysis(semester = 1, blocks = 3, departmentId
   return apiCall(url)
 }
 
-export async function getRoomUtilizationByDay(semester = 1, schoolYear = "") {
+export async function getRoomUtilizationByDay(semester = 1, schoolYear = "", courseId = null) {
   let url = `/stats/room-utilization-by-day?semester=${semester}`
   if (schoolYear) url += `&school_year=${encodeURIComponent(schoolYear)}`
+  if (courseId) url += `&course_id=${courseId}`
   return apiCall(url)
 }
 
