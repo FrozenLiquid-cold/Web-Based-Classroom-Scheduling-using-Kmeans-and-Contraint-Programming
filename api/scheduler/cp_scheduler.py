@@ -198,6 +198,20 @@ def _time_str_to_minutes(value: str) -> Optional[int]:
     value = (value or "").strip()
     if not value:
         return None
+    # Try HH:MM AM/PM format first (e.g., "1:00 PM", "7:30 AM")
+    match_ampm = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", value, re.IGNORECASE)
+    if match_ampm:
+        hour = int(match_ampm.group(1))
+        minute = int(match_ampm.group(2))
+        ampm = match_ampm.group(3).upper()
+        if ampm == "PM" and hour < 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return None
+        return hour * 60 + minute
+    # Fallback: bare HH:MM format (24-hour)
     match = re.match(r"^(\d{1,2}):(\d{2})$", value)
     if not match:
         return None
@@ -982,41 +996,6 @@ def generate_subject_start_options(
                     "slot_labels": [fri_slot.get("label", "")],
                     "num_slots": len(fri_slot_indexes),
                 })
-
-        # Individual weekday single-day options (M, T, W, TH) for LAB subjects.
-        # When paired MW/TTh slots are all occupied, these give the solver
-        # single-day weekday options BEFORE falling through to SAT/SUN via
-        # the recommendation system.
-        for single_day_label in [MON, TUE, WED, THU]:
-            single_day_obj = day_label_to_day.get(single_day_label)
-            if single_day_obj and single_day_label in slots_by_day:
-                for slot in slots_by_day[single_day_label]:
-                    slot_indexes = slot.get("index", [])
-                    if isinstance(slot_indexes, int):
-                        slot_indexes = [slot_indexes]
-
-                    block_indices = set(slot.get("block_indices", []))
-                    if not block_indices:
-                        block_indices = {slot_indexes[0]} if slot_indexes else set()
-
-                    start_min = slot.get("start_min")
-                    end_min = slot.get("end_min")
-                    duration_min = end_min - start_min
-
-                    options.append({
-                        "days": [single_day_label],
-                        "day_ids": [single_day_obj.id],
-                        "day_id": single_day_obj.id,
-                        "start_min": start_min,
-                        "end_min": end_min,
-                        "duration_min": duration_min,
-                        "block_indices": block_indices,
-                        "blocks_by_day": {single_day_obj.id: block_indices},
-                        "slot_indexes": slot_indexes,
-                        "blocks_spanned": set(slot.get("blocks_spanned", [])),
-                        "slot_labels": [slot.get("label", "")],
-                        "num_slots": len(slot_indexes),
-                    })
 
         if logger and options:
             logger.info(f"generate_subject_start_options: Subject {subj_id} (LAB) -> {len(options)} options (MW/TTh/F/single-day)")
@@ -1878,9 +1857,10 @@ def _retry_unscheduled_subjects(
             if scheduled:
                 break
 
-            # In retry, LAB subjects now search all days (M/T/W/Th/F), same as LECs.
-            # LAB vs LEC separation is enforced via room/instructor/subject type,
-            # not by restricting the time grid to Friday only.
+            # LAB subjects should only get single-day F, not individual M/T/W/TH
+            # (paired MW/TTh patterns are handled separately by the CP retry pass)
+            if is_lab_subject and day.label.upper() not in ("F",):
+                continue
             day_slots = slots_by_day.get(day.label, [])
             max_start = len(day_slots) - min_slots
             if max_start < 0:
@@ -2473,15 +2453,11 @@ def _cp_retry_mini_model(
                 (("F",), 1),         # Friday only, 1 block (1hr or 1.5hr)
             ]
         else:
-            # For LAB (and other types): paired weekday patterns + individual weekday singles
+            # For LAB (and other types): paired weekday patterns + Friday single-day only
             day_patterns = [
                 (("T", "TH"), 1),    # Tuesday + Thursday (prioritized for labs)
                 (("M", "W"), 1),     # Monday + Wednesday
                 (("F",), 1),         # Friday - single day lab
-                (("M",), 1),         # Individual weekday fallbacks
-                (("T",), 1),
-                (("W",), 1),
-                (("TH",), 1),
             ]
         
         for pattern, pattern_min_slots in day_patterns:
@@ -9039,6 +9015,18 @@ def run_cp_scheduler(
                         continue
                     if candidate_room.type != item2_room.type:
                         continue
+                    # College ownership check: don't swap INTO a room owned by another college
+                    candidate_bldg_obj = candidate_room.building if hasattr(candidate_room, 'building') else None
+                    candidate_college_id = getattr(candidate_bldg_obj, 'college_id', None) if candidate_bldg_obj else None
+                    if candidate_college_id is not None:
+                        # This room belongs to a specific college — check if the subject's course matches
+                        _item2_course_id = item2.get("course_id")
+                        _item2_college_id = None
+                        if _item2_course_id:
+                            _item2_course = db.query(models.Course).get(_item2_course_id) if db else None
+                            _item2_college_id = getattr(_item2_course, 'college_id', None) if _item2_course else None
+                        if _item2_college_id is not None and candidate_college_id != _item2_college_id:
+                            continue  # Room belongs to a different department
                     # Check capacity
                     if candidate_room.capacity and item2_room.capacity:
                         # Don't downgrade capacity too much
@@ -9054,10 +9042,16 @@ def run_cp_scheduler(
                     item2_start = item2.get("start_min", 0)
                     item2_end = item2.get("end_min", 0)
                     conflict = False
+                    # Check current run's bookings
                     for (bs, be) in _booked_room_slots.get((candidate_rid, day_id), []):
                         if not (item2_end <= bs or be <= item2_start):
                             conflict = True
                             break
+                    # Check cross-course bookings from DB (booked_room_ranges_global)
+                    if not conflict and booked_room_ranges_global is not None:
+                        candidate_room_name = room_id_to_name.get(candidate_rid, "")
+                        if _range_conflicts(booked_room_ranges_global, candidate_room_name, day_id, item2_start, item2_end):
+                            conflict = True
                     if conflict:
                         continue
                     
@@ -9414,7 +9408,7 @@ def find_alternative_slots(
             ("M", "W"), ("T", "TH"), ("F",), ("SAT",)
         ]
     else:
-        patterns = [("F",), ("SAT",), ("M",), ("T",), ("W",), ("TH",)]
+        patterns = [("M", "W"), ("T", "TH"), ("F",), ("SAT",)]
 
     for pattern in patterns:
         pattern_days = [d for d in days if d.label in pattern]

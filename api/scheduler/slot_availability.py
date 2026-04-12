@@ -153,10 +153,10 @@ def generate_recommendations(
     WEEKEND_LABELS = {"SAT", "SUN"}
     
     if is_lab:
-        # LAB: paired M-W / T-TH patterns + single weekdays FIRST, then weekends
-        weekday_singles = [(d.label, [d.label]) for d in days if d.label.upper() in WEEKDAY_LABELS]
+        # LAB: paired M-W / T-TH patterns + single Friday, then weekends
+        friday_single = [(d.label, [d.label]) for d in days if d.label.upper() == "F"]
         weekend_singles = [(d.label, [d.label]) for d in days if d.label.upper() in WEEKEND_LABELS]
-        patterns_to_try = PAIRED_PATTERNS + weekday_singles + weekend_singles
+        patterns_to_try = PAIRED_PATTERNS + friday_single + weekend_singles
     else:
         # LEC: paired M-W / T-TH patterns + Friday single-day
         patterns_to_try = PAIRED_PATTERNS + SINGLE_PATTERNS
