@@ -1,0 +1,16 @@
+api/models.py
+api/phys_lab_debug.txt
+api/routes/schedule.py
+api/routes/stats.py
+api/routes/validation.py
+api/scheduler/cp_scheduler.py
+api/scheduler/scheduler.py
+api/schemas.py
+src/pages/Admin/Dashboard.jsx
+src/pages/Auth/Login.jsx
+src/pages/Auth/LoginRegistrar.jsx
+src/pages/Landing.jsx
+src/pages/Registrar/Dashboard.jsx
+src/pages/Registrar/Schedule.jsx
+src/pages/Registrar/Subject.jsx
+src/services/api.js

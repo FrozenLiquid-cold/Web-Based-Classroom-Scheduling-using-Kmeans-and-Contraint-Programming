@@ -11,30 +11,42 @@ CREATE OR REPLACE FUNCTION public.get_instructor_eligibility(p_subject_id intege
 AS $function$
 DECLARE
     v_subject_code TEXT;
+    v_norm_code TEXT;
 BEGIN
     -- Get subject code
     SELECT s.code
     INTO v_subject_code
     FROM subjects s
     WHERE s.id = p_subject_id;
-    
+
+    -- Normalize: strip non-alphanum, then collapse Prof.E/ProE variants
+    v_norm_code := UPPER(REGEXP_REPLACE(TRIM(v_subject_code), '[^A-Za-z0-9]', '', 'g'));
+    v_norm_code := REGEXP_REPLACE(v_norm_code, 'PROFE(?=[0-9])', 'PROE', 'g');
+    v_norm_code := REPLACE(v_norm_code, 'CSPROFELECT', 'CSPROE');
+
     RETURN QUERY
-    SELECT 
+    SELECT
         i.id AS instructor_id,
         i.first_name::TEXT,
         i.last_name::TEXT,
         i.college_id,
         i.assignable_courses::TEXT
     FROM instructors i
-    WHERE 
+    WHERE
         -- Only active instructors
         i.is_active = true
         AND
-        -- Strict match: subject code must be in assignable_courses
-        i.assignable_courses IS NOT NULL 
+        -- Strict match with normalization (handles Prof.E vs ProE variants)
+        i.assignable_courses IS NOT NULL
         AND v_subject_code IS NOT NULL
-        AND UPPER(REGEXP_REPLACE(TRIM(v_subject_code), '[^A-Z0-9]', '', 'g')) = ANY(
-            SELECT UPPER(REGEXP_REPLACE(TRIM(unnest(string_to_array(i.assignable_courses, ','))), '[^A-Z0-9]', '', 'g'))
+        AND v_norm_code = ANY(
+            SELECT REPLACE(
+                REGEXP_REPLACE(
+                    UPPER(REGEXP_REPLACE(TRIM(unnest(string_to_array(i.assignable_courses, ','))), '[^A-Za-z0-9]', '', 'g')),
+                    'PROFE(?=[0-9])', 'PROE', 'g'
+                ),
+                'CSPROFELECT', 'CSPROE'
+            )
         )
     ORDER BY i.id;
 END;

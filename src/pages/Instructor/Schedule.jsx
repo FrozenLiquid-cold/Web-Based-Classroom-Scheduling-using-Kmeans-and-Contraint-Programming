@@ -36,7 +36,7 @@ export default function Schedule() {
     // Swap filter state
     const [swapFilterDay, setSwapFilterDay] = useState('')
     const [swapFilterRoom, setSwapFilterRoom] = useState('')
-    const [swapFilterStartTime, setSwapFilterStartTime] = useState('07:00')
+    const [swapFilterStartTime, setSwapFilterStartTime] = useState('07:30')
     const [swapFilterEndTime, setSwapFilterEndTime] = useState('21:00')
 
     const session = (() => {
@@ -148,56 +148,34 @@ export default function Schedule() {
             return
         }
 
-        // Store raw count before grouping
+        // Store raw count
         setRawScheduleCount(filtered.length)
 
+        const dayOrder = { M: 0, T: 1, W: 2, TH: 3, F: 4, SAT: 5, SUN: 6 }
         const dayLabelById = {}
         for (const d of (days || [])) {
             if (d && d.id != null) dayLabelById[d.id] = d.label
         }
-        const dayOrder = { M: 0, T: 1, W: 2, TH: 3, F: 4, SAT: 5, SUN: 6 }
 
-        const grouped = {}
-        for (const item of filtered) {
-            const subjectKey = item.subject_id || item.subjectId || ''
-            const instructorKey = item.instructor_id || item.instructorId || ''
-            const roomKey = item.room_id || item.roomId || ''
-            const rawTimeKey = item.time || ''
-            const timeKey = typeof rawTimeKey === 'string' ? rawTimeKey.replace(/^(M|T|W|TH|F|SAT|SUN)\s+/, '') : rawTimeKey
-            const blockKey = item.block || ''
-            const groupKey = `${subjectKey}|${instructorKey}|${roomKey}|${timeKey}|${blockKey}`
-            if (!grouped[groupKey]) {
-                grouped[groupKey] = { ...item, _dayIds: [] }
-            }
-            const dayId = item.day_id || item.dayId
-            if (dayId != null && !grouped[groupKey]._dayIds.includes(dayId)) {
-                grouped[groupKey]._dayIds.push(dayId)
-            }
-        }
-
-        const merged = Object.values(grouped).map(g => {
-            const dayIds = g._dayIds || []
-            const labels = dayIds.map(id => dayLabelById[id]).filter(Boolean).sort((a, b) => (dayOrder[a] ?? 99) - (dayOrder[b] ?? 99))
-            let combinedDays = ''
-            if (labels.length === 2) {
-                const [d1, d2] = labels
-                if ((d1 === 'M' && d2 === 'W') || (d1 === 'W' && d2 === 'M')) combinedDays = 'M-W'
-                else if ((d1 === 'T' && d2 === 'TH') || (d1 === 'TH' && d2 === 'T')) combinedDays = 'T-TH'
-                else combinedDays = labels.join('-')
-            } else {
-                combinedDays = labels.join('-')
-            }
-            const { _dayIds, ...rest } = g
-            return { ...rest, day_id: dayIds[0] ?? g.day_id ?? g.dayId ?? null, _combinedDaysLabel: combinedDays || (labels[0] || '') }
+        // Sort by subject, then by day within each subject
+        const sorted = [...filtered].sort((a, b) => {
+            const subA = a.subjectId || a.subject_id || 0
+            const subB = b.subjectId || b.subject_id || 0
+            const blockA = a.block || ''
+            const blockB = b.block || ''
+            // Primary: subject, Secondary: block, Tertiary: day
+            if (subA !== subB) return subA - subB
+            if (blockA !== blockB) return blockA < blockB ? -1 : 1
+            const dayA = dayLabelById[a.day_id || a.dayId] || ''
+            const dayB = dayLabelById[b.day_id || b.dayId] || ''
+            return (dayOrder[dayA] ?? 99) - (dayOrder[dayB] ?? 99)
         })
 
-        setRows(merged)
+        setRows(sorted)
     }, [courseId, sem, year, allInstructorSchedules, days])
 
     const getSubject = (id) => subjects.find(s => s.id === id)
     const getDay = (r) => {
-        const combined = r?._combinedDaysLabel
-        if (combined) return combined
         const id = r?.dayId || r?.day_id
         return days.find(d => d.id === id)?.label || ''
     }
@@ -287,7 +265,7 @@ export default function Schedule() {
         setSwapConflicts([])
         setSwapFilterDay('')
         setSwapFilterRoom('')
-        setSwapFilterStartTime('07:00')
+        setSwapFilterStartTime('07:30')
         setSwapFilterEndTime('21:00')
         setSwapSearchLoading(false)
     }
@@ -552,52 +530,96 @@ export default function Schedule() {
                             )}
 
                             {rows.length > 0 ? (
-                                <div className={`backdrop-blur-xl rounded-2xl border overflow-hidden ${theme.table}`}>
-                                    <div className="overflow-x-auto">
-                                        <table className="w-full">
-                                            <thead>
-                                                <tr className={theme.tableHeader}>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>#</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Subject Code</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Description</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Type</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Units</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Day</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Time</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Room</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Block</th>
-                                                    <th className={`text-left px-4 py-4 ${theme.textMuted} font-medium text-sm`}>Action</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody className={`divide-y ${theme.tableDivide}`}>
-                                                {rows.map((r, idx) => {
-                                                    const s = getSubject(r.subjectId || r.subject_id) || {}
-                                                    const dayLabel = getDay(r)
-                                                    return (
-                                                        <tr key={idx} className={`${theme.tableRow} transition-colors`}>
-                                                            <td className={`px-4 py-4 ${theme.textMuted} font-mono`}>{idx + 1}</td>
-                                                            <td className="px-4 py-4"><span className={`${theme.text} font-medium`}>{s.code || '—'}</span></td>
-                                                            <td className={`px-4 py-4 ${isDark ? 'text-slate-300' : 'text-slate-600'} max-w-xs truncate`}>{s.description || '—'}</td>
-                                                            <td className="px-4 py-4"><span className={`px-2 py-1 rounded-lg text-xs font-medium border ${getTypeBadge(s.type)}`}>{s.type || '—'}</span></td>
-                                                            <td className={`px-4 py-4 ${isDark ? 'text-slate-300' : 'text-slate-600'} text-center`}>{s.unit || '—'}</td>
-                                                            <td className="px-4 py-4"><span className={`px-2 py-1 rounded-lg text-xs font-medium ${getDayBadge(dayLabel)}`}>{dayLabel || '—'}</span></td>
-                                                            <td className={`px-4 py-4 ${isDark ? 'text-slate-300' : 'text-slate-600'} font-mono text-sm`}>{formatTime12Hour(r.time)}</td>
-                                                            <td className="px-4 py-4"><span className="text-cyan-500">{getRoom(r.roomId || r.room_id) || '—'}</span></td>
-                                                            <td className="px-4 py-4"><span className={`px-2 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-slate-600/50 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>{r.block || '—'}</span></td>
-                                                            <td className="px-4 py-4">
-                                                                <button
-                                                                    onClick={() => openSwapModal(r)}
-                                                                    className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 transition-colors"
-                                                                >
-                                                                    Request Swap
-                                                                </button>
-                                                            </td>
-                                                        </tr>
-                                                    )
-                                                })}
-                                            </tbody>
-                                        </table>
-                                    </div>
+                                <div className="space-y-4">
+                                    {(() => {
+                                        // Group rows by subject + block
+                                        const groups = []
+                                        const groupMap = new Map()
+                                        rows.forEach(r => {
+                                            const subId = r.subjectId || r.subject_id
+                                            const block = r.block || '—'
+                                            const key = `${subId}_${block}`
+                                            if (!groupMap.has(key)) {
+                                                const group = { subjectId: subId, block, entries: [] }
+                                                groupMap.set(key, group)
+                                                groups.push(group)
+                                            }
+                                            groupMap.get(key).entries.push(r)
+                                        })
+
+                                        return groups.map((group, gIdx) => {
+                                            const s = getSubject(group.subjectId) || {}
+                                            return (
+                                                <div key={gIdx} className={`backdrop-blur-xl rounded-2xl border overflow-hidden ${theme.table}`}>
+                                                    {/* Group Header */}
+                                                    <div className={`px-5 py-4 flex flex-wrap items-center gap-3 ${isDark ? 'bg-gradient-to-r from-slate-800 to-slate-800/80 border-b border-slate-700/50' : 'bg-gradient-to-r from-slate-50 to-white border-b border-slate-200'}`}>
+                                                        <div className={`w-9 h-9 rounded-lg flex items-center justify-center text-sm font-bold ${isDark ? 'bg-blue-500/20 text-blue-400' : 'bg-blue-100 text-blue-600'}`}>
+                                                            {gIdx + 1}
+                                                        </div>
+                                                        <div className="flex-1 min-w-0">
+                                                            <div className="flex items-center gap-2 flex-wrap">
+                                                                <span className={`font-semibold text-base ${theme.text}`}>{s.code || '—'}</span>
+                                                                <span className={`px-2 py-0.5 rounded-md text-xs font-medium border ${getTypeBadge(s.type)}`}>{s.type || '—'}</span>
+                                                            </div>
+                                                            <p className={`text-sm mt-0.5 ${isDark ? 'text-slate-400' : 'text-slate-500'} truncate`}>{s.description || '—'}</p>
+                                                        </div>
+                                                        <div className="flex items-center gap-3">
+                                                            <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-slate-600/50 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>
+                                                                Block {group.block}
+                                                            </span>
+                                                            <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-emerald-500/15 text-emerald-400' : 'bg-emerald-50 text-emerald-600'}`}>
+                                                                {s.unit || '—'} Units
+                                                            </span>
+                                                            <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-cyan-500/15 text-cyan-400' : 'bg-cyan-50 text-cyan-600'}`}>
+                                                                {group.entries.length} {group.entries.length === 1 ? 'session' : 'sessions'}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                    {/* Sessions Table */}
+                                                    <div className="overflow-x-auto">
+                                                        <table className="w-full">
+                                                            <thead>
+                                                                <tr className={theme.tableHeader}>
+                                                                    <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Day</th>
+                                                                    <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Time</th>
+                                                                    <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Room</th>
+                                                                    <th className={`text-right px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Action</th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody className={`divide-y ${theme.tableDivide}`}>
+                                                                {group.entries.map((r, eIdx) => {
+                                                                    const dayLabel = getDay(r)
+                                                                    return (
+                                                                        <tr key={eIdx} className={`${theme.tableRow} transition-colors`}>
+                                                                            <td className="px-5 py-3.5">
+                                                                                <span className={`inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold ${getDayBadge(dayLabel)}`}>
+                                                                                    {dayLabel || '—'}
+                                                                                </span>
+                                                                            </td>
+                                                                            <td className={`px-5 py-3.5 ${isDark ? 'text-slate-300' : 'text-slate-600'} font-mono text-sm`}>
+                                                                                {formatTime12Hour(r.time)}
+                                                                            </td>
+                                                                            <td className="px-5 py-3.5">
+                                                                                <span className="text-cyan-500 font-medium">{getRoom(r.roomId || r.room_id) || '—'}</span>
+                                                                            </td>
+                                                                            <td className="px-5 py-3.5 text-right">
+                                                                                <button
+                                                                                    onClick={() => openSwapModal(r)}
+                                                                                    className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-500/90 text-white hover:bg-indigo-600 transition-all hover:shadow-md hover:shadow-indigo-500/20"
+                                                                                >
+                                                                                    Request Swap
+                                                                                </button>
+                                                                            </td>
+                                                                        </tr>
+                                                                    )
+                                                                })}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                </div>
+                                            )
+                                        })
+                                    })()}
                                 </div>
                             ) : courseId ? (
                                 <div className="flex items-center justify-center py-24">

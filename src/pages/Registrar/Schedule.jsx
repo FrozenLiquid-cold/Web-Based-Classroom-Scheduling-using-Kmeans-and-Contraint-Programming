@@ -10,10 +10,12 @@ import {
   getScheduledSubjectIds,
   validateScheduleItem,
   getSchedulingSuggestions,
-  checkAvailability
+  checkAvailability,
+  getRoomUtilizationByDay
 } from "../../services/api";
 import SchedulerDiagnostics from "../../components/SchedulerDiagnostics";
 import ScheduleTimetable from "../../components/ScheduleTimetable";
+import SchoolYearSelector, { computeDefaultSY } from "../../components/SchoolYearSelector";
 
 const YEARS = [1, 2, 3, 4];
 const BLOCK_OPTIONS = [1, 2, 3, 4];
@@ -29,12 +31,14 @@ const withUiIds = (items) => {
 };
 
 export default function RegistrarSchedule() {
+  const [schoolYear, setSchoolYear] = useState(() => localStorage.getItem('jrmsu.schoolYear') || computeDefaultSY());
   const [courses, setCourses] = useState([]);
   const [instructors, setInstructors] = useState([]);
   const [days, setDays] = useState([]);
   const [subjects, setSubjects] = useState([]);
   const [rooms, setRooms] = useState([]);
   const [buildings, setBuildings] = useState([]);
+  const [globalRoomUtil, setGlobalRoomUtil] = useState([]);
   const [form, setForm] = useState({
     course_id: "",
     year: "",
@@ -216,7 +220,7 @@ export default function RegistrarSchedule() {
       const year = Number(form.year);
       const semester = Number(form.semester);
       if (courseId && year && semester) {
-        const resp = await loadScheduleApi(courseId, semester, year);
+        const resp = await loadScheduleApi(courseId, semester, year, null, schoolYear);
         if (resp && resp.status === 'success') setSchedule(withUiIds(resp.items || []));
       }
     } catch (err) {
@@ -297,7 +301,7 @@ export default function RegistrarSchedule() {
 
     async function loadSavedSchedule() {
       try {
-        const resp = await loadScheduleApi(courseId, semester, year);
+        const resp = await loadScheduleApi(courseId, semester, year, null, schoolYear);
         if (cancelled) return;
 
         if (resp && resp.status === "success") {
@@ -339,7 +343,7 @@ export default function RegistrarSchedule() {
     return () => {
       cancelled = true;
     };
-  }, [form.course_id, form.year, form.semester]);
+  }, [form.course_id, form.year, form.semester, schoolYear]);
 
 
 
@@ -369,7 +373,7 @@ export default function RegistrarSchedule() {
         year,
         semester,
         null,
-        { waitSeconds: 1, blocks_count: blocksCount }
+        { waitSeconds: 1, blocks_count: blocksCount, schoolYear }
       );
 
       if (result.status === "success") {
@@ -602,7 +606,7 @@ export default function RegistrarSchedule() {
       // Save each year separately
       const savePromises = Object.keys(itemsByYear).map((year) => {
         const yearNum = Number(year);
-        return saveSchedule(courseId, yearNum, semester, itemsByYear[year]);
+        return saveSchedule(courseId, yearNum, semester, itemsByYear[year], schoolYear);
       });
 
       await Promise.all(savePromises);
@@ -744,7 +748,8 @@ export default function RegistrarSchedule() {
           year: Number(form.year),
           semester: Number(form.semester),
           block: item._blockLabel || item.block || null,
-          merge_tag: item.merge_tag || null
+          merge_tag: item.merge_tag || null,
+          school_year: schoolYear || null
         });
 
         // Merge backend messages (avoid duplicates)
@@ -1315,6 +1320,314 @@ export default function RegistrarSchedule() {
     return ids.size;
   }, [subjects, filteredSchedule, form.course_id, form.year, form.semester]);
 
+  // Fetch global room utilization from backend when semester/schoolYear changes
+  useEffect(() => {
+    const sem = Number(form.semester);
+    if (!sem) return;
+    getRoomUtilizationByDay(sem, schoolYear)
+      .then(data => setGlobalRoomUtil(Array.isArray(data) ? data : []))
+      .catch(err => console.error('Failed to load room utilization', err));
+  }, [form.semester, schoolYear]);
+
+  // Room saturation analysis — detect when rooms are fully booked
+  const roomAnalysis = useMemo(() => {
+    if (!filteredSchedule || filteredSchedule.length === 0) return { recommendations: [], utilization: [] };
+
+    const recommendations = [];
+    const dayLabelById = {};
+    days.forEach(d => {
+      if (d?.id != null) {
+        dayLabelById[d.id] = d.label;
+      }
+    });
+
+    const WEEKEND = ['SAT', 'SUN', 'S'];
+
+    // Build room type lookup
+    const roomTypeMap = {};     // room_id -> type (ALL rooms, including unavailable)
+    const allRoomsOfType = {};  // type -> Set of room ids (only AVAILABLE rooms)
+    for (const r of (rooms || [])) {
+      const t = (r.type || 'LEC').toUpperCase();
+      roomTypeMap[r.id] = t;
+      // Only count available rooms for capacity/utilization calculations
+      if (r.is_available !== false && r.is_available !== 0) {
+        if (!allRoomsOfType[t]) allRoomsOfType[t] = new Set();
+        allRoomsOfType[t].add(r.id);
+      }
+    }
+
+    // Use global utilization data from backend (slot-availability-based, all courses)
+    // TIME_BLOCKS used for slot availability counting (matching api/scheduler/timeslots.py)
+    const TIME_BLOCKS_RANGES = [
+      [450, 510],   // 7:30-8:30
+      [450, 540],   // 7:30-9:00
+      [540, 600],   // 9:00-10:00
+      [540, 630],   // 9:00-10:30
+      [630, 690],   // 10:30-11:30
+      [630, 720],   // 10:30-12:00
+      [780, 840],   // 1:00-2:00
+      [780, 870],   // 1:00-2:30
+      [870, 930],   // 2:30-3:30
+      [870, 960],   // 2:30-4:00
+      [960, 1020],  // 4:00-5:00
+      [960, 1050],  // 4:00-5:30
+      [1050, 1140], // 5:30-7:00
+    ];
+    const TOTAL_SLOTS_PER_ROOM = TIME_BLOCKS_RANGES.length;
+
+    // Parse time ranges from schedule items, group by (roomId, dayId)
+    const localRoomDayRanges = {};  // `${roomId}-${dayId}` -> [{start, end}]
+    const localRoomsUsed = {};      // `${type}-${dayId}` -> Set of room_ids
+    for (const item of filteredSchedule) {
+      const dayId = item.day_id || item.dayId;
+      const roomId = item.room_id || item.roomId;
+      if (!dayId || !roomId) continue;
+      const rtype = roomTypeMap[roomId] || 'LEC';
+      const tdKey = `${rtype}-${dayId}`;
+      if (!localRoomsUsed[tdKey]) localRoomsUsed[tdKey] = new Set();
+      localRoomsUsed[tdKey].add(roomId);
+
+      const timeStr = item.time || '';
+      const normalized = timeStr.replace(/[\u2013\u2014]/g, '-');
+      const matches = normalized.match(/(\d{1,2}):(\d{2})/g);
+      if (matches && matches.length >= 2) {
+        const [h1, m1] = matches[0].split(':').map(Number);
+        const [h2, m2] = matches[1].split(':').map(Number);
+        const start = (h1 < 7 ? h1 + 12 : h1) * 60 + m1;
+        const end = (h2 < 7 ? h2 + 12 : h2) * 60 + m2;
+        const rdKey = `${roomId}-${dayId}`;
+        if (!localRoomDayRanges[rdKey]) localRoomDayRanges[rdKey] = [];
+        localRoomDayRanges[rdKey].push({ start, end });
+      }
+    }
+
+    // Count available TIME_BLOCK slots for a room on a day
+    const countAvailableSlots = (roomId, dayId) => {
+      const booked = localRoomDayRanges[`${roomId}-${dayId}`] || [];
+      let available = 0;
+      for (const [tbS, tbE] of TIME_BLOCKS_RANGES) {
+        const isFree = booked.every(b => tbE <= b.start || b.end <= tbS);
+        if (isFree) available++;
+      }
+      return available;
+    };
+
+    // Start from global backend data if available
+    let utilization;
+    if (globalRoomUtil.length > 0) {
+      utilization = globalRoomUtil.map(u => {
+        const slotsUsed = u.slotsUsed || 0;
+        const maxSlots = u.maxSlots || 0;
+        const pct = maxSlots > 0 ? Math.round((slotsUsed / maxSlots) * 100) : 0;
+        const localRooms = localRoomsUsed[`${u.type}-${u.dayId}`]?.size || 0;
+        const roomsUsed = Math.max(u.roomsUsed || 0, localRooms);
+        return {
+          ...u,
+          slotsUsed,
+          roomsUsed,
+          percentage: pct,
+          bookings: slotsUsed,
+          maxCapacity: maxSlots,
+        };
+      });
+    } else {
+      // No global data — build utilization from generated schedule using slot availability
+      const roomTypesInUse = new Set();
+      for (const item of filteredSchedule) {
+        const roomId = item.room_id || item.roomId;
+        if (roomId) roomTypesInUse.add(roomTypeMap[roomId] || 'LEC');
+      }
+      utilization = [];
+      for (const rtype of roomTypesInUse) {
+        const typeLabel = rtype === 'LAB' ? 'Laboratory' : 'Lecture';
+        const availRoomIds = allRoomsOfType[rtype] || new Set();
+        const totalRoomCount = availRoomIds.size;
+        const activeSet = new Set();
+        for (const item of filteredSchedule) {
+          const roomId = item.room_id || item.roomId;
+          if (roomId && (roomTypeMap[roomId] || 'LEC') === rtype && availRoomIds.has(roomId)) {
+            activeSet.add(roomId);
+          }
+        }
+        const activeCount = activeSet.size;
+        const maxSlotsPerDay = activeCount * TOTAL_SLOTS_PER_ROOM;
+        const unusedIds = [...availRoomIds].filter(id => !activeSet.has(id));
+        const roomNameMap = {};
+        for (const r of (rooms || [])) roomNameMap[r.id] = r.name;
+        const unusedRooms = unusedIds.map(id => roomNameMap[id] || `Room ${id}`).sort();
+
+        for (const day of days) {
+          if (!day.id) continue;
+          const dayLabel = day.label || '';
+          const isWeekend = WEEKEND.includes(dayLabel.toUpperCase());
+          const roomsUsed = localRoomsUsed[`${rtype}-${day.id}`]?.size || 0;
+
+          // Count available slots across all active rooms for this day
+          let totalAvailable = 0;
+          for (const rid of activeSet) {
+            totalAvailable += countAvailableSlots(rid, day.id);
+          }
+          const slotsUsed = maxSlotsPerDay - totalAvailable;
+          const pct = maxSlotsPerDay > 0 ? Math.round((slotsUsed / maxSlotsPerDay) * 100) : 0;
+
+          utilization.push({
+            type: rtype,
+            typeLabel,
+            day: dayLabel,
+            dayId: day.id,
+            isWeekend,
+            slotsUsed,
+            maxSlots: maxSlotsPerDay,
+            maxSlotsTotal: totalRoomCount * TOTAL_SLOTS_PER_ROOM,
+            slotsAvailable: totalAvailable,
+            roomsUsed,
+            activeRooms: activeCount,
+            totalRooms: totalRoomCount,
+            unusedRooms,
+            percentage: pct,
+            bookings: slotsUsed,
+            maxCapacity: maxSlotsPerDay,
+          });
+        }
+      }
+    }
+
+    // 1. Detect SAT/SUN usage — sign of weekday saturation
+    // Exclude NSTP and shared venue subjects (FIELD, GYM, etc.) which are
+    // intentionally scheduled on weekends and should not trigger overflow warnings
+    const SHARED_VENUES = ['FIELD', 'GYM', 'INNER QUAD', 'GYMNASIUM'];
+    const weekendItems = filteredSchedule.filter(item => {
+      const dayId = item.day_id || item.dayId;
+      const label = (dayLabelById[dayId] || '').toUpperCase();
+      if (!WEEKEND.includes(label)) return false;
+      // Exclude NSTP subjects — look up code from subjects array since schedule items only have subject_id
+      const subjectId = item.subject_id || item.subjectId;
+      const subj = subjectId ? (subjects || []).find(s => s.id === subjectId) : null;
+      const code = (subj?.code || item.subject_code || '').toUpperCase();
+      if (code.startsWith('NSTP')) return false;
+      // Exclude shared venue rooms (these are outdoor/open venues, not real rooms)
+      const roomId = item.room_id || item.roomId;
+      const room = roomId ? (rooms || []).find(r => r.id === roomId) : null;
+      const roomName = (room?.name || item.room_name || '').toUpperCase();
+      if (SHARED_VENUES.some(v => roomName.includes(v))) return false;
+      return true;
+    });
+
+    if (weekendItems.length > 0) {
+      // Group by room type
+      const weekendTypes = {};
+      for (const item of weekendItems) {
+        const roomId = item.room_id || item.roomId;
+        const rType = roomTypeMap[roomId] || 'LEC';
+        if (!weekendTypes[rType]) weekendTypes[rType] = 0;
+        weekendTypes[rType]++;
+      }
+
+      for (const [rType, count] of Object.entries(weekendTypes)) {
+        const typeLabel = rType === 'LAB' ? 'Laboratory' : 'Lecture';
+        const totalCount = allRoomsOfType[rType]?.size || 0;
+
+        // Use GLOBAL weekday utilization for this room type
+        const weekdayUtils = utilization.filter(u => u.type === rType && !u.isWeekend);
+        const avgWeekdayPct = weekdayUtils.length > 0
+          ? Math.round(weekdayUtils.reduce((a, u) => a + u.percentage, 0) / weekdayUtils.length)
+          : 0;
+
+        // Build a meaningful usage description using global data
+        let usageDescription;
+        if (avgWeekdayPct >= 80) {
+          usageDescription = `full (${avgWeekdayPct}% avg usage across all courses)`;
+        } else if (avgWeekdayPct >= 50) {
+          usageDescription = `heavily booked (${avgWeekdayPct}% avg usage across all courses)`;
+        } else if (avgWeekdayPct > 0) {
+          usageDescription = `at ${avgWeekdayPct}% avg usage across all courses`;
+        } else {
+          usageDescription = `fully unavailable on weekdays (booked by other schedules)`;
+        }
+
+        recommendations.push({
+          type: 'weekend_overflow',
+          severity: 'warning',
+          message: `${count} class${count > 1 ? 'es' : ''} pushed to SAT/SUN because weekday ${typeLabel.toLowerCase()} rooms are ${usageDescription}. NEED to add more ${rType === 'LAB' ? 'computer labs' : 'lecture rooms'} — you currently have ${totalCount}.`,
+        });
+      }
+    }
+
+    // 2. Near-capacity weekdays (≥80% but not yet in "weekend_overflow")
+    const nearCapDays = utilization.filter(u => !u.isWeekend && u.percentage >= 80);
+    if (nearCapDays.length > 0 && weekendItems.length === 0) {
+      const grouped = {};
+      for (const u of nearCapDays) {
+        if (!grouped[u.type]) grouped[u.type] = [];
+        grouped[u.type].push(u);
+      }
+      for (const [rType, entries] of Object.entries(grouped)) {
+        const typeLabel = rType === 'LAB' ? 'Laboratory' : 'Lecture';
+        const daysList = entries.map(e => `${e.day} (${e.percentage}%)`).join(', ');
+        const totalCount = allRoomsOfType[rType]?.size || 0;
+        recommendations.push({
+          type: 'near_capacity',
+          severity: 'warning',
+          message: `${typeLabel} rooms near capacity on ${daysList}. With only ${totalCount} ${typeLabel.toLowerCase()} room${totalCount > 1 ? 's' : ''}, adding more blocks may require scheduling on weekends.`,
+        });
+      }
+    }
+
+    // 3. All rooms of a type booked on a weekday
+    for (const u of utilization) {
+      if (u.isWeekend) continue;
+      if (u.roomsUsed >= u.totalRooms && u.totalRooms > 0) {
+        recommendations.push({
+          type: 'room_full',
+          severity: 'warning',
+          roomType: u.type,
+          day: u.day,
+          message: `All ${u.totalRooms} ${u.typeLabel.toLowerCase()} room${u.totalRooms > 1 ? 's' : ''} are in use on ${u.day} (${u.percentage}% capacity). NEED to add a new ${u.type === 'LAB' ? 'computer lab' : 'lecture room'}.`,
+        });
+      }
+    }
+
+    // 4. Fallback rooms used
+    const fallbackCount = filteredSchedule.filter(s => s.is_recommended).length;
+    if (fallbackCount > 0) {
+      recommendations.push({
+        type: 'fallback_used',
+        severity: 'info',
+        message: `${fallbackCount} slot${fallbackCount > 1 ? 's' : ''} used a suggested fallback room because the preferred room was unavailable.`,
+      });
+    }
+
+    // 5. Unscheduled subjects due to room constraints
+    const diagReasons = diagnostics?.unscheduled_reasons || diagnostics?._raw || {};
+    for (const [sid, entry] of Object.entries(diagReasons)) {
+      if (typeof entry === 'object' && entry.failure_reason) {
+        const reason = (entry.failure_reason || '').toLowerCase();
+        if (reason.includes('room') || reason.includes('no feasible')) {
+          const subj = subjects.find(s => String(s.id) === String(sid));
+          recommendations.push({
+            type: 'unscheduled_room',
+            severity: 'critical',
+            message: `"${subj?.code || `Subject ${sid}`}" could not be scheduled — ${entry.failure_reason}. Add more rooms or adjust schedules.`,
+          });
+        }
+      }
+    }
+
+    // Deduplicate by message
+    const seen = new Set();
+    const deduped = recommendations.filter(r => {
+      if (seen.has(r.message)) return false;
+      seen.add(r.message);
+      return true;
+    });
+
+    // Sort: critical first, then warning, then info
+    const severityOrder = { critical: 0, warning: 1, info: 2 };
+    deduped.sort((a, b) => (severityOrder[a.severity] ?? 3) - (severityOrder[b.severity] ?? 3));
+
+    return { recommendations: deduped, utilization };
+  }, [filteredSchedule, rooms, days, diagnostics, subjects, globalRoomUtil]);
+
   // Feature 1: Detect subjects with no eligible active instructor (pre-scheduling)
   const normalizeCode = (str) => str.toUpperCase().replace(/[^A-Z0-9]/g, '');
 
@@ -1405,9 +1718,20 @@ export default function RegistrarSchedule() {
         if (assignable.trim().length > 0) {
           // Strip everything except letters and numbers for a bulletproof match
           const normalizeString = (str) => str.toUpperCase().replace(/[^A-Z0-9]/g, '');
+          // More aggressive normalization: collapse common abbreviation variants
+          // e.g. "Prof.E 7" (PROFE7) and "ProE 7" (PROE7) both mean Professional Elective 7
+          const deepNormalize = (str) => normalizeString(str)
+            .replace(/PROFE(?=\d)/g, 'PROE')        // Prof.E N → ProE N
+            .replace(/CSPROFELECT/g, 'CSPROE');      // CS Prof Elect → CS ProE
           const cleanSubjectCode = normalizeString(subjectCode);
+          const deepCleanSubjectCode = deepNormalize(subjectCode);
 
-          isSpecialized = assignable.split(',').some(c => normalizeString(c) === cleanSubjectCode);
+          isSpecialized = assignable.split(',').some(c => {
+            const nc = normalizeString(c);
+            if (nc === cleanSubjectCode) return true;
+            // Fallback: aggressive normalization for Prof.E/ProE variants
+            return deepNormalize(c) === deepCleanSubjectCode;
+          });
         }
       }
     }
@@ -1486,7 +1810,19 @@ export default function RegistrarSchedule() {
                 onClick={(e) => {
                   e.stopPropagation();
                   const recs = diagEntry?.recommendations || [];
-                  setResolvingItem({ ...slot, failureReason, recommendations: recs });
+                  const diagDetail = typeof diagEntry === 'object' ? diagEntry.detail || diagEntry.reason_text || '' : '';
+                  const diagSuggestion = typeof diagEntry === 'object' ? diagEntry.suggestion || '' : '';
+                  const diagSubjectCode = typeof diagEntry === 'object' ? diagEntry.subject_code || '' : '';
+                  const diagSubjectType = typeof diagEntry === 'object' ? diagEntry.subject_type || '' : '';
+                  setResolvingItem({
+                    ...slot,
+                    failureReason,
+                    recommendations: recs,
+                    diagDetail,
+                    diagSuggestion,
+                    diagSubjectCode: diagSubjectCode || subjectCode,
+                    diagSubjectType: diagSubjectType || subjectType,
+                  });
                 }}
                 className="text-white text-xs bg-blue-500 hover:bg-blue-600 px-2 py-1 rounded shadow-sm flex items-center gap-1 active:scale-95 transition-transform"
               >
@@ -1576,8 +1912,11 @@ export default function RegistrarSchedule() {
   };
 
   return (
-    <div className="p-6 max-w-4xl mx-auto">
-      <h1 className="text-2xl font-semibold mb-6">Registrar Scheduling</h1>
+    <div className="p-2">
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-semibold">Registrar Scheduling</h1>
+        <SchoolYearSelector onChange={setSchoolYear} />
+      </div>
 
       <form onSubmit={handleSubmit} className="grid gap-4 sm:grid-cols-2">
         <label className="flex flex-col gap-1 text-sm">
@@ -1727,6 +2066,151 @@ export default function RegistrarSchedule() {
         isVisible={jobStatus === "succeeded" && Object.keys(diagnostics).length > 0}
       />
 
+      {/* Room Recommendations Banner */}
+      {roomAnalysis.recommendations.length > 0 && Object.keys(expandedSchedule).length > 0 && (
+        <div className="mt-4 space-y-2">
+          {roomAnalysis.recommendations.map((rec, i) => {
+            const styles = {
+              critical: {
+                bg: 'bg-red-50', border: 'border-red-200', text: 'text-red-800',
+                icon: (
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-red-500 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                  </svg>
+                ),
+              },
+              warning: {
+                bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-800',
+                icon: (
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-amber-500 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                  </svg>
+                ),
+              },
+              info: {
+                bg: 'bg-blue-50', border: 'border-blue-200', text: 'text-blue-800',
+                icon: (
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-blue-500 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                  </svg>
+                ),
+              },
+            };
+            const s = styles[rec.severity] || styles.info;
+            const badgeMap = {
+              weekend_overflow: { label: 'Weekend Overflow', bg: 'bg-orange-200 text-orange-800' },
+              near_capacity: { label: 'Near Capacity', bg: 'bg-amber-200 text-amber-800' },
+              room_full: { label: 'Room Capacity', bg: 'bg-amber-200 text-amber-800' },
+              unscheduled_room: { label: 'No Room Available', bg: 'bg-red-200 text-red-800' },
+              fallback_used: { label: 'Fallback Used', bg: 'bg-blue-200 text-blue-800' },
+            };
+            const badge = badgeMap[rec.type];
+            return (
+              <div key={i} className={`flex items-start gap-3 p-3 rounded-lg border ${s.bg} ${s.border}`}>
+                {s.icon}
+                <div className={`text-sm font-medium ${s.text}`}>
+                  {badge && (
+                    <span className={`inline-block px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide rounded mr-2 ${badge.bg}`}>
+                      {badge.label}
+                    </span>
+                  )}
+                  {rec.message}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Room Utilization Breakdown */}
+          {roomAnalysis.utilization.some(u => (u.slotsUsed || u.bookings) > 0) && (
+            <details className="rounded-lg border border-gray-200 bg-white overflow-hidden">
+              <summary className="px-4 py-2.5 cursor-pointer select-none flex items-center gap-2 text-sm font-semibold text-gray-700 hover:bg-gray-50 transition-colors">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-gray-400" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clipRule="evenodd" />
+                </svg>
+                Room Utilization Breakdown
+              </summary>
+              <div className="px-4 pb-4 pt-2">
+                {Object.entries(
+                  roomAnalysis.utilization
+                    .filter(u => (u.slotsUsed || u.bookings) > 0 || !u.isWeekend)
+                    .reduce((acc, u) => {
+                      if (!acc[u.type]) acc[u.type] = {
+                        label: u.typeLabel,
+                        totalRooms: u.totalRooms,
+                        activeRooms: u.activeRooms ?? u.totalRooms,
+                        unusedRooms: u.unusedRooms || [],
+                        days: []
+                      };
+                      acc[u.type].days.push(u);
+                      return acc;
+                    }, {})
+                ).map(([type, data]) => (
+                  <div key={type} className="mb-4 last:mb-0">
+                    <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-2">
+                      {type === 'LAB' ? '🖥' : '📖'} {data.label} Rooms
+                      <span className="text-[10px] font-normal normal-case text-gray-400">
+                        ({data.activeRooms}/{data.totalRooms} active)
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
+                      {data.days.filter(d => !d.isWeekend || (d.slotsUsed || d.bookings) > 0).map((d) => {
+                        const barColor = d.isWeekend
+                          ? 'bg-orange-400'
+                          : d.percentage >= 80
+                            ? 'bg-red-400'
+                            : d.percentage >= 50
+                              ? 'bg-amber-400'
+                              : 'bg-emerald-400';
+                        return (
+                          <div key={`${type}-${d.dayId}`} className={`rounded-lg border p-2 ${d.isWeekend ? 'bg-orange-50 border-orange-200' : d.percentage >= 100 ? 'bg-red-50 border-red-200' : 'bg-gray-50 border-gray-200'}`}>
+                            <div className="flex items-center justify-between mb-1">
+                              <span className={`text-xs font-bold ${d.isWeekend ? 'text-orange-700' : d.percentage >= 100 ? 'text-red-700' : 'text-gray-700'}`}>
+                                {d.day}
+                                {d.isWeekend && <span className="ml-1 text-[9px] font-normal">⚠</span>}
+                              </span>
+                              <span className="text-[10px] text-gray-500">
+                                {d.slotsUsed ?? d.bookings ?? 0}/{d.maxSlots ?? d.maxCapacity ?? 0}
+                              </span>
+                            </div>
+                            <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all duration-500 ${barColor}`}
+                                style={{ width: `${Math.min(100, d.percentage)}%` }}
+                              />
+                            </div>
+                            <div className="flex items-center justify-between mt-0.5">
+                              <span className={`text-[10px] font-semibold ${
+                                (d.slotsAvailable ?? ((d.maxSlots || 0) - (d.slotsUsed || 0))) <= 0
+                                  ? 'text-red-600'
+                                  : 'text-emerald-600'
+                              }`}>
+                                {(() => {
+                                  const free = d.slotsAvailable ?? Math.max(0, (d.maxSlots || 0) - (d.slotsUsed || 0));
+                                  return free <= 0 ? 'FULL' : `${free} free`;
+                                })()}
+                              </span>
+                              <span className="text-[10px] text-gray-500">{d.percentage}%</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {data.unusedRooms.length > 0 && (
+                      <div className="mt-2 text-[11px] text-gray-400 italic flex items-center gap-1">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                        </svg>
+                        {data.unusedRooms.length} unused: {data.unusedRooms.join(', ')}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+
       {Object.keys(expandedSchedule).length > 0 && (
         <div className="mt-6">
           <div className="flex justify-between items-center mb-3">
@@ -1761,7 +2245,15 @@ export default function RegistrarSchedule() {
                     {blockLabel}
                   </h3>
                   <span className="text-sm text-gray-500">
-                    scheduled {expandedSchedule[blockLabel].length}/{plannedSubjectCount || expandedSchedule[blockLabel].length}
+                    {(() => {
+                      const blockItems = expandedSchedule[blockLabel];
+                      const total = plannedSubjectCount || blockItems.length;
+                      const actuallyScheduled = blockItems.filter(s => s.day_id && s.time && s.room_id).length;
+                      // Deduplicate by subject_id to count unique subjects (not per-day rows)
+                      const scheduledSubjects = new Set(blockItems.filter(s => s.day_id && s.time && s.room_id).map(s => s.subject_id));
+                      const totalSubjects = new Set(blockItems.map(s => s.subject_id));
+                      return `scheduled ${scheduledSubjects.size}/${totalSubjects.size}`;
+                    })()}
                   </span>
                 </div>
                 <div className="overflow-x-auto border border-gray-200 rounded">
@@ -2581,7 +3073,7 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
     if (resolvingItem.recommendations && resolvingItem.recommendations.length > 0) {
       const mappedRecs = resolvingItem.recommendations.map(r => ({
         ...r,
-        room: r.room_name,
+        room: r.room_name || r.room,
         day: r.day_label || r.day,
         day_ids: r.day_ids || [r.day_id]
       }));
@@ -2617,16 +3109,54 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
   }
 
+  // Derive bottleneck chips from failure reason
+  const reason = resolvingItem?.failureReason || "Unscheduled";
+  const bottlenecks = [];
+  if (reason === "Room Conflict" || reason === "No Rooms") {
+    bottlenecks.push({ label: "Room", color: "bg-orange-100 text-orange-700 border-orange-200", icon: "🏫" });
+  }
+  if (reason === "Instructor Conflict" || reason === "No Instructor") {
+    bottlenecks.push({ label: "Instructor", color: "bg-purple-100 text-purple-700 border-purple-200", icon: "👤" });
+  }
+  if (reason === "Student Conflict") {
+    bottlenecks.push({ label: "Student Schedule", color: "bg-yellow-100 text-yellow-700 border-yellow-200", icon: "🎓" });
+  }
+  if (reason === "Solver Conflict" || reason === "All Slots Booked") {
+    bottlenecks.push({ label: "Room", color: "bg-orange-100 text-orange-700 border-orange-200", icon: "🏫" });
+    bottlenecks.push({ label: "Instructor", color: "bg-purple-100 text-purple-700 border-purple-200", icon: "👤" });
+  }
+  if (reason === "Cross-Block Conflict") {
+    bottlenecks.push({ label: "Need more instructors for this subject", color: "bg-purple-100 text-purple-700 border-purple-200", icon: "👤" });
+  }
+  if (reason === "No Valid Time") {
+    bottlenecks.push({ label: "Time", color: "bg-cyan-100 text-cyan-700 border-cyan-200", icon: "⏰" });
+  }
+  if (bottlenecks.length === 0) {
+    bottlenecks.push({ label: "Unknown", color: "bg-gray-100 text-gray-600 border-gray-200", icon: "❓" });
+  }
+
+  // Detail / suggestion from diagnostics
+  const diagDetail = resolvingItem?.diagDetail || "";
+  const diagSuggestion = resolvingItem?.diagSuggestion || "";
+  const subjectCode = resolvingItem?.diagSubjectCode || `Subject #${resolvingItem?.subject_id}`;
+  const subjectType = resolvingItem?.diagSubjectType || "";
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
       <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden animate-in fade-in zoom-in duration-200">
+        {/* Header */}
         <div className="bg-gradient-to-r from-blue-600 to-indigo-600 p-4 flex justify-between items-center text-white">
-          <h3 className="font-bold text-lg flex items-center gap-2">
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
-            </svg>
-            Resolve Scheduling Conflict
-          </h3>
+          <div>
+            <h3 className="font-bold text-lg flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+              </svg>
+              Resolve: {subjectCode}
+            </h3>
+            {subjectType && (
+              <span className="text-xs text-white/70 ml-7">{subjectType} • Block {resolvingItem?.block || "?"}</span>
+            )}
+          </div>
           <button onClick={() => setResolvingItem(null)} className="hover:bg-white/20 p-1 rounded-full transition-colors">
             <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
               <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
@@ -2635,42 +3165,63 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
         </div>
 
         <div className="p-6">
-          <div className="mb-6">
-            <h4 className="text-gray-900 font-semibold text-lg mb-1">
-              Subject ID: {resolvingItem.subject_id}
-            </h4>
-            <div className="flex gap-2 text-sm">
-              <span className="bg-gray-100 text-gray-800 px-2 py-0.5 rounded">
-                {resolvingItem.year ? `Year ${resolvingItem.year}` : 'Unk Year'}
+          {/* Bottleneck chips */}
+          <div className="flex flex-wrap gap-2 mb-4">
+            <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide self-center mr-1">Bottleneck:</span>
+            {bottlenecks.map((b, i) => (
+              <span
+                key={i}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold border ${b.color}`}
+              >
+                <span>{b.icon}</span> {b.label}
               </span>
-            </div>
+            ))}
           </div>
 
-          <div className="bg-red-50 border border-red-100 rounded-lg p-4 mb-6">
+          {/* Diagnosed Issue */}
+          <div className="bg-red-50 border border-red-100 rounded-lg p-4 mb-4">
             <div className="text-xs font-bold text-red-500 uppercase tracking-wide mb-1">Diagnosed Issue</div>
-            <div className="text-red-800 font-semibold text-lg flex items-center gap-2">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+            <div className="text-red-800 font-semibold text-base flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
                 <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
               </svg>
-              {resolvingItem.failureReason || "Unscheduled"}
+              {reason}
             </div>
-            <p className="text-red-700/80 text-sm mt-1">
-              {resolvingItem.failureReason === "Solver Conflict" && "Valid slots exist, but they conflict with other scheduled classes. Try manually placing this subject."}
-              {resolvingItem.failureReason === "No Rooms" && "No rooms are available or eligible for this subject type."}
-              {resolvingItem.failureReason === "No Instructor" && "No eligible instructor is available."}
-              {resolvingItem.failureReason === "Room Conflict" && "All eligible rooms are fully booked during suggested times."}
-              {resolvingItem.failureReason === "Instructor Conflict" && "The assigned instructor is fully booked."}
-              {resolvingItem.failureReason === "Student Conflict" && "Scheduling this would overlap with another class for this block."}
-              {resolvingItem.failureReason === "Unscheduled" && "The scheduler could not find a valid slot."}
-            </p>
+            {diagDetail && (
+              <p className="text-red-700/80 text-sm mt-1">{diagDetail}</p>
+            )}
+            {!diagDetail && (
+              <p className="text-red-700/80 text-sm mt-1">
+                {reason === "Solver Conflict" && "Valid slots exist, but they conflict with other scheduled classes."}
+                {reason === "No Rooms" && "No rooms are available or eligible for this subject type."}
+                {reason === "No Instructor" && "No eligible instructor is available."}
+                {reason === "Room Conflict" && "All eligible rooms are fully booked during suggested times."}
+                {reason === "Instructor Conflict" && "The assigned instructor is fully booked."}
+                {reason === "Student Conflict" && "Scheduling this would overlap with another class for this block."}
+                {reason === "Unscheduled" && "The scheduler could not find a valid slot."}
+              </p>
+            )}
           </div>
 
+          {/* Actionable Suggestion */}
+          {diagSuggestion && (
+            <div className="bg-blue-50 border border-blue-100 rounded-lg p-3 mb-4">
+              <div className="flex items-start gap-2">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-blue-500 flex-shrink-0 mt-0.5" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                </svg>
+                <p className="text-blue-800 text-sm">{diagSuggestion}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Suggestions */}
           <div>
             <h5 className="font-semibold text-gray-700 mb-3 flex items-center gap-2">
               <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-green-500" viewBox="0 0 20 20" fill="currentColor">
                 <path fillRule="evenodd" d="M6.267 3.455a3.066 3.066 0 001.745-.723 3.066 3.066 0 013.976 0 3.066 3.066 0 001.745.723 3.066 3.066 0 012.812 2.812c.051.643.304 1.254.723 1.745a3.066 3.066 0 010 3.976 3.066 3.066 0 00-.723 1.745 3.066 3.066 0 01-2.812 2.812 3.066 3.066 0 00-1.745.723 3.066 3.066 0 01-3.976 0 3.066 3.066 0 00-1.745-.723 3.066 3.066 0 01-2.812-2.812 3.066 3.066 0 00-.723-1.745 3.066 3.066 0 010-3.976 3.066 3.066 0 00.723-1.745 3.066 3.066 0 012.812-2.812zm7.44 5.252a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
               </svg>
-              Suggestions
+              Available Slots ({suggestions.length})
             </h5>
 
             {loading ? (
@@ -2681,35 +3232,40 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
                 </svg>
               </div>
             ) : suggestions.length > 0 ? (
-              <div className="space-y-2 max-h-40 overflow-y-auto">
+              <div className="space-y-2 max-h-48 overflow-y-auto">
                 {suggestions.map((s, idx) => (
                   <button
                     key={idx}
                     onClick={() => {
                       setResolvingItem(null);
-                      // Map recommendation fields to what openEditModal reads
                       const overrideItem = {
                         ...resolvingItem,
-                        // These are the fields openEditModal uses to detect day pattern:
                         _combinedDaysLabel: s.day_label || s.day,
                         _dayIds: s.day_ids || [s.day_id],
-                        // These are read directly by openEditModal as slot.room_id, slot.instructor_id:
                         room_id: s.room_id,
                         instructor_id: s.instructor_id,
-                        // Time fields read by openEditModal:
                         start_min: s.start_min,
                         end_min: s.end_min,
                         time: s.time,
                       };
                       openEditModal(overrideItem);
                     }}
-                    className="w-full text-left p-2 border border-green-100 bg-green-50 hover:bg-green-100 rounded text-sm text-green-900 flex justify-between items-center group transition-colors"
+                    className="w-full text-left p-3 border border-green-100 bg-green-50 hover:bg-green-100 rounded-lg text-sm text-green-900 flex justify-between items-center group transition-colors"
                   >
-                    <div>
-                      <div className="font-semibold">{s.day} @ {s.time}</div>
-                      <div className="text-xs text-green-700">{s.room || s.room_name} • {s.instructor_name || (s.instructor_id ? `Instructor #${s.instructor_id}` : "No Instructor")}</div>
+                    <div className="flex items-center gap-3">
+                      <div className="w-7 h-7 bg-green-200 rounded-full flex items-center justify-center text-green-700 font-bold text-xs flex-shrink-0">
+                        {idx + 1}
+                      </div>
+                      <div>
+                        <div className="font-semibold text-gray-800">{s.day_label || s.day} @ {s.time}</div>
+                        <div className="text-xs text-green-700">
+                          {s.room || s.room_name}
+                          {" • "}
+                          {s.instructor_name || (s.instructor_id ? `Instructor #${s.instructor_id}` : "No Instructor")}
+                        </div>
+                      </div>
                     </div>
-                    <span className="opacity-0 group-hover:opacity-100 text-green-600 font-medium text-xs bg-white px-2 py-1 rounded shadow-sm">
+                    <span className="opacity-0 group-hover:opacity-100 text-green-600 font-medium text-xs bg-white px-2 py-1 rounded shadow-sm transition-opacity">
                       Apply
                     </span>
                   </button>
@@ -2718,7 +3274,7 @@ function ResolveModal({ resolvingItem, setResolvingItem, openEditModal, form }) 
             ) : (
               <div className="bg-gray-50 rounded border border-gray-200 p-4 text-center text-sm text-gray-500">
                 No automated suggestions found.<br />
-                <span className="text-xs">Please use "Manual Override" to force a slot.</span>
+                <span className="text-xs">Use "Manual Override" below to assign this subject manually.</span>
               </div>
             )}
           </div>

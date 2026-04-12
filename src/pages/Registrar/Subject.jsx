@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState, useRef } from 'react'
 import { list, upsert, remove } from '../../store/db'
-import { mergeSubjects, mergePreview } from '../../services/api'
 import ConfirmDialog from '../../components/ConfirmDialog'
 
 export default function Subject() {
@@ -25,30 +24,7 @@ export default function Subject() {
 	const [entries, setEntries] = useState(10)
 	const [processing, setProcessing] = useState(false)
 	const [confirmDialog, setConfirmDialog] = useState({ open: false })
-	const [selectedIds, setSelectedIds] = useState(new Set())
 
-	// Merge modal state
-	const [mergeModal, setMergeModal] = useState({
-		open: false,
-		sourceId: null,
-		targetId: null,
-		showAllCourses: false,
-		targetSearch: '',
-		// Preview data
-		preview: null,
-		previewLoading: false,
-		// Resource survival checkboxes
-		keepSourceInstructor: true,
-		keepSourceRoom: true,
-		keepSourceTime: true,
-		keepTargetInstructor: true,
-		keepTargetRoom: true,
-		keepTargetTime: true,
-		// Compatibility
-		compatChecked: false,
-		conflicts: [],
-		safe: false,
-	})
 
 	// Prevent duplicate loads from React StrictMode
 	const dataLoadingRef = useRef(false);
@@ -221,193 +197,17 @@ export default function Subject() {
 		})
 	}
 
-	function toggleSelection(id) {
-		const newSet = new Set(selectedIds)
-		if (newSet.has(id)) newSet.delete(id)
-		else newSet.add(id)
-		setSelectedIds(newSet)
-	}
 
-	// --- Merge functions ---
-	const defaultMergeState = {
-		open: false, sourceId: null, targetId: null, showAllCourses: false, targetSearch: '',
-		preview: null, previewLoading: false,
-		keepSourceInstructor: true, keepSourceRoom: true, keepSourceTime: true,
-		keepTargetInstructor: true, keepTargetRoom: true, keepTargetTime: true,
-		compatChecked: false, conflicts: [], safe: false,
-	}
 
-	function openMergeModal(sourceId = null) {
-		if (sourceId) {
-			setMergeModal({ ...defaultMergeState, open: true, sourceId })
-		} else if (selectedIds.size === 2) {
-			const [id1, id2] = Array.from(selectedIds)
-			setMergeModal({ ...defaultMergeState, open: true, sourceId: id1, targetId: id2 })
-			// Auto-load preview
-			loadMergePreview(id1, id2)
-		}
-	}
-
-	function swapMergeDirection() {
-		setMergeModal(prev => {
-			const newState = {
-				...prev,
-				sourceId: prev.targetId,
-				targetId: prev.sourceId,
-				// Reset checkboxes
-				keepSourceInstructor: prev.keepTargetInstructor,
-				keepSourceRoom: prev.keepTargetRoom,
-				keepSourceTime: prev.keepTargetTime,
-				keepTargetInstructor: prev.keepSourceInstructor,
-				keepTargetRoom: prev.keepSourceRoom,
-				keepTargetTime: prev.keepSourceTime,
-				// Reset compat
-				compatChecked: false, conflicts: [], safe: false, preview: null,
-			}
-			return newState
-		})
-	}
-
-	function selectMergeTarget(targetId) {
-		setMergeModal(prev => ({
-			...prev,
-			targetId,
-			compatChecked: false, conflicts: [], safe: false, preview: null,
-		}))
-		// Auto-load preview
-		if (mergeModal.sourceId && targetId) {
-			loadMergePreview(mergeModal.sourceId, targetId)
-		}
-	}
-
-	async function loadMergePreview(srcId, tgtId) {
-		setMergeModal(prev => ({ ...prev, previewLoading: true }))
-		try {
-			const data = await mergePreview(srcId, tgtId)
-			setMergeModal(prev => ({
-				...prev,
-				preview: data,
-				previewLoading: false,
-				conflicts: data.conflicts || [],
-				safe: data.safe,
-				compatChecked: true,
-			}))
-		} catch (err) {
-			console.error('Preview failed:', err)
-			setMergeModal(prev => ({ ...prev, previewLoading: false }))
-		}
-	}
-
-	async function confirmMerge() {
-		if (!mergeModal.sourceId || !mergeModal.targetId) {
-			alert('Please select a target subject to merge into.')
-			return
-		}
-		if (mergeModal.sourceId === mergeModal.targetId) {
-			alert('Cannot merge a subject into itself.')
-			return
-		}
-		if (!mergeModal.compatChecked) {
-			alert('Please check compatibility first.')
-			return
-		}
-		if (!mergeModal.safe) {
-			alert('Cannot merge: conflicts detected. Resolve conflicts first.')
-			return
-		}
-
-		setProcessing(true)
-		try {
-			const res = await mergeSubjects(mergeModal.sourceId, mergeModal.targetId, {
-				keepSourceInstructor: mergeModal.keepSourceInstructor,
-				keepSourceRoom: mergeModal.keepSourceRoom,
-				keepSourceTime: mergeModal.keepSourceTime,
-				keepTargetInstructor: mergeModal.keepTargetInstructor,
-				keepTargetRoom: mergeModal.keepTargetRoom,
-				keepTargetTime: mergeModal.keepTargetTime,
-			})
-			alert(`Merged successfully! ${res.schedules_moved || 0} schedules moved. Both subjects marked as [M].`)
-			setMergeModal(defaultMergeState)
-			setSelectedIds(new Set())
-			await load(true)
-		} catch (error) {
-			alert(error.message || 'Failed to merge subjects')
-		} finally {
-			setProcessing(false)
-		}
-	}
-
-	// Filter subjects for the merge target list
-	const mergeSourceSubject = items.find(i => i.id === mergeModal.sourceId)
-	const mergeTargetSubject = items.find(i => i.id === mergeModal.targetId)
-	const mergeTargetOptions = useMemo(() => {
-		if (!mergeSourceSubject) return []
-		const tSearch = (mergeModal.targetSearch || '').toLowerCase()
-		return items.filter(i => {
-			if (i.id === mergeModal.sourceId) return false
-			if (!mergeModal.showAllCourses && i.course_id !== mergeSourceSubject.course_id) return false
-			if (tSearch && !(i.code + ' ' + i.description).toLowerCase().includes(tSearch)) return false
-			return true
-		}).sort((a, b) => a.code.localeCompare(b.code))
-	}, [items, mergeSourceSubject, mergeModal.sourceId, mergeModal.showAllCourses, mergeModal.targetSearch])
-
-	// Schedule detail card for merge preview
-	const ScheduleCard = ({ schedules, side, label }) => {
-		if (!schedules || schedules.length === 0) {
-			return <div className="text-xs text-gray-400 italic py-2">No schedule entries</div>
-		}
-		const keepInstr = side === 'source' ? mergeModal.keepSourceInstructor : mergeModal.keepTargetInstructor
-		const keepRoom = side === 'source' ? mergeModal.keepSourceRoom : mergeModal.keepTargetRoom
-		const keepTime = side === 'source' ? mergeModal.keepSourceTime : mergeModal.keepTargetTime
-		const toggleField = (field) => {
-			const key = side === 'source'
-				? { instructor: 'keepSourceInstructor', room: 'keepSourceRoom', time: 'keepSourceTime' }[field]
-				: { instructor: 'keepTargetInstructor', room: 'keepTargetRoom', time: 'keepTargetTime' }[field]
-			setMergeModal(prev => ({ ...prev, [key]: !prev[key], compatChecked: false }))
-		}
-		return (
-			<div className="space-y-2">
-				{schedules.map((s, i) => (
-					<div key={i} className="text-xs bg-gray-50 rounded-lg p-2 space-y-1 border">
-						{s.block && <div className="font-semibold text-gray-600">Block {s.block}</div>}
-						<label className={`flex items-center gap-2 cursor-pointer rounded px-1 py-0.5 ${keepInstr ? 'bg-green-50' : 'bg-red-50 line-through'}`}>
-							<input type="checkbox" checked={keepInstr} onChange={() => toggleField('instructor')} className="w-3.5 h-3.5 accent-green-600" />
-							<span>👨‍🏫 {s.instructor ? s.instructor.name : '(none)'}</span>
-						</label>
-						<label className={`flex items-center gap-2 cursor-pointer rounded px-1 py-0.5 ${keepRoom ? 'bg-green-50' : 'bg-red-50 line-through'}`}>
-							<input type="checkbox" checked={keepRoom} onChange={() => toggleField('room')} className="w-3.5 h-3.5 accent-green-600" />
-							<span>🏢 {s.room ? s.room.name : '(none)'}</span>
-						</label>
-						<label className={`flex items-center gap-2 cursor-pointer rounded px-1 py-0.5 ${keepTime ? 'bg-green-50' : 'bg-red-50 line-through'}`}>
-							<input type="checkbox" checked={keepTime} onChange={() => toggleField('time')} className="w-3.5 h-3.5 accent-green-600" />
-							<span>🕐 {s.day ? s.day.label : '?'} {s.time || '(none)'}</span>
-						</label>
-					</div>
-				))}
-			</div>
-		)
-	}
 
 	return (
 		<div>
 			<div className="flex items-center justify-between mb-4">
 				<h1 className="text-navy text-3xl font-semibold">SUBJECT</h1>
-				<div className="flex gap-2">
-					{selectedIds.size === 2 && (
-						<button
-							className="px-3 py-2 rounded bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-2 disabled:opacity-60 transition-colors"
-							onClick={() => openMergeModal()}
-							disabled={processing}
-						>
-							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z" /></svg>
-							<span>Merge Selected</span>
-						</button>
-					)}
-					<button className="px-3 py-2 rounded bg-royal hover:bg-blue-700 text-white flex items-center gap-2 disabled:opacity-60 transition-colors" onClick={openAdd} disabled={processing}>
-						<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M11 11V5h2v6h6v2h-6v6h-2v-6H5v-2h6z" /></svg>
-						<span>Add Subject</span>
-					</button>
-				</div>
+				<button className="px-3 py-2 rounded bg-royal hover:bg-blue-700 text-white flex items-center gap-2 disabled:opacity-60 transition-colors" onClick={openAdd} disabled={processing}>
+					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M11 11V5h2v6h6v2h-6v6h-2v-6H5v-2h6z" /></svg>
+					<span>Add Subject</span>
+				</button>
 			</div>
 			{/* Standardized fixed-height container for list/table area */}
 			<div className="h-[520px] overflow-auto pr-1 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
@@ -430,20 +230,6 @@ export default function Subject() {
 					<table className="min-w-full text-sm border border-gray-400">
 						<thead>
 							<tr className="bg-navy text-white border-b-2 border-gray-500">
-								<th className="text-center px-3 py-2 border-r border-gray-300 w-10">
-									<input
-										type="checkbox"
-										className="w-4 h-4"
-										checked={shown.length > 0 && selectedIds.size === shown.length}
-										onChange={(e) => {
-											if (e.target.checked) {
-												setSelectedIds(new Set(shown.map(s => s.id)))
-											} else {
-												setSelectedIds(new Set())
-											}
-										}}
-									/>
-								</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">No.</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">Code</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">Description</th>
@@ -462,14 +248,6 @@ export default function Subject() {
 									key={it.id}
 									className={(((it.is_major ?? it.isMajor) === null) || ((it.is_major ?? it.isMajor) === undefined)) ? 'bg-yellow-100' : (idx % 2 ? 'bg-gray-50' : '')}
 								>
-									<td className="px-3 py-2 border-r border-gray-300 text-center">
-										<input
-											type="checkbox"
-											className="w-4 h-4 cursor-pointer"
-											checked={selectedIds.has(it.id)}
-											onChange={() => toggleSelection(it.id)}
-										/>
-									</td>
 									<td className="px-3 py-2 border-r border-gray-300">{idx + 1}</td>
 									<td className="px-3 py-2 border-r border-gray-300">
 										{it.code}
@@ -495,9 +273,6 @@ export default function Subject() {
 									<td className="px-3 py-2 border-r border-gray-300">{it.type}</td>
 									<td className="px-3 py-2 border-r border-gray-300">{it.unit}</td>
 									<td className="px-3 py-2 space-x-2 text-center">
-										<button className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-indigo-600 hover:bg-indigo-700 transition-colors" title="Merge" onClick={() => openMergeModal(it.id)}>
-											<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4 text-white"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z" /></svg>
-										</button>
 										<button className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-600 hover:bg-blue-700 transition-colors" title="Edit" onClick={() => openEdit(it)}>
 											<img src="/assets/edit.png" alt="Edit" className="w-4 h-4 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
 										</button>
@@ -508,7 +283,7 @@ export default function Subject() {
 								</tr>
 							))}
 							{filtered.length === 0 && (
-								<tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={11}>No records</td></tr>
+								<tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={10}>No records</td></tr>
 							)}
 						</tbody>
 					</table>
@@ -613,165 +388,7 @@ export default function Subject() {
 				</div>
 			)}
 
-			{mergeModal.open && mergeSourceSubject && (
-				<div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
-					<div className="w-full max-w-4xl bg-white rounded-xl shadow-xl overflow-hidden">
-						{/* Header */}
-						<div className="bg-indigo-600 px-6 py-4 flex items-center justify-between">
-							<h3 className="text-xl font-semibold text-white flex items-center gap-2">
-								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z" /></svg>
-								Merge Subjects
-							</h3>
-							<button onClick={() => setMergeModal(defaultMergeState)} className="text-white/80 hover:text-white text-xl">✕</button>
-						</div>
 
-						{/* Warning */}
-						<div className="px-6 pt-4">
-							<div className="bg-orange-50 text-orange-800 p-3 rounded-lg text-sm border border-orange-200">
-								<strong>Note:</strong> Source schedules will be merged into the target. Checked resources survive; unchecked are freed. Both subjects get <code className="bg-orange-100 px-1 rounded">[M]</code> prefix.
-							</div>
-						</div>
-
-						{/* Horizontal layout: Source → Target */}
-						<div className="p-6 overflow-y-auto max-h-[60vh]">
-							<div className="flex gap-4 items-stretch">
-
-								{/* SOURCE (left) */}
-								<div className="flex-1 border rounded-xl overflow-hidden bg-gray-50">
-									<div className="bg-gray-200 px-4 py-2">
-										<div className="text-xs font-bold text-gray-600 uppercase">Source (Schedules move to target)</div>
-									</div>
-									<div className="p-4 space-y-2">
-										<div className="font-semibold text-gray-900">{mergeSourceSubject.code}</div>
-										<div className="text-sm text-gray-600">{mergeSourceSubject.description}</div>
-										<div className="text-xs text-gray-500">{mergeSourceSubject.type} • {mergeSourceSubject.unit} Units</div>
-										<div className="text-xs text-gray-400">{courseName(mergeSourceSubject.course_id || mergeSourceSubject.courseId)}</div>
-
-										{/* Source schedule resources */}
-										{mergeModal.preview && (
-											<div className="mt-3 pt-3 border-t">
-												<div className="text-xs font-semibold text-gray-500 mb-2">Schedule Resources — check to keep:</div>
-												<ScheduleCard schedules={mergeModal.preview.source.schedules} side="source" />
-											</div>
-										)}
-										{mergeModal.previewLoading && <div className="text-xs text-gray-400 mt-2">Loading schedules...</div>}
-									</div>
-								</div>
-
-								{/* Arrow + Swap */}
-								<div className="flex flex-col items-center justify-center gap-2 px-2">
-									<div className="text-2xl text-gray-400">→</div>
-									<button
-										onClick={swapMergeDirection}
-										className="bg-white border shadow-sm rounded-full p-2 hover:bg-gray-50 hover:text-indigo-600 transition-colors"
-										title="Swap source and target"
-									>
-										<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5">
-											<path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" />
-										</svg>
-									</button>
-								</div>
-
-								{/* TARGET (right) */}
-								<div className="flex-1 border rounded-xl overflow-hidden border-indigo-200">
-									<div className="bg-indigo-50 px-4 py-2 flex items-center justify-between">
-										<div className="text-xs font-bold text-indigo-700 uppercase">Target (Will survive)</div>
-										<button
-											onClick={() => setMergeModal(prev => ({ ...prev, showAllCourses: !prev.showAllCourses }))}
-											className="text-[10px] bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full hover:bg-indigo-200 transition-colors"
-										>
-											{mergeModal.showAllCourses ? 'All courses' : 'Same course'}
-										</button>
-									</div>
-									<div className="p-4 space-y-3">
-										{/* Search input */}
-										<input
-											className="w-full px-3 py-2 rounded-lg border border-gray-300 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
-											placeholder="Search target subject..."
-											value={mergeModal.targetSearch}
-											onChange={e => setMergeModal(prev => ({ ...prev, targetSearch: e.target.value }))}
-										/>
-
-										{/* Scrollable subject list */}
-										<div className="max-h-36 overflow-y-auto space-y-1 border rounded-lg p-2 bg-gray-50">
-											{mergeTargetOptions.length === 0 && (
-												<div className="text-xs text-gray-400 text-center py-3">No matching subjects</div>
-											)}
-											{mergeTargetOptions.map(opt => (
-												<div
-													key={opt.id}
-													onClick={() => selectMergeTarget(opt.id)}
-													className={`px-3 py-2 rounded-lg cursor-pointer text-sm transition-colors ${
-														mergeModal.targetId === opt.id
-															? 'bg-indigo-100 border-indigo-300 border text-indigo-900 font-semibold'
-															: 'hover:bg-white border border-transparent'
-													}`}
-												>
-													<div className="font-medium">{opt.code}</div>
-													<div className="text-xs text-gray-500">{opt.description} • {opt.type} • {opt.unit}u {mergeModal.showAllCourses ? `[${courseName(opt.course_id)}]` : ''}</div>
-												</div>
-											))}
-										</div>
-
-										{/* Target schedule resources */}
-										{mergeModal.preview && mergeModal.targetId && (
-											<div className="mt-2 pt-2 border-t">
-												<div className="text-xs font-semibold text-gray-500 mb-2">Schedule Resources — check to keep:</div>
-												<ScheduleCard schedules={mergeModal.preview.target.schedules} side="target" />
-											</div>
-										)}
-										{mergeModal.previewLoading && <div className="text-xs text-gray-400 mt-2">Loading schedules...</div>}
-									</div>
-								</div>
-
-							</div>
-
-							{/* Compatibility status */}
-							{mergeModal.compatChecked && mergeModal.targetId && (
-								<div className={`mt-4 p-3 rounded-lg border text-sm ${mergeModal.safe ? 'bg-green-50 border-green-200 text-green-800' : 'bg-red-50 border-red-200 text-red-800'}`}>
-									{mergeModal.safe ? (
-										<div className="flex items-center gap-2">✅ <strong>Compatible</strong> — No instructor or room conflicts detected.</div>
-									) : (
-										<div>
-											<div className="flex items-center gap-2 mb-2">⚠️ <strong>Conflicts detected — merge blocked</strong></div>
-											<ul className="list-disc list-inside space-y-1 text-xs">
-												{mergeModal.conflicts.map((c, i) => <li key={i}>{c.message || c}</li>)}
-											</ul>
-										</div>
-									)}
-								</div>
-							)}
-						</div>
-
-						{/* Footer */}
-						<div className="bg-gray-50 px-6 py-4 flex items-center justify-between border-t">
-							<button
-								onClick={() => mergeModal.sourceId && mergeModal.targetId && loadMergePreview(mergeModal.sourceId, mergeModal.targetId)}
-								className="px-4 py-2 rounded bg-gray-200 text-gray-700 font-medium hover:bg-gray-300 transition-colors disabled:opacity-50"
-								disabled={!mergeModal.targetId || mergeModal.previewLoading}
-							>
-								{mergeModal.previewLoading ? 'Checking...' : '🔍 Re-check Compatibility'}
-							</button>
-							<div className="flex gap-3">
-								<button
-									onClick={() => setMergeModal(defaultMergeState)}
-									className="px-4 py-2 rounded text-gray-700 font-medium hover:bg-gray-200 transition-colors"
-									disabled={processing}
-								>
-									Cancel
-								</button>
-								<button
-									onClick={confirmMerge}
-									className="px-4 py-2 rounded bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors disabled:opacity-50"
-									disabled={processing || !mergeModal.targetId || !mergeModal.safe}
-								>
-									{processing ? 'Merging...' : 'Confirm Merge'}
-								</button>
-							</div>
-						</div>
-					</div>
-				</div>
-			)}
 
 			<ConfirmDialog
 				{...confirmDialog}

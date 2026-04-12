@@ -24,8 +24,9 @@ from api.scheduler.slot_availability import (
 
 logger = logging.getLogger(__name__)
 
-# Add file handler to capture all logs to file for debugging
-_file_handler = logging.FileHandler("scheduler_debug.log", mode="a")
+import os as _os
+_log_dir = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+_file_handler = logging.FileHandler(_os.path.join(_log_dir, "scheduler_debug.log"), mode="a")
 _file_handler.setLevel(logging.DEBUG)
 _file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(_file_handler)
@@ -78,6 +79,87 @@ def _range_conflicts(ranges_dict, key, day_id, start, end):
     return None
 
 
+def _rec_has_cross_block_or_course_conflict(
+    rec, block_label, scheduled_items,
+    booked_room_ranges_global=None,
+    booked_instr_ranges_global=None,
+    solver_shared_room_ids=None,
+    room_id_to_name=None,
+):
+    """Return True if the recommended slot conflicts with:
+    1) An existing item in a DIFFERENT block of the same course, OR
+    2) A booking from a DIFFERENT course (in booked_*_ranges_global from DB).
+    
+    Shared rooms (FIELD, GYM, Inner Quad, COURT) are exempt from room checks.
+    """
+    rec_instr = rec.get("instructor_id")
+    rec_room = rec.get("room_id")
+    rec_start = rec.get("start_min")
+    rec_end = rec.get("end_min")
+    rec_day_ids = rec.get("day_ids", [rec.get("day_id")])
+    if rec_start is None or rec_end is None:
+        return False
+
+    _shared_ids = solver_shared_room_ids or set()
+    _room_names = room_id_to_name or {}
+
+    # Determine if recommended room is shared
+    rec_room_name = rec.get("room_name", "")
+    rec_room_name_upper = (rec_room_name or "").upper()
+    is_shared_rec_room = ("FIELD" in rec_room_name_upper or "COURT" in rec_room_name_upper
+                          or "GYM" in rec_room_name_upper or "INNER QUAD" in rec_room_name_upper)
+    if rec_room and not is_shared_rec_room:
+        try:
+            if int(rec_room) in _shared_ids:
+                is_shared_rec_room = True
+        except (ValueError, TypeError):
+            pass
+
+    # --- Check 1: Cross-COURSE conflicts (other courses' DB bookings) ---
+    for rd in rec_day_ids:
+        rd_int = int(rd)
+        # Room conflict with other courses
+        if not is_shared_rec_room and booked_room_ranges_global is not None and rec_room_name:
+            if _range_conflicts(booked_room_ranges_global, rec_room_name, rd_int, int(rec_start), int(rec_end)):
+                return True
+        # Instructor conflict with other courses
+        if rec_instr is not None and booked_instr_ranges_global is not None:
+            if _range_conflicts(booked_instr_ranges_global, int(rec_instr), rd_int, int(rec_start), int(rec_end)):
+                return True
+
+    # --- Check 2: Cross-BLOCK conflicts (same course, different block) ---
+    for existing in scheduled_items:
+        ex_block = existing.get("block")
+        if str(ex_block) == str(block_label):
+            continue  # same block — not a cross-block conflict
+        ex_day = existing.get("day_id")
+        ex_start = existing.get("start_min")
+        ex_end = existing.get("end_min")
+        if ex_day is None or ex_start is None or ex_end is None:
+            continue
+        for rd in rec_day_ids:
+            if int(rd) != int(ex_day):
+                continue
+            # Check time overlap
+            if max(int(rec_start), int(ex_start)) < min(int(rec_end), int(ex_end)):
+                # Instructor conflict?
+                if rec_instr is not None and existing.get("instructor_id") is not None:
+                    if int(rec_instr) == int(existing["instructor_id"]):
+                        return True
+                # Room conflict? (skip shared rooms)
+                if rec_room is not None and existing.get("room_id") is not None:
+                    ex_room_name = _room_names.get(int(existing["room_id"]), "").upper()
+                    is_shared = ("FIELD" in ex_room_name or "COURT" in ex_room_name
+                                 or "GYM" in ex_room_name)
+                    try:
+                        if int(existing["room_id"]) in _shared_ids:
+                            is_shared = True
+                    except (ValueError, TypeError):
+                        pass
+                    if not is_shared and int(rec_room) == int(existing["room_id"]):
+                        return True
+    return False
+
 def _is_shared_subject(subject) -> bool:
     """Check if a subject is block-shared (e.g., NSTP, PE).
     
@@ -96,7 +178,7 @@ def _is_shared_subject(subject) -> bool:
     # Legacy fallback: check NSTP or PE prefix in code
     code = getattr(subject, "code", "") or ""
     code_upper = code.upper()
-    return code_upper.startswith("NSTP") or code_upper.startswith("PE")
+    return code_upper.startswith("NSTP") or code_upper.startswith("PE") or code_upper.startswith("PATHFIT")
 
 
 def _is_nstp_only_subject(subject) -> bool:
@@ -901,8 +983,43 @@ def generate_subject_start_options(
                     "num_slots": len(fri_slot_indexes),
                 })
 
+        # Individual weekday single-day options (M, T, W, TH) for LAB subjects.
+        # When paired MW/TTh slots are all occupied, these give the solver
+        # single-day weekday options BEFORE falling through to SAT/SUN via
+        # the recommendation system.
+        for single_day_label in [MON, TUE, WED, THU]:
+            single_day_obj = day_label_to_day.get(single_day_label)
+            if single_day_obj and single_day_label in slots_by_day:
+                for slot in slots_by_day[single_day_label]:
+                    slot_indexes = slot.get("index", [])
+                    if isinstance(slot_indexes, int):
+                        slot_indexes = [slot_indexes]
+
+                    block_indices = set(slot.get("block_indices", []))
+                    if not block_indices:
+                        block_indices = {slot_indexes[0]} if slot_indexes else set()
+
+                    start_min = slot.get("start_min")
+                    end_min = slot.get("end_min")
+                    duration_min = end_min - start_min
+
+                    options.append({
+                        "days": [single_day_label],
+                        "day_ids": [single_day_obj.id],
+                        "day_id": single_day_obj.id,
+                        "start_min": start_min,
+                        "end_min": end_min,
+                        "duration_min": duration_min,
+                        "block_indices": block_indices,
+                        "blocks_by_day": {single_day_obj.id: block_indices},
+                        "slot_indexes": slot_indexes,
+                        "blocks_spanned": set(slot.get("blocks_spanned", [])),
+                        "slot_labels": [slot.get("label", "")],
+                        "num_slots": len(slot_indexes),
+                    })
+
         if logger and options:
-            logger.info(f"generate_subject_start_options: Subject {subj_id} (LAB) -> {len(options)} options (MW/TTh/F)")
+            logger.info(f"generate_subject_start_options: Subject {subj_id} (LAB) -> {len(options)} options (MW/TTh/F/single-day)")
             
             # Track unique days and pattern types in options
             all_days_set = set()
@@ -1271,7 +1388,10 @@ def build_eligibility_maps(
         if not eligible_instrs:
             import re
             def _normalize_code(s):
-                return re.sub(r'[^A-Z0-9]', '', s.upper())
+                base = re.sub(r'[^A-Z0-9]', '', s.upper())
+                base = re.sub(r'PROFE(?=\d)', 'PROE', base)
+                base = re.sub(r'CSPROFELECT', 'CSPROE', base)
+                return base
 
             norm_subj_code = _normalize_code(subj_code) if subj_code else ""
             eligible_instrs = []
@@ -1539,6 +1659,9 @@ def _retry_unscheduled_subjects(
     booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     instructor_prefs: Optional[Dict[int, Dict]] = None,
+    instructor_current_units: Optional[Dict[int, int]] = None,
+    instructor_limit_minutes: Optional[Dict[int, int]] = None,
+    _seen_instr_subj_blocks: Optional[set] = None,
 ) -> Tuple[Dict[int, Dict], Dict[int, Dict[str, int]]]:
     """
     Retry pass: attempt to schedule subjects that weren't scheduled in initial cluster runs.
@@ -1662,6 +1785,9 @@ def _retry_unscheduled_subjects(
             booked_instr_ranges_global=booked_instr_ranges_global,
             instructor_prefs=instructor_prefs,
             relaxed=relaxed,
+            instructor_current_units=instructor_current_units,
+            instructor_limit_minutes=instructor_limit_minutes,
+            _seen_instr_subj_blocks=_seen_instr_subj_blocks,
         )
         
         # Merge results
@@ -1767,7 +1893,14 @@ def _retry_unscheduled_subjects(
                 if len(block) < min_slots:
                     continue
                 
-                if not is_consecutive_blocks([slot["index"] for slot in block]):
+                # Check if blocks are consecutive using slot data directly
+                # (avoids TIME_BLOCKS lookup which may not match DB-sourced slots)
+                blocks_consecutive = True
+                for ci in range(len(block) - 1):
+                    if block[ci]["end_min"] != block[ci + 1]["start_min"]:
+                        blocks_consecutive = False
+                        break
+                if not blocks_consecutive:
                     continue
                 
                 # CRITICAL FIX: Check for student conflicts FIRST (before trying rooms/instructors)
@@ -1839,10 +1972,49 @@ def _retry_unscheduled_subjects(
                         failure_metrics["room_conflicts"] += 1
                         continue
                     
-                    # Check instructor availability
-                    for instructor_id in eligible_instrs:
+                    # Check instructor availability — sort by current load (least loaded first)
+                    subj_units = int(getattr(subject, "unit", 0) or 0)
+                    DESIGNATED_ROLES_GREEDY = {"dean", "associate dean", "director", "program chair", "college secretary"}
+                    
+                    def _instr_sort_key(iid):
+                        """Sort instructors: least loaded first, overloaded visiting last."""
+                        cur = instructor_current_units.get(iid, 0)
+                        prefs = instructor_prefs.get(iid, {})
+                        mx = prefs.get('max_units')
+                        if mx is None:
+                            lm = instructor_limit_minutes.get(iid, 24 * 60)
+                            mx = lm // 60
+                        is_over = cur + subj_units > mx
+                        is_visiting = prefs.get('employment_type', 'regular') == 'visiting'
+                        # Priority: (0=under cap, 1=over cap visiting) then by current load
+                        return (1 if (is_over and is_visiting) else (2 if is_over else 0), cur)
+                    
+                    sorted_eligible = sorted(eligible_instrs, key=_instr_sort_key)
+                    
+                    for instructor_id in sorted_eligible:
                         if scheduled:
                             break
+
+                        # --- Unit capacity check (greedy) ---
+                        cur_units = instructor_current_units.get(instructor_id, 0)
+                        i_prefs = instructor_prefs.get(instructor_id, {})
+                        i_max = i_prefs.get('max_units')
+                        if i_max is None:
+                            i_lm = instructor_limit_minutes.get(instructor_id, 24 * 60)
+                            i_max = i_lm // 60
+                        i_designation = i_prefs.get('designation', '')
+                        i_employment = i_prefs.get('employment_type', 'regular')
+                        
+                        if cur_units + subj_units > i_max:
+                            if i_designation in DESIGNATED_ROLES_GREEDY:
+                                # HARD block: designated instructors cannot be overloaded
+                                failure_metrics["instr_conflicts"] += 1
+                                continue
+                            elif i_employment != 'visiting':
+                                # HARD block: regular instructors cannot be overloaded
+                                failure_metrics["instr_conflicts"] += 1
+                                continue
+                            # else: visiting — allow but they've been sorted to end of list
 
                         # Range-based instructor conflict check
                         if booked_instr_ranges_global is not None and _range_conflicts(
@@ -1912,8 +2084,9 @@ def _retry_unscheduled_subjects(
 
                             # Handle paired days correctly
                             days_to_book = [day.id]
-                            if cand.get("is_paired") and cand.get("paired_days"):
-                                days_to_book = [p["day_id"] for p in cand["paired_days"]]
+                            result_entry = retry_results.get(subject.id, {})
+                            if result_entry.get("is_paired") and result_entry.get("paired_days"):
+                                days_to_book = [p["day_id"] for p in result_entry["paired_days"]]
                             
                             for d_id in days_to_book:
                                 if booked_room_ranges_global is not None:
@@ -1923,6 +2096,15 @@ def _retry_unscheduled_subjects(
 
                                 student_time_ranges[(subj_course_id, subj_year, subj_block_label, d_id)].append((proposed_start_min, proposed_end_min))
 
+                            # Update instructor units tracking for greedy consistency
+                            try:
+                                orig_id_for_units = getattr(subject, "original_subject_id", None) or subject.id
+                                greedy_unit_key = (int(instructor_id), int(orig_id_for_units), str(subj_block_label))
+                                if greedy_unit_key not in _seen_instr_subj_blocks:
+                                    _seen_instr_subj_blocks.add(greedy_unit_key)
+                                    instructor_current_units[int(instructor_id)] += subj_units
+                            except Exception:
+                                pass
 
                             # Log success
                             scheduled = True
@@ -1982,7 +2164,17 @@ def _cp_retry_mini_model(
     booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     instructor_prefs: Optional[Dict[int, Dict]] = None,
     relaxed: bool = False,
+    instructor_current_units: Optional[Dict[int, int]] = None,
+    instructor_limit_minutes: Optional[Dict[int, int]] = None,
+    _seen_instr_subj_blocks: Optional[set] = None,
 ) -> Tuple[Dict[int, Dict], Dict[int, Dict[str, int]]]:
+    # Default to empty dicts/sets if not provided
+    if instructor_current_units is None:
+        instructor_current_units = defaultdict(int)
+    if instructor_limit_minutes is None:
+        instructor_limit_minutes = {}
+    if _seen_instr_subj_blocks is None:
+        _seen_instr_subj_blocks = set()
     retry_results: Dict[int, Dict] = {}
 
     if not unscheduled_subjects:
@@ -2269,23 +2461,27 @@ def _cp_retry_mini_model(
             min_slots = 1
 
         # Define day patterns for retry
-        # LAB: Friday only (single day), Saturday as emergency
-        # LEC: MW or TTh patterns (paired days), Friday as fallback, Saturday as emergency
+        # With the new TIME_BLOCKS grid, each block = 1hr or 1.5hr (NOT 30 minutes).
+        # pattern_min_slots = number of consecutive blocks needed per meeting day.
+        # For a standard 3-unit LEC: 1 block per day on paired (MW/TTh), or 1 block on Friday.
+        # For LAB: 1 block (1hr or 1.5hr) on any pattern.
+        # SAT/SUN are NOT valid for regular subjects — only NSTP uses Sunday.
         if is_lec_subject:
-            # For LEC, try MW, TTh, Friday patterns first, then Saturday as last resort
             day_patterns = [
-                (("M", "W"), 3),     # Monday + Wednesday, 90 min per meeting = 3 slots
-                (("T", "TH"), 3),    # Tuesday + Thursday, 90 min per meeting = 3 slots
-                (("F",), 6),         # Friday (3-hour single day) = 6 slots
-                (("SAT",), 6),       # Saturday - EMERGENCY ONLY
+                (("M", "W"), 1),     # Monday + Wednesday, 1 block per day (1hr or 1.5hr)
+                (("T", "TH"), 1),    # Tuesday + Thursday, 1 block per day
+                (("F",), 1),         # Friday only, 1 block (1hr or 1.5hr)
             ]
         else:
-            # For LAB (and other types), use same MW/TTh/F patterns as LEC
+            # For LAB (and other types): paired weekday patterns + individual weekday singles
             day_patterns = [
-                (("M", "W"), 3),     # Monday + Wednesday (prioritized)
-                (("T", "TH"), 3),    # Tuesday + Thursday (prioritized)
-                (("F",), 6),         # Friday - fallback
-                (("SAT",), 6),       # Saturday - EMERGENCY ONLY
+                (("T", "TH"), 1),    # Tuesday + Thursday (prioritized for labs)
+                (("M", "W"), 1),     # Monday + Wednesday
+                (("F",), 1),         # Friday - single day lab
+                (("M",), 1),         # Individual weekday fallbacks
+                (("T",), 1),
+                (("W",), 1),
+                (("TH",), 1),
             ]
         
         for pattern, pattern_min_slots in day_patterns:
@@ -2392,7 +2588,7 @@ def _cp_retry_mini_model(
                     for check_day in pattern_days:
                         check_day_slots = slots_by_day.get(check_day.label, [])
                         if start_pos < len(check_day_slots):
-                            check_block = check_day_slots[start_pos : start_pos + pattern_min_slots]
+                            check_block = check_day_slots[start_pos : start_pos + min_slots]
                             for slot in check_block:
                                 block_index = slot["index"]
                                 if (room_name, check_day.id, block_index) in booked_room_slots_global:
@@ -2405,7 +2601,7 @@ def _cp_retry_mini_model(
                         for check_day in pattern_days:
                             check_day_slots = slots_by_day.get(check_day.label, [])
                             if start_pos < len(check_day_slots):
-                                check_block = check_day_slots[start_pos : start_pos + pattern_min_slots]
+                                check_block = check_day_slots[start_pos : start_pos + min_slots]
                                 if not check_block: continue
                                 block_start_min = int(check_block[0]["start_min"])
                                 block_end_min = int(check_block[-1]["end_min"])
@@ -2432,17 +2628,50 @@ def _cp_retry_mini_model(
                                 booked_room_ranges_global, room_name, check_day.id, block_start_min, block_end_min
                             )
                             if isinstance(conflict_metadata, dict):
-                                reason = conflict_metadata.get("description") or f"{course_id_to_code.get(conflict_metadata.get('course_id'), 'Other')} {_year_label(conflict_metadata.get('year'))}"
+                                reason = conflict_metadata.get("description") or "Existing Schedule Conflict"
                             elif conflict_metadata is True:
                                 reason = "Existing Schedule"
                                 
                             stats["rejection_counters"][reason] += 1
                             continue
                     
-                    # Room is available, proceed to instructor check
+                    # Sort instructors by current load (least loaded first) for fairer distribution
+                    retry_subj_units = int(getattr(subject, "unit", 0) or 0)
+                    DESIGNATED_ROLES_RETRY = {"dean", "associate dean", "director", "program chair", "college secretary"}
+                    
+                    def _retry_instr_sort(iid):
+                        cur = instructor_current_units.get(iid, 0)
+                        prefs = instructor_prefs.get(iid, {})
+                        mx = prefs.get('max_units')
+                        if mx is None:
+                            lm = instructor_limit_minutes.get(iid, 24 * 60)
+                            mx = lm // 60
+                        is_over = cur + retry_subj_units > mx
+                        is_visiting = prefs.get('employment_type', 'regular') == 'visiting'
+                        return (1 if (is_over and is_visiting) else (2 if is_over else 0), cur)
+                    
+                    eligible_instrs_sorted = sorted(eligible_instrs, key=_retry_instr_sort)
 
-                    for instructor_id in eligible_instrs:
+                    for instructor_id in eligible_instrs_sorted:
                         stats["instr_checks"] += 1
+                        
+                        # --- Unit capacity check (retry) ---
+                        retry_cur_units = instructor_current_units.get(instructor_id, 0)
+                        retry_i_prefs = instructor_prefs.get(instructor_id, {})
+                        retry_i_max = retry_i_prefs.get('max_units')
+                        if retry_i_max is None:
+                            retry_i_lm = instructor_limit_minutes.get(instructor_id, 24 * 60)
+                            retry_i_max = retry_i_lm // 60
+                        retry_i_desig = retry_i_prefs.get('designation', '')
+                        retry_i_empl = retry_i_prefs.get('employment_type', 'regular')
+                        
+                        if retry_cur_units + retry_subj_units > retry_i_max:
+                            if retry_i_desig in DESIGNATED_ROLES_RETRY:
+                                stats["instr_conflicts"] += 1
+                                continue
+                            elif retry_i_empl != 'visiting':
+                                stats["instr_conflicts"] += 1
+                                continue
                         
                         # NEW: Check time preferences (SKIP in relaxed mode)
                         if not relaxed and instructor_prefs and instructor_id in instructor_prefs:
@@ -2458,7 +2687,7 @@ def _cp_retry_mini_model(
                         for check_day in pattern_days:
                             check_day_slots = slots_by_day.get(check_day.label, [])
                             if start_pos < len(check_day_slots):
-                                check_block = check_day_slots[start_pos : start_pos + pattern_min_slots]
+                                check_block = check_day_slots[start_pos : start_pos + min_slots]
                                 for slot in check_block:
                                     block_index = slot["index"]
                                     if (
@@ -2481,7 +2710,7 @@ def _cp_retry_mini_model(
                             for check_day in pattern_days:
                                 check_day_slots = slots_by_day.get(check_day.label, [])
                                 if start_pos < len(check_day_slots):
-                                    check_block = check_day_slots[start_pos : start_pos + pattern_min_slots]
+                                    check_block = check_day_slots[start_pos : start_pos + min_slots]
                                     if not check_block: continue
                                     block_start_min = int(check_block[0]["start_min"])
                                     block_end_min = int(check_block[-1]["end_min"])
@@ -2695,6 +2924,90 @@ def _cp_retry_mini_model(
     for indices in student_slot_to_indices.values():
         if len(indices) > 1:
             model.Add(sum(vars_list[i] for i in indices) <= 1)
+
+    # CRITICAL FIX: Add range-based NoOverlap for student groups.
+    # The slot-index approach above can miss overlaps when TIME_BLOCKs have
+    # overlapping window definitions (e.g., 10:30-2:00 and 1:00-3:30 share time
+    # but may use different slot indices). This interval-based constraint ensures
+    # no two subjects assigned to the same student block overlap in actual time.
+    student_range_intervals: Dict[Tuple, list] = defaultdict(list)  # (course, year, block, day) -> [interval_vars]
+    for idx, cand in enumerate(candidates):
+        course_key, year_key, block_label, _day_id = cand["student_key"]
+        start_min = int(cand["start_min"])
+        end_min = int(cand["end_min"])
+        duration = end_min - start_min
+        if duration <= 0:
+            continue
+        # Handle paired days: add intervals for EACH day in the pair
+        if cand.get("is_paired") and cand.get("paired_days"):
+            for day_info in cand["paired_days"]:
+                d_id = int(day_info["day_id"])
+                d_start = int(day_info["start_min"])
+                d_end = int(day_info["end_min"])
+                d_dur = d_end - d_start
+                if d_dur <= 0:
+                    continue
+                intv_name = f"student_intv_{idx}_d{d_id}"
+                intv = model.NewOptionalIntervalVar(d_start, d_dur, d_end, vars_list[idx], intv_name)
+                student_range_intervals[(course_key, year_key, block_label, d_id)].append(intv)
+        else:
+            day_id = int(cand["day_id"])
+            intv_name = f"student_intv_{idx}_d{day_id}"
+            intv = model.NewOptionalIntervalVar(start_min, duration, end_min, vars_list[idx], intv_name)
+            student_range_intervals[(course_key, year_key, block_label, day_id)].append(intv)
+
+    student_no_overlap_count = 0
+    for group_key, intervals in student_range_intervals.items():
+        if len(intervals) > 1:
+            model.AddNoOverlap(intervals)
+            student_no_overlap_count += 1
+    if student_no_overlap_count > 0:
+        logger.info(f"[RETRY MINI-CP] Added {student_no_overlap_count} range-based student NoOverlap constraints")
+
+    # Range-based NoOverlap for rooms (same logic, keyed by room_name+day)
+    room_range_intervals: Dict[Tuple, list] = defaultdict(list)
+    instr_range_intervals: Dict[Tuple, list] = defaultdict(list)
+    for idx, cand in enumerate(candidates):
+        room_name = cand["room_name"]
+        instructor_id = int(cand["instructor_id"])
+        if cand.get("is_paired") and cand.get("paired_days"):
+            for day_info in cand["paired_days"]:
+                d_id = int(day_info["day_id"])
+                d_start = int(day_info["start_min"])
+                d_end = int(day_info["end_min"])
+                d_dur = d_end - d_start
+                if d_dur <= 0:
+                    continue
+                room_intv = model.NewOptionalIntervalVar(d_start, d_dur, d_end, vars_list[idx], f"room_intv_{idx}_d{d_id}")
+                room_range_intervals[(room_name, d_id)].append(room_intv)
+                instr_intv = model.NewOptionalIntervalVar(d_start, d_dur, d_end, vars_list[idx], f"instr_intv_{idx}_d{d_id}")
+                instr_range_intervals[(instructor_id, d_id)].append(instr_intv)
+        else:
+            day_id = int(cand["day_id"])
+            start_min = int(cand["start_min"])
+            end_min = int(cand["end_min"])
+            duration = end_min - start_min
+            if duration <= 0:
+                continue
+            room_intv = model.NewOptionalIntervalVar(start_min, duration, end_min, vars_list[idx], f"room_intv_{idx}_d{day_id}")
+            room_range_intervals[(room_name, day_id)].append(room_intv)
+            instr_intv = model.NewOptionalIntervalVar(start_min, duration, end_min, vars_list[idx], f"instr_intv_{idx}_d{day_id}")
+            instr_range_intervals[(instructor_id, day_id)].append(instr_intv)
+
+    room_no_overlap_count = 0
+    for group_key, intervals in room_range_intervals.items():
+        if len(intervals) > 1:
+            model.AddNoOverlap(intervals)
+            room_no_overlap_count += 1
+
+    instr_no_overlap_count = 0
+    for group_key, intervals in instr_range_intervals.items():
+        if len(intervals) > 1:
+            model.AddNoOverlap(intervals)
+            instr_no_overlap_count += 1
+
+    if room_no_overlap_count > 0 or instr_no_overlap_count > 0:
+        logger.info(f"[RETRY MINI-CP] Added {room_no_overlap_count} room + {instr_no_overlap_count} instructor range-based NoOverlap constraints")
 
     lec_key_to_instrs: Dict[Tuple[str, int, int], Set[int]] = defaultdict(set)
     for idx, cand in enumerate(candidates):
@@ -2975,8 +3288,14 @@ def greedy_initial_schedule(
                 if not block or len(block) < rec_slots:
                     continue
                 
-                # Check if blocks are consecutive using helper function
-                if not is_consecutive_blocks([slot["index"] for slot in block]):
+                # Check if blocks are consecutive using slot data directly
+                # (avoids TIME_BLOCKS lookup which may not match DB-sourced slots)
+                blocks_consecutive = True
+                for ci in range(len(block) - 1):
+                    if block[ci]["end_min"] != block[ci + 1]["start_min"]:
+                        blocks_consecutive = False
+                        break
+                if not blocks_consecutive:
                     continue
                 
                 global_start = block[0]["index"]
@@ -3865,6 +4184,8 @@ def run_cp_scheduler(
     except Exception:
         existing_scheds = []
 
+    # Track unique (instructor, subject, block) combos to avoid counting units per row
+    _seen_instr_subj_blocks = set()
     for sched in existing_scheds:
         instr_id = getattr(sched, "instructor_id", None)
         if instr_id is None:
@@ -3881,16 +4202,15 @@ def run_cp_scheduler(
         if parsed:
             start_min, end_min = parsed
             instructor_current_minutes[instr_id_int] += max(0, int(end_min) - int(start_min))
-            # Calculate current units
+            # Calculate current units — count per unique (instructor, subject, block)
+            # NOT per schedule row, since each day-entry is a separate row
             try:
-                if sched.subject_id:
-                     # We might need to fetch subject if not loaded. 
-                     # For safety, rely on unit if available, or try to load.
-                     # Since this is ORM, sched.subject might trigger a query.
-                     # To be safe and fast, maybe better to fetch units in bulk or rely on a simple query if needed.
-                     # But for now let's try accessing subject.unit if present
-                     if sched.subject:
-                         instructor_current_units[instr_id_int] += int(getattr(sched.subject, "unit", 0))
+                if sched.subject_id and sched.subject:
+                    block_val = getattr(sched, 'block', None) or ''
+                    unit_key = (instr_id_int, int(sched.subject_id), str(block_val))
+                    if unit_key not in _seen_instr_subj_blocks:
+                        _seen_instr_subj_blocks.add(unit_key)
+                        instructor_current_units[instr_id_int] += int(getattr(sched.subject, "unit", 0))
             except Exception:
                 pass
             continue
@@ -4045,12 +4365,14 @@ def run_cp_scheduler(
                 _room_to_bldg_id[r.id] = r.building_id
     logger.info(f"Loaded {len(_bldg_dist_map)//2} building distance pairs, {len(_room_to_bldg_id)} room-to-building mappings")
     
-    # Build instructor preferences lookup (time preferences and unit limits)
+    # Build instructor preferences lookup (time preferences, unit limits, and type info)
     instructor_prefs = {}
     for inst in instructors:
         pref_start = getattr(inst, 'preferred_start_time', None)
         pref_end = getattr(inst, 'preferred_end_time', None)
         max_units = getattr(inst, 'max_units', None)
+        employment_type = (getattr(inst, 'employment_type', None) or 'regular').strip().lower()
+        designation = (getattr(inst, 'designation', None) or '').strip().lower()
         
         # Convert time strings to minutes
         start_min = _time_str_to_minutes(pref_start) if pref_start else None
@@ -4059,7 +4381,9 @@ def run_cp_scheduler(
         instructor_prefs[inst.id] = {
             'start_min': start_min,
             'end_min': end_min,
-            'max_units': max_units
+            'max_units': max_units,
+            'employment_type': employment_type,
+            'designation': designation,
         }
     
     # Track currently assigned units per instructor (for max_units enforcement)
@@ -4388,6 +4712,7 @@ def run_cp_scheduler(
     sample_room_key = next(iter(booked_room_ranges_global)) if booked_room_ranges_global else None
     if sample_room_key:
          logger.info(f"Sample blocked room ranges for {sample_room_key}: {booked_room_ranges_global[sample_room_key]}")
+
 
     # Seed range-based bookings from existing bookings (DB + other courses).
 
@@ -5123,12 +5448,27 @@ def run_cp_scheduler(
                             if not is_time_within_preference(start_min, end_min, prefs['start_min'], prefs['end_min']):
                                 instr_ok = False
                                 break
-                                
-                                instr_ok = False
-                                break
                     
                     if not instr_ok:
                         continue
+                    
+                    # Unit capacity pre-filter: exclude instructors who would exceed max_units
+                    # (Designated and regular = hard block; visiting = allowed, penalty handles it)
+                    cp_subj_units = int(getattr(subject, "unit", 0) or 0)
+                    cp_i_prefs = instructor_prefs.get(instructor_id, {})
+                    cp_i_max = cp_i_prefs.get('max_units')
+                    if cp_i_max is None:
+                        cp_i_lm = instructor_limit_minutes.get(instructor_id, 24 * 60)
+                        cp_i_max = cp_i_lm // 60
+                    cp_i_cur = instructor_current_units.get(instructor_id, 0)
+                    cp_i_empl = cp_i_prefs.get('employment_type', 'regular')
+                    cp_i_desig = cp_i_prefs.get('designation', '')
+                    DESIGNATED_ROLES_CP = {"dean", "associate dean", "director", "program chair", "college secretary"}
+                    
+                    if cp_i_cur + cp_subj_units > cp_i_max:
+                        if cp_i_desig in DESIGNATED_ROLES_CP or cp_i_empl != 'visiting':
+                            # Hard block: skip this instructor entirely
+                            continue
                     
                     compatible_instructors.append(instructor_id)
                 
@@ -5202,7 +5542,7 @@ def run_cp_scheduler(
                         sorted_reasons = sorted(subject.rejection_counters.items(), key=lambda x: -x[1])
                         reasons_str = ", ".join([f"{r}: {c}" for r, c in sorted_reasons])
                         # Only log full summary on last window to avoid spam
-                        if opt_idx == len(subject_options) - 1:
+                        if opt_idx == len(subj_opts) - 1:
                              logger.info(f"[CONFLICT DIAGNOSIS] Subject {subject_id} ({code}) has 0 options. Reasons: {reasons_str}")
                         else:
                              # Debug level for intermediate windows
@@ -6256,10 +6596,25 @@ def run_cp_scheduler(
         if distribution_penalty is not None:
             penalty_exprs.append(DAY_TARGET_PENALTY_WEIGHT * distribution_penalty)
 
-        # Enforce Instructor Max Units (HARD CONSTRAINT)
-        # Uses DB max_units if set, otherwise derives from designation-based limit
+        # ==================================================================
+        # Enforce Instructor Max Units — differentiated by instructor type
+        #
+        # DESIGNATED (dean, program chair, etc.): HARD constraint — no overload
+        # REGULAR (no designation): HARD constraint — capped at max_units
+        # VISITING: SOFT penalty — allow overload but heavily penalize it
+        #   so the solver strongly prefers assigning free/available instructors
+        # ==================================================================
+        DESIGNATED_ROLES = {"dean", "associate dean", "director", "program chair", "college secretary"}
+        visiting_overload_penalty_terms = []
+
         for inst_id, terms in instructor_unit_terms.items():
-            max_units = instructor_prefs.get(inst_id, {}).get('max_units')
+            if not terms:
+                continue
+
+            prefs = instructor_prefs.get(inst_id, {})
+            employment_type = prefs.get('employment_type', 'regular')
+            designation = prefs.get('designation', '')
+            max_units = prefs.get('max_units')
             if max_units is None:
                 # Fallback: derive from designation-based limit_minutes (24h - deduction)
                 limit_min = instructor_limit_minutes.get(inst_id, 24 * 60)
@@ -6271,12 +6626,61 @@ def run_cp_scheduler(
             current_units = instructor_current_units.get(inst_id, 0)
             remaining_capacity = max(0, max_units - current_units)
             
-            if terms:
-                model.Add(sum(var * units for var, units in terms) <= remaining_capacity)
+            has_designation = designation in DESIGNATED_ROLES
+            is_visiting = employment_type == 'visiting'
+
+            assigned_units_var = model.NewIntVar(
+                0,
+                sum(units for _, units in terms),
+                f"cluster_{cluster_id}_inst_{inst_id}_assigned_units"
+            )
+            model.Add(assigned_units_var == sum(var * units for var, units in terms))
+            
+            if has_designation:
+                # HARD: Designated instructors CANNOT be overloaded at all
+                model.Add(assigned_units_var <= remaining_capacity)
+                logger.info(
+                    "[LOAD HARD-DESIGNATED] Instructor %d (%s): max=%d, current=%d, remaining=%d — NO overload allowed",
+                    inst_id, designation, max_units, current_units, remaining_capacity
+                )
+            elif is_visiting:
+                # SOFT: Visiting lecturers CAN be overloaded but get a heavy penalty
+                # This allows the solver to still schedule them if no others are available,
+                # but strongly prefers free instructors
+                if remaining_capacity > 0:
+                    model.Add(assigned_units_var <= remaining_capacity)
+                    logger.debug(
+                        "[LOAD SOFT-VISITING] Instructor %d: max=%d, current=%d, remaining=%d — within cap, hard enforced",
+                        inst_id, max_units, current_units, remaining_capacity
+                    )
+                else:
+                    # Already at or over capacity — apply heavy penalty per unit assigned
+                    over_units_var = model.NewIntVar(
+                        0, sum(units for _, units in terms),
+                        f"cluster_{cluster_id}_inst_{inst_id}_visiting_over_units"
+                    )
+                    model.Add(over_units_var == assigned_units_var)
+                    visiting_overload_penalty_terms.append(over_units_var)
+                    logger.info(
+                        "[LOAD SOFT-VISITING] Instructor %d: max=%d, current=%d — OVER CAP, penalty applied",
+                        inst_id, max_units, current_units
+                    )
+            else:
+                # HARD: Regular instructors are capped at max_units
+                model.Add(assigned_units_var <= remaining_capacity)
                 logger.debug(
-                    "[LOAD CONSTRAINT] Instructor %d: max_units=%d, current=%d, remaining=%d",
+                    "[LOAD HARD-REGULAR] Instructor %d: max=%d, current=%d, remaining=%d",
                     inst_id, max_units, current_units, remaining_capacity
                 )
+
+        # Visiting overload penalty (very high so solver avoids it)
+        VISITING_OVERLOAD_PENALTY_WEIGHT = 5000
+        if visiting_overload_penalty_terms:
+            penalty_exprs.append(VISITING_OVERLOAD_PENALTY_WEIGHT * sum(visiting_overload_penalty_terms))
+            logger.info(
+                "[LOAD] Applied visiting overload penalty to %d instructors (weight=%d)",
+                len(visiting_overload_penalty_terms), VISITING_OVERLOAD_PENALTY_WEIGHT
+            )
 
         overload_penalty_terms = []
         zero_var = model.NewIntVar(0, 0, f"cluster_{cluster_id}_zero")
@@ -6302,7 +6706,7 @@ def run_cp_scheduler(
             model.AddMaxEquality(over_min_var, [zero_var, diff_min_var])
             overload_penalty_terms.append(over_min_var)
 
-        overload_penalty_weight = 500  # Strong penalty to discourage overloading
+        overload_penalty_weight = 5000  # Strong penalty to discourage time-based overloading
         if overload_penalty_terms:
             penalty_exprs.append(overload_penalty_weight * sum(overload_penalty_terms))
 
@@ -6804,7 +7208,6 @@ def run_cp_scheduler(
                         logger.info(f"[GE-US DEBUG] Block {student_block_index} day {day_id_int}: time_label={time_label}, "
                                    f"start_min={start_min_day}, end_min={end_min_day}, room={room_name}")
 
-
                     # If end_block_id still None, set it equal to start_block_id (single-block subject)
                     if end_block_id is None:
                         end_block_id = start_block_id
@@ -6891,6 +7294,15 @@ def run_cp_scheduler(
                     try:
                         instr_for_load = int(row.get("instructor_id"))
                         instructor_current_minutes[instr_for_load] += max(0, int(row.get("end_min")) - int(row.get("start_min")))
+                        # Update units per unique (instructor, subject, block) — NOT per row
+                        subj_id_for_units = row.get("clone_subject_id") or row.get("subject_id")
+                        block_for_units = row.get("block", "")
+                        unit_key = (instr_for_load, int(subj_id_for_units), str(block_for_units))
+                        if unit_key not in _seen_instr_subj_blocks:
+                            _seen_instr_subj_blocks.add(unit_key)
+                            subj_obj = subject_lookup.get(int(row.get("subject_id")))
+                            if subj_obj:
+                                instructor_current_units[instr_for_load] += int(getattr(subj_obj, "unit", 0))
                     except Exception:
                         pass
 
@@ -6930,13 +7342,19 @@ def run_cp_scheduler(
 
                     # CRITICAL FIX: For block-shared subjects (PE, PATHFIT, NSTP),
                     # register the time slot for ALL student blocks, not just the current one.
-                    # These subjects occupy the same time across all blocks, so the booking
-                    # must prevent other subjects from using that slot in ANY block.
-                    if subject and _is_block_shared_subject(subject):
+                    # ONLY if the assigned room belongs to a shared building (like GYM or FIELD).
+                    if 'room_is_shared_cache' not in locals():
+                        room_is_shared_cache = {}
+                        for _r in db.query(models.Room).all():
+                            room_is_shared_cache[_r.id] = getattr(getattr(_r, 'building', None), 'is_shared', False)
+                    
+                    is_shared_building = room_is_shared_cache.get(room_id_int, False)
+
+                    if subject and _is_shared_subject(subject) and is_shared_building:
                         for _bi in range(1, block_count + 1):
                             cross_cluster_scheduled_ranges[(subj_year, _bi, day_id_int)].append((int(start_min_day), int(end_min_day)))
                         logger.info(f"[BLOCK-SHARED BOOKING] {getattr(subject, 'code', 'ID:' + str(subject_id))} "
-                                   f"booked for ALL {block_count} blocks at day {day_id_int} {start_min_day}-{end_min_day}")
+                                   f"booked for ALL {block_count} blocks at day {day_id_int} {start_min_day}-{end_min_day} (Room: {room_name})")
                     else:
                         cross_cluster_scheduled_ranges[(subj_year, student_block_index, day_id_int)].append((int(start_min_day), int(end_min_day)))
         
@@ -7035,6 +7453,9 @@ def run_cp_scheduler(
             booked_room_ranges_global=booked_room_ranges_global,
             booked_instr_ranges_global=booked_instr_ranges_global,
             instructor_prefs=instructor_prefs,
+            instructor_current_units=instructor_current_units,
+            instructor_limit_minutes=instructor_limit_minutes,
+            _seen_instr_subj_blocks=_seen_instr_subj_blocks,
         )
         
         # Accumulate diagnostics
@@ -7416,6 +7837,10 @@ def run_cp_scheduler(
                     scheduled_rows=scheduled_rows_for_retry,
                     booked_room_ranges_global=booked_room_ranges_global,
                     booked_instr_ranges_global=booked_instr_ranges_global,
+                    instructor_prefs=instructor_prefs,
+                    instructor_current_units=instructor_current_units,
+                    instructor_limit_minutes=instructor_limit_minutes,
+                    _seen_instr_subj_blocks=_seen_instr_subj_blocks,
                 )
                 
                 # Merge diagnostics
@@ -8152,72 +8577,132 @@ def run_cp_scheduler(
                                      diagnostic_entry["failure_reason"] = "Instructor Conflict"
                                      diagnostic_entry["detail"] = "All eligible instructors are fully booked."
                 
-                # Auto-apply logic: Only for "Skipped" subjects (is_newly_discovered)
-                # For "Solver Conflict", we let the user resolve manually using the recommendations
-                if is_newly_discovered and recommendations:
-                    first_rec = recommendations[0]
-                    rec_is_paired = first_rec.get("is_paired", False)
-                    rec_day_ids = first_rec.get("day_ids", [first_rec["day_id"]])
+                # Auto-apply logic: Apply first CONFLICT-FREE recommendation
+                # Previously only applied for "Skipped" subjects (is_newly_discovered),
+                # but subjects with solver diagnostics (Room Conflict, Solver Conflict etc.)
+                # also need auto-apply so they show as "Suggested" in the UI.
+                logger.info(f"[REC FLOW] Clone {subject.id} (orig={sid_to_use}, block={subj_block}): "
+                           f"is_newly_discovered={is_newly_discovered}, recs={len(recommendations)}")
+                if recommendations:
+                    # Pick the first recommendation that doesn't conflict with other blocks/courses
+                    chosen_rec = None
+                    for candidate_rec in recommendations:
+                        if not _rec_has_cross_block_or_course_conflict(
+                            candidate_rec, subj_block, all_scheduled_items,
+                            booked_room_ranges_global=booked_room_ranges_global,
+                            booked_instr_ranges_global=booked_instr_ranges_global,
+                            solver_shared_room_ids=_solver_shared_room_ids,
+                            room_id_to_name=room_id_to_name,
+                        ):
+                            chosen_rec = candidate_rec
+                            break
+                        else:
+                            logger.info(f"[REC FLOW] Skipping rec for {subject.id} block {subj_block}: "
+                                       f"cross-block/course conflict with instr={candidate_rec.get('instructor_id')} "
+                                       f"room={candidate_rec.get('room_id')} at {candidate_rec.get('time')}")
 
-                    # Create schedule items — one per day for paired patterns (M-W, T-TH)
-                    for rec_day_id in rec_day_ids:
-                        auto_item = {
-                            "subject_id": int(sid_to_use),
-                            "clone_subject_id": subject.id,
-                            "subject_code": getattr(subject, 'code', ''),
-                            "subject_name": getattr(subject, 'name', ''),
-                            "course_id": subj_course_id,
-                            "year": subj_year,
-                            "semester": getattr(subject, 'semester', None) or semester,
-                            "block": subj_block,
-                            "room_id": first_rec["room_id"],
-                            "room_name": first_rec["room_name"],
-                            "instructor_id": first_rec["instructor_id"],
-                            "instructor_name": first_rec["instructor_name"],
-                            "day_id": rec_day_id,
-                            "day": first_rec["day_label"],
-                            "time": first_rec["time"],
-                            "start_min": first_rec["start_min"],
-                            "end_min": first_rec["end_min"],
-                            "is_recommended": True,  # Flag for UI
-                            "recommendation_score": first_rec["score"],
-                            "alternatives": recommendations,  # Pass all generated alternatives to frontend
-                        }
-                        all_scheduled_items.append(auto_item)
+                    if chosen_rec:
+                        first_rec = chosen_rec
+                        rec_is_paired = first_rec.get("is_paired", False)
+                        rec_day_ids = first_rec.get("day_ids", [first_rec["day_id"]])
 
-                    _trace_all_scheduled_items(f"After Auto-Apply Subj {subject.id}")
-                    scheduled_clones_set.add(int(subject.id))
+                        # Create schedule items — one per day for paired patterns (M-W, T-TH)
+                        for rec_day_id in rec_day_ids:
+                            auto_item = {
+                                "subject_id": int(sid_to_use),
+                                "clone_subject_id": subject.id,
+                                "subject_code": getattr(subject, 'code', ''),
+                                "subject_name": getattr(subject, 'name', ''),
+                                "course_id": subj_course_id,
+                                "year": subj_year,
+                                "semester": getattr(subject, 'semester', None) or semester,
+                                "block": subj_block,
+                                "room_id": first_rec["room_id"],
+                                "room_name": first_rec["room_name"],
+                                "instructor_id": first_rec["instructor_id"],
+                                "instructor_name": first_rec["instructor_name"],
+                                "day_id": rec_day_id,
+                                "day": first_rec["day_label"],
+                                "time": first_rec["time"],
+                                "start_min": first_rec["start_min"],
+                                "end_min": first_rec["end_min"],
+                                "is_recommended": True,  # Flag for UI
+                                "recommendation_score": first_rec["score"],
+                                "alternatives": recommendations,  # Pass all generated alternatives to frontend
+                            }
+                            all_scheduled_items.append(auto_item)
 
-                    # Update booking maps for ALL days to prevent conflicts
-                    for rec_day_id in rec_day_ids:
-                        room_key = (first_rec["room_name"], rec_day_id)
-                        if booked_room_ranges_global is not None:
-                            booked_room_ranges_global[room_key].append((first_rec["start_min"], first_rec["end_min"]))
-                        instr_key = (first_rec["instructor_id"], rec_day_id)
-                        if booked_instr_ranges_global is not None:
-                            booked_instr_ranges_global[instr_key].append((first_rec["start_min"], first_rec["end_min"]))
-                    
-                    reason = "Auto-Recommended"
-                    detail = f"Automatically scheduled using recommendation: {first_rec['room_name']} on {first_rec['day_label']} at {first_rec['time']} with {first_rec['instructor_name']}"
-                    logger.info(f"[RECOMMENDATION APPLIED] Subject {subject.id} ({code}) auto-scheduled: {detail}")
-                    
-                    # Remove from diagnostics since it's now scheduled
-                    if sid_str in final_diagnostics:
-                        del final_diagnostics[sid_str]
+                        _trace_all_scheduled_items(f"After Auto-Apply Subj {subject.id}")
+                        scheduled_clones_set.add(int(subject.id))
+
+                        # Update booking maps for ALL days to prevent conflicts
+                        for rec_day_id in rec_day_ids:
+                            room_key = (first_rec["room_name"], rec_day_id)
+                            if booked_room_ranges_global is not None:
+                                booked_room_ranges_global[room_key].append((first_rec["start_min"], first_rec["end_min"]))
+                            instr_key = (first_rec["instructor_id"], rec_day_id)
+                            if booked_instr_ranges_global is not None:
+                                booked_instr_ranges_global[instr_key].append((first_rec["start_min"], first_rec["end_min"]))
+                        
+                        reason = "Auto-Recommended"
+                        detail = f"Automatically scheduled using recommendation: {first_rec['room_name']} on {first_rec['day_label']} at {first_rec['time']} with {first_rec['instructor_name']}"
+                        logger.info(f"[RECOMMENDATION APPLIED] Subject {subject.id} ({code}) block {subj_block}: {detail}")
+                        
+                        # Remove from diagnostics since it's now scheduled
+                        if sid_str in final_diagnostics:
+                            del final_diagnostics[sid_str]
+                    else:
+                        logger.info(f"[REC FLOW] All {len(recommendations)} recommendations for {subject.id} block {subj_block} "
+                                   f"have cross-block conflicts. Keeping as unscheduled.")
+                        final_diagnostics[sid_str] = diagnostic_entry
                 else:
-                    # Update the reason if we found recommendations for a skipped item but didn't auto-apply?
-                    # (Logic above always auto-applies if list not empty for skipped items).
-                    pass
+                    # No recommendations found — keep the diagnostic entry so Resolve button
+                    # can still show the failure reason and context to the user.
+                    logger.info(f"[REC FLOW] Clone {subject.id} (orig={sid_to_use}, block={subj_block}): "
+                               f"0 recommendations, keeping diagnostic for Resolve UI")
+                    # Ensure diagnostic_entry stays in final_diagnostics
+                    final_diagnostics[sid_str] = diagnostic_entry
 
             except Exception as e:
                 logger.warning(f"[RECOMMENDATION ERROR] Failed to generate recommendations for subject {subject.id}: {e}")
+                import traceback
+                logger.warning(traceback.format_exc())
 
     # Build structured diagnostics for frontend SchedulerDiagnostics component
-    subjects_scheduled = len(set(
-        int(item.get("subject_id")) for item in all_scheduled_items 
-        if item.get("subject_id") is not None
-    ))
-    subjects_total = len(all_requested_ids) if all_requested_ids else subjects_scheduled
+    # Count per-block instances, not just unique subject IDs.
+    # With 3 blocks × 10 subjects, total should be 30 (not 10).
+    scheduled_pairs = set()
+    for item in all_scheduled_items:
+        sid = item.get("subject_id")
+        block = item.get("block", "?")
+        day_id = item.get("day_id")
+        if sid is not None and day_id is not None:
+            scheduled_pairs.add((int(sid), str(block)))
+    subjects_scheduled = len(scheduled_pairs)
+    
+    # Compute total from BOTH sources:
+    # 1. `subjects` list (non-NSTP clones — includes unscheduled subjects not yet in all_scheduled_items)
+    # 2. `all_scheduled_items` (includes NSTP items that were pre-scheduled and removed from subjects list)
+    total_pairs = set()
+    # Source 1: subjects list (clones per block, may include unscheduled subjects)
+    for subj in subjects:
+        orig_id = getattr(subj, 'original_subject_id', None) or subj.id
+        _sb = getattr(subj, 'student_block', None)
+        if _sb is not None:
+            try:
+                bl = _block_index_to_label(int(_sb))
+            except (TypeError, ValueError):
+                bl = 'A'
+        else:
+            bl = getattr(subj, 'block', 'A') or 'A'
+        total_pairs.add((int(orig_id), str(bl)))
+    # Source 2: all_scheduled_items (captures NSTP and any other pre-scheduled subjects)
+    for item in all_scheduled_items:
+        sid = item.get("subject_id")
+        block = item.get("block", "?")
+        if sid is not None:
+            total_pairs.add((int(sid), str(block)))
+    subjects_total = len(total_pairs) if total_pairs else subjects_scheduled
     
     # Convert per-subject diagnostics to unscheduled_reasons format
     unscheduled_reasons = {}
@@ -8612,6 +9097,236 @@ def run_cp_scheduler(
     else:
         logger.info("[PROXIMITY] No building distance data — skipping proximity pass")
 
+    # =========================================================================
+    # SECOND-PASS DIAGNOSTICS: Recalculate after post-processing
+    # =========================================================================
+    # Post-processing may have removed items (cross-block conflicts).
+    # We need to recalculate the counters and add diagnostics for removed items
+    # so that the UI correctly shows them as unscheduled with Resolve buttons.
+    logger.info("[DIAGNOSTICS 2ND PASS] Recalculating counters after post-processing")
+    
+    # Recalculate scheduled pairs
+    post_scheduled_pairs = set()
+    for item in all_scheduled_items:
+        sid = item.get("subject_id")
+        block = item.get("block", "?")
+        day_id = item.get("day_id")
+        if sid is not None and day_id is not None:
+            post_scheduled_pairs.add((int(sid), str(block)))
+    post_subjects_scheduled = len(post_scheduled_pairs)
+    
+    # Recalculate total (same logic as before)
+    post_total_pairs = set()
+    for subj in subjects:
+        orig_id = getattr(subj, 'original_subject_id', None) or subj.id
+        _sb = getattr(subj, 'student_block', None)
+        if _sb is not None:
+            try:
+                bl = _block_index_to_label(int(_sb))
+            except (TypeError, ValueError):
+                bl = 'A'
+        else:
+            bl = getattr(subj, 'block', 'A') or 'A'
+        post_total_pairs.add((int(orig_id), str(bl)))
+    for item in all_scheduled_items:
+        sid = item.get("subject_id")
+        block = item.get("block", "?")
+        if sid is not None:
+            post_total_pairs.add((int(sid), str(block)))
+    post_subjects_total = len(post_total_pairs) if post_total_pairs else post_subjects_scheduled
+    
+    # Detect items that were removed by post-processing
+    removed_pairs = post_total_pairs - post_scheduled_pairs
+    if removed_pairs:
+        logger.info(f"[DIAGNOSTICS 2ND PASS] {len(removed_pairs)} (subject, block) pairs are unscheduled after post-processing: {removed_pairs}")
+        
+        # Create diagnostics for removed subjects
+        for (removed_sid, removed_block) in removed_pairs:
+            sid_str = str(removed_sid)
+            if sid_str not in structured_diagnostics["unscheduled_reasons"]:
+                # Build a diagnostic entry for this removed subject
+                subject_code = None
+                subject_type = None
+                for subj in subjects:
+                    orig_id = getattr(subj, "original_subject_id", None) or subj.id
+                    if int(orig_id) == removed_sid:
+                        subject_code = getattr(subj, "code", None)
+                        subject_type = getattr(subj, "type", None)
+                        break
+                
+                entry = {
+                    "failure_reason": "Cross-Block Conflict",
+                    "detail": f"Removed by post-processing: instructor or room was double-booked across blocks.",
+                    "subject_code": subject_code or f"Subject {removed_sid}",
+                    "subject_type": subject_type or "LEC",
+                    "recommendations": [],
+                    "suggestion": "Need more instructors for this subject. Go to the Instructors page and assign additional instructors to this subject's specialization to avoid conflicts across blocks.",
+                }
+                
+                # Generate recommendations for this removed subject
+                try:
+                    for subj in subjects:
+                        orig_id = getattr(subj, 'original_subject_id', None) or subj.id
+                        _sb = getattr(subj, 'student_block', None)
+                        if _sb is not None:
+                            try:
+                                bl = _block_index_to_label(int(_sb))
+                            except (TypeError, ValueError):
+                                bl = 'A'
+                        else:
+                            bl = getattr(subj, 'block', 'A') or 'A'
+                        
+                        if int(orig_id) == removed_sid and str(bl) == str(removed_block):
+                            # Found the clone for this (subject, block) pair
+                            eligible_room_ids = course_to_all_rooms.get(subj.id, [])
+                            if not eligible_room_ids:
+                                eligible_room_ids = course_to_all_rooms.get(removed_sid, [])
+                            eligible_instr_ids = course_to_instructors.get(subj.id, [])
+                            if not eligible_instr_ids:
+                                eligible_instr_ids = course_to_instructors.get(removed_sid, [])
+                            
+                            # Strip shared rooms for non-sports subjects
+                            _rec_code = (getattr(subj, 'code', '') or '').upper().strip()
+                            _rec_is_sports = (
+                                _rec_code.startswith("NSTP") or
+                                _rec_code.startswith("PE") or
+                                _rec_code.startswith("PATHFIT")
+                            )
+                            if not _rec_is_sports and _solver_shared_room_ids:
+                                eligible_room_ids = [rid for rid in eligible_room_ids if rid not in _solver_shared_room_ids]
+                            
+                            # Regenerate availability with current bookings
+                            room_availability = get_available_slots(rooms, days, booked_room_ranges_global or {})
+                            instr_availability = get_instructor_availability(instructors, days, booked_instr_ranges_global or {})
+                            
+                            subj_course_id = getattr(subj, 'course_id', course_id) or course_id
+                            subj_year = getattr(subj, 'year_level', default_year) or default_year or 1
+                            
+                            # Build student time ranges for this block
+                            student_time_ranges = defaultdict(list)
+                            for sched_item in all_scheduled_items:
+                                i_course = sched_item.get("course_id")
+                                i_year = sched_item.get("year")
+                                i_block = sched_item.get("block")
+                                if (str(i_course) == str(subj_course_id) and
+                                    str(i_year) == str(subj_year) and
+                                    str(i_block) == str(removed_block)):
+                                    d_id = sched_item.get("day_id")
+                                    s_min = sched_item.get("start_min")
+                                    e_min = sched_item.get("end_min")
+                                    if d_id is not None and s_min is not None and e_min is not None:
+                                        key = (subj_course_id, subj_year, removed_block, int(d_id))
+                                        student_time_ranges[key].append((int(s_min), int(e_min)))
+                            
+                            recommendations = generate_recommendations(
+                                subject=subj,
+                                eligible_room_ids=eligible_room_ids,
+                                eligible_instructor_ids=eligible_instr_ids,
+                                rooms=rooms,
+                                instructors=instructors,
+                                days=days,
+                                room_availability=room_availability,
+                                instructor_availability=instr_availability,
+                                student_time_ranges=student_time_ranges,
+                                course_id=subj_course_id,
+                                year=subj_year,
+                                block_label=removed_block,
+                                max_recommendations=5,
+                            )
+                            entry["recommendations"] = recommendations
+                            logger.info(f"[DIAGNOSTICS 2ND PASS] Generated {len(recommendations)} recommendations for subject {removed_sid} block {removed_block}")
+                            
+                            # Auto-apply if a conflict-free recommendation is found
+                            if recommendations:
+                                chosen_rec = None
+                                for candidate_rec in recommendations:
+                                    if not _rec_has_cross_block_or_course_conflict(
+                                        candidate_rec, removed_block, all_scheduled_items,
+                                        booked_room_ranges_global=booked_room_ranges_global,
+                                        booked_instr_ranges_global=booked_instr_ranges_global,
+                                        solver_shared_room_ids=_solver_shared_room_ids,
+                                        room_id_to_name=room_id_to_name,
+                                    ):
+                                        chosen_rec = candidate_rec
+                                        break
+                                    else:
+                                        logger.info(f"[2ND PASS] Skipping rec for {removed_sid} block {removed_block}: "
+                                                   f"cross-block/course conflict with instr={candidate_rec.get('instructor_id')} "
+                                                   f"room={candidate_rec.get('room_id')} at {candidate_rec.get('time')}")
+
+                                if chosen_rec:
+                                    first_rec = chosen_rec
+                                    rec_day_ids = first_rec.get("day_ids", [first_rec["day_id"]])
+                                    for rec_day_id in rec_day_ids:
+                                        auto_item = {
+                                            "subject_id": int(removed_sid),
+                                            "clone_subject_id": subj.id,
+                                            "subject_code": getattr(subj, 'code', ''),
+                                            "subject_name": getattr(subj, 'name', ''),
+                                            "course_id": subj_course_id,
+                                            "year": subj_year,
+                                            "semester": getattr(subj, 'semester', None) or semester,
+                                            "block": removed_block,
+                                            "room_id": first_rec["room_id"],
+                                            "room_name": first_rec["room_name"],
+                                            "instructor_id": first_rec["instructor_id"],
+                                            "instructor_name": first_rec["instructor_name"],
+                                            "day_id": rec_day_id,
+                                            "day": first_rec["day_label"],
+                                            "time": first_rec["time"],
+                                            "start_min": first_rec["start_min"],
+                                            "end_min": first_rec["end_min"],
+                                            "is_recommended": True,
+                                            "recommendation_score": first_rec["score"],
+                                            "alternatives": recommendations,
+                                        }
+                                        all_scheduled_items.append(auto_item)
+                                    # Update booking maps
+                                    for rec_day_id in rec_day_ids:
+                                        room_key = (first_rec["room_name"], rec_day_id)
+                                        if booked_room_ranges_global is not None:
+                                            booked_room_ranges_global[room_key].append((first_rec["start_min"], first_rec["end_min"]))
+                                        instr_key = (first_rec["instructor_id"], rec_day_id)
+                                        if booked_instr_ranges_global is not None:
+                                            booked_instr_ranges_global[instr_key].append((first_rec["start_min"], first_rec["end_min"]))
+                                    logger.info(f"[DIAGNOSTICS 2ND PASS] Auto-applied conflict-free recommendation for subject {removed_sid} block {removed_block}")
+                                    entry = None  # Don't add diagnostic since it's now scheduled
+                                else:
+                                    logger.info(f"[DIAGNOSTICS 2ND PASS] All {len(recommendations)} recommendations for "
+                                               f"{removed_sid} block {removed_block} have cross-block conflicts. Keeping as unscheduled.")
+                            break
+                except Exception as e:
+                    logger.warning(f"[DIAGNOSTICS 2ND PASS] Error generating recommendations for {removed_sid}: {e}")
+                    import traceback
+                    logger.warning(traceback.format_exc())
+                
+                if entry is not None:
+                    structured_diagnostics["unscheduled_reasons"][sid_str] = entry
+    
+    # Recalculate final counters after 2nd pass auto-apply
+    final_scheduled_pairs = set()
+    for item in all_scheduled_items:
+        sid = item.get("subject_id")
+        block = item.get("block", "?")
+        day_id = item.get("day_id")
+        if sid is not None and day_id is not None:
+            final_scheduled_pairs.add((int(sid), str(block)))
+    
+    structured_diagnostics["subjects_scheduled"] = len(final_scheduled_pairs)
+    structured_diagnostics["subjects_total"] = len(post_total_pairs) if post_total_pairs else len(final_scheduled_pairs)
+    
+    # Recalculate status
+    s_sched = structured_diagnostics["subjects_scheduled"]
+    s_total = structured_diagnostics["subjects_total"]
+    if s_sched == s_total and s_total > 0:
+        structured_diagnostics["solver_status"] = "OPTIMAL"
+    elif s_sched > 0:
+        structured_diagnostics["solver_status"] = "FEASIBLE"
+    elif s_total > 0:
+        structured_diagnostics["solver_status"] = "INFEASIBLE"
+    
+    logger.info(f"[DIAGNOSTICS 2ND PASS] Final: {structured_diagnostics['subjects_scheduled']}/{structured_diagnostics['subjects_total']} {structured_diagnostics['solver_status']}")
+
     return all_scheduled_items, structured_diagnostics
 
 
@@ -8657,6 +9372,19 @@ def find_alternative_slots(
     subject = db.query(models.Subject).get(subject_id)
     if not subject:
         return []
+
+    # Build instructor name map for suggestion display
+    instr_name_map = {}
+    all_instr_ids = set()
+    for iids in course_to_instructors.values():
+        all_instr_ids.update(iids)
+    if all_instr_ids:
+        try:
+            instrs = db.query(models.Instructor).filter(models.Instructor.id.in_(all_instr_ids)).all()
+            for i in instrs:
+                instr_name_map[i.id] = f"{i.last_name}, {i.first_name}" if i.last_name else f"{i.first_name}"
+        except Exception:
+            pass
 
     subj_code = (getattr(subject, "code", "") or "").upper().strip()
     subj_type = (getattr(subject, "type", "") or "").upper().strip()
@@ -8742,12 +9470,16 @@ def find_alternative_slots(
                         suggestions.append({
                             "type": "Valid", 
                             "day": " + ".join([d.label for d in pattern_days]),
+                            "day_label": "-".join([d.label for d in pattern_days]),
                             "time": time_label,
                             "room": room_name,
+                            "room_name": room_name,
                             "instructor_id": instr_id,
+                            "instructor_name": instr_name_map.get(instr_id, f"Instructor #{instr_id}"),
                             "start_min": first_slot["start_min"],
                             "end_min": last_slot["end_min"],
                             "day_ids": [d.id for d in pattern_days],
+                            "day_id": pattern_days[0].id,
                             "room_id": room_id,
                             "score": 100 # High score = good
                         })

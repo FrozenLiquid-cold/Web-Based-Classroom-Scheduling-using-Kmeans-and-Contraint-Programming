@@ -149,10 +149,14 @@ def generate_recommendations(
         ("T-TH", ["T", "TH"]),
     ]
     SINGLE_PATTERNS = [("F", ["F"])]
+    WEEKDAY_LABELS = {"M", "T", "W", "TH", "F"}
+    WEEKEND_LABELS = {"SAT", "SUN"}
     
     if is_lab:
-        # LAB: paired M-W / T-TH patterns + all available single days
-        patterns_to_try = PAIRED_PATTERNS + [(d.label, [d.label]) for d in days]
+        # LAB: paired M-W / T-TH patterns + single weekdays FIRST, then weekends
+        weekday_singles = [(d.label, [d.label]) for d in days if d.label.upper() in WEEKDAY_LABELS]
+        weekend_singles = [(d.label, [d.label]) for d in days if d.label.upper() in WEEKEND_LABELS]
+        patterns_to_try = PAIRED_PATTERNS + weekday_singles + weekend_singles
     else:
         # LEC: paired M-W / T-TH patterns + Friday single-day
         patterns_to_try = PAIRED_PATTERNS + SINGLE_PATTERNS
@@ -206,9 +210,8 @@ def generate_recommendations(
             room_slots = room_availability.get(room_id, {}).get(first_day.id, [])
             
             for slot in room_slots:
-                # For LAB subjects, only consider LAB-flagged slots
-                if is_lab and not slot.get("is_lab", False):
-                    continue
+                # NOTE: Removed is_lab filter — the CP solver schedules LAB subjects
+                # in any available timeslot, so recommendations should too.
                 
                 start_min = slot["start_min"]
                 end_min = slot["end_min"]
@@ -251,13 +254,22 @@ def generate_recommendations(
                     if is_paired:
                         score += 10       # Prefer proper paired patterns over single-day
                     
+                    # CRITICAL: Heavily penalize weekend days so weekday slots
+                    # are always preferred when available
+                    day_label_upper = pattern_label.upper()
+                    if day_label_upper == "SAT":
+                        score -= 200
+                    elif day_label_upper == "SUN":
+                        score -= 300
+                    
                     day_ids = [pd.id for pd in pattern_days]
                     
+                    instr_name = f"{instructor.first_name} {instructor.last_name}" if getattr(instructor, 'last_name', None) else getattr(instructor, 'first_name', f"Instructor {instr_id}")
                     recommendations.append({
                         "room_id": room_id,
                         "room_name": room.name,
                         "instructor_id": instr_id,
-                        "instructor_name": getattr(instructor, "name", f"Instructor {instr_id}"),
+                        "instructor_name": instr_name,
                         "day_id": pattern_days[0].id,
                         "day_ids": day_ids,
                         "day_label": pattern_label,
@@ -269,21 +281,35 @@ def generate_recommendations(
                         "is_paired": is_paired,
                     })
     
-    # Deduplicate: keep only the best instructor per unique (room, pattern, time)
-    # This prevents identical-looking entries when multiple instructors are free
-    best_by_slot = {}
+    # Deduplicate: keep top N instructors per unique (room, pattern, time) slot.
+    # Previously only kept the "best" instructor, which caused all recommendations
+    # to use the same instructor — if that instructor had a cross-block conflict,
+    # every recommendation was rejected and the subject stayed unscheduled.
+    MAX_INSTRUCTORS_PER_SLOT = 3
+    slot_groups = {}
     for rec in recommendations:
         slot_key = (rec["room_id"], rec["day_label"], rec["start_min"], rec["end_min"])
-        existing = best_by_slot.get(slot_key)
-        if existing is None or rec["score"] > existing["score"]:
-            best_by_slot[slot_key] = rec
+        if slot_key not in slot_groups:
+            slot_groups[slot_key] = []
+        slot_groups[slot_key].append(rec)
     
-    deduped = list(best_by_slot.values())
+    deduped = []
+    for slot_key, recs in slot_groups.items():
+        # Sort by score descending, keep top N instructors per slot
+        recs.sort(key=lambda x: -x["score"])
+        # Deduplicate by instructor within this slot
+        seen_instructors = set()
+        for rec in recs:
+            if rec["instructor_id"] not in seen_instructors:
+                deduped.append(rec)
+                seen_instructors.add(rec["instructor_id"])
+                if len(seen_instructors) >= MAX_INSTRUCTORS_PER_SLOT:
+                    break
     
     # Sort by score (highest first) and limit
     deduped.sort(key=lambda x: -x["score"])
     
-    # User requested more alternatives, so let's allow up to 15 if max is set small
+    # Allow up to 15 alternatives for better cross-block conflict resolution
     actual_max = max(max_recommendations, 15)
     return deduped[:actual_max]
 

@@ -1,0 +1,99 @@
+diff --git a/src/services/api.js b/src/services/api.js
+index feef317..20e3b80 100644
+--- a/src/services/api.js
++++ b/src/services/api.js
+@@ -219,7 +219,7 @@ export async function generateSchedule(
+   subjectIds = null,
+   options = {}
+ ) {
+-  const { waitSeconds, ...extraPayload } = options || {}
++  const { waitSeconds, schoolYear, ...extraPayload } = options || {}
+   const payload = {
+     course_id: courseId,
+     semester,
+@@ -227,6 +227,8 @@ export async function generateSchedule(
+     ...extraPayload,
+   }
+ 
++  if (schoolYear) payload.school_year = schoolYear
++
+   if (Array.isArray(yearOrYears)) {
+     payload.years = yearOrYears
+   } else if (typeof yearOrYears === 'number') {
+@@ -244,17 +246,20 @@ export async function generateSchedule(
+   })
+ }
+ 
+-export async function saveSchedule(courseId, year, semester, items) {
++export async function saveSchedule(courseId, year, semester, items, schoolYear = null) {
++  const payload = { course_id: courseId, year, semester, items }
++  if (schoolYear) payload.school_year = schoolYear
+   return apiCall('/schedule/save', {
+     method: 'POST',
+-    body: JSON.stringify({ course_id: courseId, year, semester, items }),
++    body: JSON.stringify(payload),
+   })
+ }
+ 
+-export async function loadSchedule(courseId, semester, year = null, instructorId = null) {
++export async function loadSchedule(courseId, semester, year = null, instructorId = null, schoolYear = null) {
+   const params = new URLSearchParams({ course_id: courseId, semester })
+   if (year !== null) params.append('year', year)
+   if (instructorId) params.append('instructor_id', instructorId)
++  if (schoolYear) params.append('school_year', schoolYear)
+   return apiCall(`/schedule/load?${params.toString()}`)
+ }
+ 
+@@ -266,10 +271,11 @@ export async function loadSchedule(courseId, semester, year = null, instructorId
+  * @param {number|null} semester - Optional semester filter (1 or 2)
+  * @returns {Promise<{status: string, items: Array, course_ids: Array<number>, count: number}>}
+  */
+-export async function loadInstructorSchedules(instructorId, semester = null) {
++export async function loadInstructorSchedules(instructorId, semester = null, schoolYear = null) {
+   if (!instructorId) throw new Error('Missing instructorId')
+   const params = new URLSearchParams({ instructor_id: instructorId })
+   if (semester !== null) params.append('semester', semester)
++  if (schoolYear) params.append('school_year', schoolYear)
+   return apiCall(`/schedule/load-instructor?${params.toString()}`)
+ }
+ 
+@@ -279,8 +285,9 @@ export async function getInstructorWorkload(instructorId, semester) {
+   return apiCall(`/instructors/${encodeURIComponent(instructorId)}/workload?${params.toString()}`)
+ }
+ 
+-export async function deleteSchedule(courseId, year, semester) {
++export async function deleteSchedule(courseId, year, semester, schoolYear = null) {
+   const params = new URLSearchParams({ course_id: courseId, year, semester })
++  if (schoolYear) params.append('school_year', schoolYear)
+   return apiCall(`/schedule/delete?${params.toString()}`, { method: 'DELETE' })
+ }
+ 
+@@ -294,12 +301,13 @@ export async function getScheduleStatus(jobId) {
+   })
+ }
+ 
+-export async function getRoomSchedule(roomId, semester, dayId = null) {
++export async function getRoomSchedule(roomId, semester, dayId = null, schoolYear = null) {
+   const params = new URLSearchParams({
+     room_id: roomId,
+     semester: semester
+   })
+   if (dayId) params.append('day_id', dayId)
++  if (schoolYear) params.append('school_year', schoolYear)
+ 
+   return apiCall(`/schedule/room?${params.toString()}`)
+ }
+@@ -393,8 +401,11 @@ export async function getSwapRequestPendingCount(instructorId) {
+   return apiCall(`/swap-requests/pending-count?instructor_id=${instructorId}`)
+ }
+ 
+-export async function getAdminStats(semester = 1, departmentId = "") {
+-  return apiCall(`/stats/admin?semester=${semester}${departmentId ? `&department_id=${departmentId}` : ""}`)
++export async function getAdminStats(semester = 1, departmentId = "", schoolYear = "") {
++  let url = `/stats/admin?semester=${semester}`
++  if (departmentId) url += `&department_id=${departmentId}`
++  if (schoolYear) url += `&school_year=${encodeURIComponent(schoolYear)}`
++  return apiCall(url)
+ }
+ 
+ export async function getSchedulingSuggestions(subjectId, courseId, year, semester) {

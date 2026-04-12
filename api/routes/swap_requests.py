@@ -56,11 +56,14 @@ def search_swappable_schedules():
         if schedule_id:
             requester_schedule = session.query(Schedule).get(schedule_id)
         
-        # Build query for other instructors' schedules
+        # Build query for schedules available to swap with (including own schedules for self-swap)
         query = session.query(Schedule).filter(
-            Schedule.instructor_id != instructor_id,
             Schedule.instructor_id.isnot(None)
         )
+        
+        # Exclude the specific schedule being swapped (can't swap with itself)
+        if schedule_id:
+            query = query.filter(Schedule.id != schedule_id)
         
         # Filter by time range if provided
         time_range_start = data.get("time_range_start")
@@ -508,7 +511,7 @@ def format_swap_request(r):
 
 
 def format_schedule(s):
-    """Format a Schedule for API response"""
+    """Format a Schedule for API response."""
     return {
         "id": s.id,
         "subject_code": s.subject.code if s.subject else None,
@@ -520,9 +523,10 @@ def format_schedule(s):
     }
 
 
+
 @swap_requests_bp.route("/<int:request_id>/accept", methods=["POST"])
 def accept_swap_request(request_id):
-    """Accept a swap request and execute the swap"""
+    """Accept a swap request and execute the swap."""
     session = SessionLocal()
     try:
         swap_request = session.query(SwapRequest).get(request_id)
@@ -546,7 +550,6 @@ def accept_swap_request(request_id):
             return jsonify({"error": "Swap would create conflicts", "conflicts": conflicts}), 400
         
         # Execute the swap - exchange time, day, and room
-        # Store original values
         a_day_id = schedule_a.day_id
         a_time = schedule_a.time
         a_room_id = schedule_a.room_id
@@ -555,7 +558,6 @@ def accept_swap_request(request_id):
         b_time = schedule_b.time
         b_room_id = schedule_b.room_id
         
-        # Swap the values
         schedule_a.day_id = b_day_id
         schedule_a.time = b_time
         schedule_a.room_id = b_room_id

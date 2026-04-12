@@ -74,6 +74,22 @@ def _time_str_to_minutes(value: str) -> int:
     return hour * 60 + minute
 
 
+def _parse_12h_to_minutes(value: str) -> int:
+    """Parse '7:00 AM' or '1:30 PM' into minutes from midnight."""
+    value = (value or "").strip().upper()
+    match = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", value)
+    if not match:
+        raise ValueError(f"Cannot parse 12h time: {value}")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    period = match.group(3)
+    if hour == 12:
+        hour = 0 if period == "AM" else 12
+    elif period == "PM":
+        hour += 12
+    return hour * 60 + minute
+
+
 def _parse_time_range_minutes(time_label: str):
     label = (time_label or "").strip()
     if not label:
@@ -88,6 +104,20 @@ def _parse_time_range_minutes(time_label: str):
         .replace("–", "-")
         .replace("−", "-")
     )
+
+    # Try format: "7:00 AM - 8:30 AM" (12-hour with AM/PM)
+    match_12h = re.match(
+        r"(\d{1,2}:\d{2}\s*[AaPp][Mm])\s*-\s*(\d{1,2}:\d{2}\s*[AaPp][Mm])",
+        normalized,
+    )
+    if match_12h:
+        try:
+            start_min = _parse_12h_to_minutes(match_12h.group(1))
+            end_min = _parse_12h_to_minutes(match_12h.group(2))
+            if end_min > start_min:
+                return start_min, end_min
+        except Exception:
+            pass
 
     # Try format: "480-600" (minutes from midnight)
     match = re.match(r"^(\d+)\s*-\s*(\d+)$", normalized)
@@ -444,12 +474,18 @@ def get_instructor_workload(instructor_id: int):
             subjects = db.query(models.Subject).filter(models.Subject.id.in_(sorted(subject_ids))).all()
             subject_units_map = {s.id: int(s.unit or 0) for s in subjects}
             
-            # Count units for each schedule entry (each class/block counts its units)
+            # Count units per unique (subject, block) combination
+            # Each distinct class (same subject taught to different blocks) counts separately,
+            # but multiple day-entries for the same class should NOT multiply units.
+            seen_subject_blocks = set()
             for sched in schedules:
                 if sched.subject_id and sched.subject_id in subject_units_map:
-                    units_total += subject_units_map[sched.subject_id]
+                    block_key = (sched.subject_id, getattr(sched, 'block', None) or '')
+                    if block_key not in seen_subject_blocks:
+                        seen_subject_blocks.add(block_key)
+                        units_total += subject_units_map[sched.subject_id]
             
-            logger.info(f"Units calculation: {len(schedules)} schedule entries, {len(subjects)} unique subjects, total={units_total}")
+            logger.info(f"Units calculation: {len(schedules)} schedule entries, {len(seen_subject_blocks)} unique subject-blocks, {len(subjects)} unique subjects, total={units_total}")
 
         employment_type = (getattr(instructor, "employment_type", None) or "regular").strip().lower()
         designation = (getattr(instructor, "designation", None) or "").strip()
@@ -492,7 +528,7 @@ def get_instructor_workload(instructor_id: int):
                 "overload_hours": overload_hours,
                 "overload_pay_hours": overload_pay_hours,
                 "units_total": units_total,
-                "schedule_count": len(schedules),
+                "schedule_count": len(seen_subject_blocks) if subject_ids else 0,
                 "warnings": warnings,
             }
         )
@@ -699,6 +735,28 @@ def get_day(day_id: int):
         day = db.query(models.Day).filter(models.Day.id == day_id).first()
         if not day:
             return jsonify({"detail": "Day not found"}), 404
+        return jsonify(_serialize(day, schemas.DayResponse))
+
+
+@entities_bp.route("/days/<int:day_id>", methods=["PUT"])
+def update_day(day_id: int):
+    payload = request.get_json(force=True) or {}
+    try:
+        day_update = schemas.DayUpdate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        day = db.query(models.Day).filter(models.Day.id == day_id).first()
+        if not day:
+            return jsonify({"detail": "Day not found"}), 404
+
+        data = day_update.model_dump(exclude_unset=True)
+        for key, value in data.items():
+            setattr(day, key, value)
+
+        db.commit()
+        db.refresh(day)
         return jsonify(_serialize(day, schemas.DayResponse))
 
 

@@ -36,6 +36,7 @@ def get_room_schedule():
     room_id = request.args.get("room_id", type=int)
     semester = request.args.get("semester", type=int)
     day_id = request.args.get("day_id", type=int)
+    school_year = request.args.get("school_year", type=str)
     
     if not room_id or not semester:
          return jsonify({"detail": "room_id and semester are required"}), 400
@@ -46,6 +47,8 @@ def get_room_schedule():
             models.Schedule.room_id == room_id,
             models.Schedule.semester == semester
         )
+        if school_year:
+            query = query.filter(models.Schedule.school_year == school_year)
         
         if day_id:
             query = query.filter(models.Schedule.day_id == day_id)
@@ -207,6 +210,7 @@ def generate_schedule():
                 for override in (schedule_request.block_capacities or [])
             ],
             "blocks_count": schedule_request.blocks_count,
+            "school_year": schedule_request.school_year,
         }
 
         job_id, already_queued = queue_manager.enqueue(queue_key, job_payload)
@@ -364,6 +368,7 @@ def save_schedule_route():
             year=save_request.year,
             semester=save_request.semester,
             schedule_items=schedule_items,
+            school_year=save_request.school_year,
         )
         return jsonify(
             {
@@ -389,6 +394,7 @@ def load_schedule_route():
 
     year = request.args.get("year", type=int)
     instructor_id = request.args.get("instructor_id", type=int)
+    school_year = request.args.get("school_year", type=str)
 
     # Check if there's an active job for this course/semester
     active_job_id = queue_manager.find_active_job_for_course(course_id, semester)
@@ -409,6 +415,7 @@ def load_schedule_route():
                 year=year,
                 semester=semester,
                 instructor_id=instructor_id,
+                school_year=school_year,
             )
             items = [
                 {
@@ -509,6 +516,7 @@ def load_instructor_schedule():
         return response, 400
     
     semester = request.args.get("semester", type=int)
+    school_year = request.args.get("school_year", type=str)
     
     db = _get_session()
     try:
@@ -519,6 +527,8 @@ def load_instructor_schedule():
         )
         if semester is not None:
             query = query.filter(models.Schedule.semester == semester)
+        if school_year:
+            query = query.filter(models.Schedule.school_year == school_year)
         
         query = query.order_by(
             models.Schedule.course_id,
@@ -586,17 +596,18 @@ def delete_schedule():
     except ValueError:
         return jsonify({"detail": "course_id, year, and semester must be integers"}), 400
 
+    school_year = request.args.get("school_year", type=str)
+
     db = _get_session()
     try:
-        deleted = (
-            db.query(models.Schedule)
-            .filter(
-                models.Schedule.course_id == course_id,
-                models.Schedule.year == year,
-                models.Schedule.semester == semester,
-            )
-            .delete()
+        query = db.query(models.Schedule).filter(
+            models.Schedule.course_id == course_id,
+            models.Schedule.year == year,
+            models.Schedule.semester == semester,
         )
+        if school_year:
+            query = query.filter(models.Schedule.school_year == school_year)
+        deleted = query.delete()
         db.commit()
         return jsonify(
             {

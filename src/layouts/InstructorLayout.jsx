@@ -133,10 +133,6 @@ export default function InstructorLayout() {
 								</svg>
 							)}
 						</button>
-						{/* Notifications */}
-						<button className="relative rounded-full w-14 h-14 bg-white/90 border border-white/60 shadow hover:shadow-lg transition-all duration-300" title="Notifications" onClick={() => navigate('/i/notifications')}>
-							<img src="/assets/notification-bell.png" alt="Notifications" className="absolute inset-0 m-auto w-6 h-6 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
-						</button>
 					</div>
 					{isDashboard ? (
 						<Outlet context={{ mustChangeCredentials, isDark }} />

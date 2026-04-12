@@ -149,6 +149,10 @@ class DayCreate(BaseModel):
     label: str
 
 
+class DayUpdate(BaseModel):
+    label: Optional[str] = None
+
+
 class DayResponse(BaseModel):
     id: int
     label: str
@@ -312,6 +316,7 @@ class ScheduleItemResponse(BaseModel):
     year: int
     semester: int
     block: Optional[str] = None
+    school_year: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -329,6 +334,7 @@ class ScheduleGenerateRequest(BaseModel):
     force_refit: Optional[bool] = False  # Force re-run clustering even if cache exists
     block_capacities: Optional[List["BlockCapacityOverride"]] = None  # Optional per-block capacity overrides
     blocks_count: Optional[int] = None  # Optional number of student blocks (A/B/...) per course/year
+    school_year: Optional[str] = None  # e.g. "2025-2026"
 
 
 class BlockCapacityOverride(BaseModel):
@@ -345,6 +351,7 @@ class ScheduleSaveRequest(BaseModel):
     course_id: int
     year: int
     semester: int
+    school_year: Optional[str] = None
     items: List[ScheduleItemCreate]
 
 
@@ -363,3 +370,4 @@ class ScheduleValidationRequest(BaseModel):
     semester: int
     block: Optional[str] = None
     merge_tag: Optional[str] = None  # If set, entries with same merge_tag are exempt from conflicts
+    school_year: Optional[str] = None

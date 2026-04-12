@@ -4,26 +4,35 @@ from typing import List, Dict, Tuple
 from datetime import time
 
 # Registrar-provided time windows (shared across all days)
+# Clean grid: All slots start at 7:30 AM. Each time has a 1-hour and 1.5-hour variant.
+# Lunch break: 12:00 PM - 1:00 PM
+# NSTP uses a dedicated 3-hour Sunday block (8:00-11:00).
 TIME_BLOCKS = [
-    {"label": "7:00–8:30", "start": "07:00", "end": "08:30", "is_lab": False},
-    {"label": "7:30–8:30", "start": "07:30", "end": "08:30", "is_lab": False},
-    {"label": "7:30–9:00", "start": "07:30", "end": "09:00", "is_lab": True},
-    {"label": "8:00–9:00", "start": "08:00", "end": "09:00", "is_lab": False},
-    {"label": "8:30–10:00", "start": "08:30", "end": "10:00", "is_lab": False},
+    # === MORNING (7:30 AM - 12:00 PM) ===
+    # 1-hour slots (1-unit subjects)
+    {"label": "7:30–8:30",  "start": "07:30", "end": "08:30", "is_lab": False},
     {"label": "9:00–10:00", "start": "09:00", "end": "10:00", "is_lab": False},
+    {"label": "10:30–11:30","start": "10:30", "end": "11:30", "is_lab": False},
+    # 1.5-hour slots (2-unit LEC / LAB subjects)
+    {"label": "7:30–9:00",  "start": "07:30", "end": "09:00", "is_lab": True},
     {"label": "9:00–10:30", "start": "09:00", "end": "10:30", "is_lab": True},
-    {"label": "9:00–12:00", "start": "09:00", "end": "12:00", "is_lab": False},
-    {"label": "10:30–11:30", "start": "10:30", "end": "11:30", "is_lab": False},
-    {"label": "10:30–12:00", "start": "10:30", "end": "12:00", "is_lab": True},
-    {"label": "11:00–12:00", "start": "11:00", "end": "12:00", "is_lab": False},
-    {"label": "1:00–2:00", "start": "13:00", "end": "14:00", "is_lab": False},
-    {"label": "1:00–2:30", "start": "13:00", "end": "14:30", "is_lab": False},
-    {"label": "1:00–3:00", "start": "13:00", "end": "15:00", "is_lab": False},
-    {"label": "2:00–3:00", "start": "14:00", "end": "15:00", "is_lab": False},
-    {"label": "2:30–4:00", "start": "14:30", "end": "16:00", "is_lab": True},
-    {"label": "3:00–5:00", "start": "15:00", "end": "17:00", "is_lab": False},
-    {"label": "4:00–5:30", "start": "16:00", "end": "17:30", "is_lab": True},
-    {"label": "5:30–7:00", "start": "17:30", "end": "19:00", "is_lab": False},
+    {"label": "10:30–12:00","start": "10:30", "end": "12:00", "is_lab": True},
+
+    # === AFTERNOON (1:00 PM - 5:30 PM) ===
+    # 1-hour slots
+    {"label": "1:00–2:00",  "start": "13:00", "end": "14:00", "is_lab": False},
+    {"label": "2:30–3:30",  "start": "14:30", "end": "15:30", "is_lab": False},
+    {"label": "4:00–5:00",  "start": "16:00", "end": "17:00", "is_lab": False},
+    # 1.5-hour slots
+    {"label": "1:00–2:30",  "start": "13:00", "end": "14:30", "is_lab": True},
+    {"label": "2:30–4:00",  "start": "14:30", "end": "16:00", "is_lab": True},
+    {"label": "4:00–5:30",  "start": "16:00", "end": "17:30", "is_lab": True},
+
+    # === EVENING ===
+    {"label": "5:30–7:00",  "start": "17:30", "end": "19:00", "is_lab": False},
+
+    # === NSTP (Sunday 3-hour block) ===
+    {"label": "8:00–11:00", "start": "08:00", "end": "11:00", "is_lab": False},
 ]
 
 
@@ -72,9 +81,15 @@ def is_consecutive_blocks(block_indices: List[int]) -> bool:
     if len(block_indices) < 2:
         return True
     
+    max_idx = len(TIME_BLOCKS) - 1
+    
     for i in range(len(block_indices) - 1):
         curr_idx = block_indices[i]
         next_idx = block_indices[i + 1]
+        
+        # Bounds check — reject if indices exceed available TIME_BLOCKS
+        if curr_idx > max_idx or next_idx > max_idx or curr_idx < 0 or next_idx < 0:
+            return False
         
         # Get end time of current block and start time of next block
         curr_end = time_to_minutes(TIME_BLOCKS[curr_idx]["end"])

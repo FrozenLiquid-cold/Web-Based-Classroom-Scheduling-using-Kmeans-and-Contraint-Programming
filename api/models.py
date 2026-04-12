@@ -233,6 +233,7 @@ class Schedule(Base):
     year = Column(Integer, nullable=False)  # 1, 2, 3, 4
     semester = Column(Integer, nullable=False)  # 1, 2
     block = Column(String(50), nullable=True)
+    school_year = Column(String(10), nullable=False, server_default="2025-2026")  # e.g. "2025-2026"
     merge_tag = Column(String(200), nullable=True)  # e.g. "[M] CC101+IAS1" — set on schedule entries during merge
     
     subject = relationship("Subject", back_populates="schedules")
@@ -242,10 +243,13 @@ class Schedule(Base):
     day = relationship("Day", back_populates="schedules")
     
     __table_args__ = (
-        # Prevent double-booking: same room, day, time, year, semester
-        UniqueConstraint("room_id", "day_id", "time", "year", "semester", name="uq_room_time"),
-        # Prevent instructor conflicts: same instructor, day, time, year, semester
-        UniqueConstraint("instructor_id", "day_id", "time", "year", "semester", name="uq_instructor_time"),
+        # Prevent double-booking: same room, day, time, year, semester, school_year, block, course
+        # course_id is included so shared rooms (FIELD, GYM) can host NSTP from multiple courses
+        UniqueConstraint("room_id", "day_id", "time", "year", "semester", "school_year", "block", "course_id", name="uq_room_time_sy"),
+        # Prevent instructor conflicts: same instructor, day, time, year, semester, school_year, block, course
+        # course_id included because NSTP instructors teach multiple courses simultaneously (mass activity)
+        # The CP scheduler enforces real instructor non-overlap for non-NSTP subjects
+        UniqueConstraint("instructor_id", "day_id", "time", "year", "semester", "school_year", "block", "course_id", name="uq_instructor_time_sy"),
     )
 
 

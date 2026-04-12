@@ -45,6 +45,53 @@ def validate_schedule_item():
         day_label_map = {d.id: d.label for d in all_days}
         DAY_FULL_NAMES = {"M": "Monday", "T": "Tuesday", "W": "Wednesday", "TH": "Thursday", "F": "Friday", "SAT": "Saturday", "SUN": "Sunday"}
 
+        # SELF-EXCLUSION: For MW/TTH subjects, a single UI row maps to MULTIPLE
+        # DB records (one per day).  We must exclude ALL of them so the item
+        # doesn't conflict with itself.
+        exclude_ids = set()
+        if req.id:
+            exclude_ids.add(req.id)
+            # Find the record we are editing
+            self_record = db.query(models.Schedule).get(req.id)
+            if self_record:
+                # Find sibling records (same subject, block, course, semester,
+                # year, school_year — only day_id differs for MW/TTH pairs).
+                # NOTE: We intentionally do NOT filter by time here because when
+                # rescheduling, the user may be changing the time, so the new
+                # proposed time won't match the old DB time.
+                sibling_q = db.query(models.Schedule.id).filter(
+                    models.Schedule.subject_id == self_record.subject_id,
+                    models.Schedule.course_id == self_record.course_id,
+                    models.Schedule.semester == self_record.semester,
+                    models.Schedule.year == self_record.year,
+                    models.Schedule.school_year == self_record.school_year,
+                )
+                if self_record.block is not None:
+                    sibling_q = sibling_q.filter(models.Schedule.block == self_record.block)
+                for (sid,) in sibling_q.all():
+                    exclude_ids.add(sid)
+                logger.info(f"Self-exclusion (id={req.id}): excluding {len(exclude_ids)} DB records for subject {self_record.subject_id} block {self_record.block}")
+        elif req.subject_id:
+            # No explicit DB ID → this is a generated/unsaved schedule item.
+            # The user is working on a regenerated schedule that hasn't been saved
+            # yet.  When they save, ALL old DB records for this course/year/semester
+            # will be REPLACED.  So we must exclude ALL of them to avoid false
+            # conflicts with stale data (e.g. old CC 101 entry conflicting with
+            # new CC 102 that was moved to that slot).
+            # The frontend's local conflict check already handles intra-schedule
+            # conflicts between the in-memory items.
+            stale_q = db.query(models.Schedule.id).filter(
+                models.Schedule.course_id == req.course_id,
+                models.Schedule.semester == req.semester,
+                models.Schedule.year == req.year,
+            )
+            if req.school_year:
+                stale_q = stale_q.filter(models.Schedule.school_year == req.school_year)
+            for (sid,) in stale_q.all():
+                exclude_ids.add(sid)
+            if exclude_ids:
+                logger.info(f"Self-exclusion (no id): excluding {len(exclude_ids)} stale DB records for course {req.course_id} year {req.year} sem {req.semester} sy {req.school_year}")
+
         # Pydantic has handled basic type checks
         # Decide which days to check: prefer day_ids if present, else day_id
         days_to_check = req.day_ids if req.day_ids else [req.day_id]
@@ -83,19 +130,10 @@ def validate_schedule_item():
                  models.Schedule.day_id == check_day_id,
                  models.Schedule.semester == req.semester,
                  models.Schedule.year == req.year  
-                 # Filtering by year here assumes we only check conflicts within same academic year schedule
-                 # However, room/instructor conflicts are global across years.
-                 # Let's relax year filter for Room and Instructor checks? 
-                 # Usually scheduling is done per semester/term, so `semester` is key overlap.
-                 # If instructor teaches 1st Year course and 4th Year course, they conflict regardless of 'year' field.
-                 # BUT, the `models.Schedule` usually contains ALL active schedules for the active term.
-                 # So filtering by `semester` is correct. Filtering by `year` (year level) is WRONG for global resources.
-                 # Let's FIX this: Remove year filter for global resources (Room, Instructor).
-                 # Keep year filter for Student Group (since meaningful student blocks are per year level).
              ).filter(models.Schedule.semester == req.semester)
 
-             if req.id:
-                 query = query.filter(models.Schedule.id != req.id)
+             if exclude_ids:
+                 query = query.filter(models.Schedule.id.notin_(exclude_ids))
 
              # 1. Check Room Conflict (Active Term Global Resource)
              if req.room_id and not is_field_room:
@@ -105,12 +143,15 @@ def validate_schedule_item():
                      models.Schedule.day_id == check_day_id,
                      models.Schedule.semester == req.semester,
                      models.Schedule.room_id == req.room_id
-                 ).options(
+                 )
+                 if req.school_year:
+                     room_query = room_query.filter(models.Schedule.school_year == req.school_year)
+                 room_query = room_query.options(
                      joinedload(models.Schedule.course),
                      joinedload(models.Schedule.subject)
                  )
-                 if req.id:
-                     room_query = room_query.filter(models.Schedule.id != req.id)
+                 if exclude_ids:
+                     room_query = room_query.filter(models.Schedule.id.notin_(exclude_ids))
                      
                  room_conflicts = room_query.all()
                  # Exclude entries sharing the same merge_tag (merged entries exempt)
@@ -141,12 +182,15 @@ def validate_schedule_item():
                      models.Schedule.day_id == check_day_id,
                      models.Schedule.semester == req.semester,
                      models.Schedule.instructor_id == req.instructor_id
-                 ).options(
+                 )
+                 if req.school_year:
+                     instr_query = instr_query.filter(models.Schedule.school_year == req.school_year)
+                 instr_query = instr_query.options(
                      joinedload(models.Schedule.course),
                      joinedload(models.Schedule.subject)
                  )
-                 if req.id:
-                     instr_query = instr_query.filter(models.Schedule.id != req.id)
+                 if exclude_ids:
+                     instr_query = instr_query.filter(models.Schedule.id.notin_(exclude_ids))
 
                  instr_conflicts = instr_query.all()
                  # Exclude entries sharing the same merge_tag (merged entries exempt)
@@ -227,8 +271,8 @@ def validate_schedule_item():
              ).options(
                  joinedload(models.Schedule.subject)
              )
-             if req.id:
-                 student_query = student_query.filter(models.Schedule.id != req.id)
+             if exclude_ids:
+                 student_query = student_query.filter(models.Schedule.id.notin_(exclude_ids))
 
              if req.block and hasattr(models.Schedule, 'block'):
                  student_query = student_query.filter(models.Schedule.block == req.block)

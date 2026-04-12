@@ -1,12 +1,11 @@
 import { useState, useEffect, useMemo } from 'react'
 import { getRoomSchedule, list } from '../../services/api'
 
-// Master time slots from 7:00 AM to 7:00 PM (based on registrar time blocks)
+// Master time slots from 7:30 AM to 7:00 PM (based on registrar time blocks)
 const MASTER_TIME_SLOTS = [
-    { label: "7:00 AM – 8:30 AM", start: 420, end: 510 },
-    { label: "8:30 AM – 10:00 AM", start: 510, end: 600 },
-    { label: "10:00 AM – 11:30 AM", start: 600, end: 690 },
-    { label: "11:30 AM – 1:00 PM", start: 690, end: 780 },
+    { label: "7:30 AM – 9:00 AM", start: 450, end: 540 },
+    { label: "9:00 AM – 10:30 AM", start: 540, end: 630 },
+    { label: "10:30 AM – 12:00 PM", start: 630, end: 720 },
     { label: "1:00 PM – 2:30 PM", start: 780, end: 870 },
     { label: "2:30 PM – 4:00 PM", start: 870, end: 960 },
     { label: "4:00 PM – 5:30 PM", start: 960, end: 1050 },
@@ -134,7 +133,7 @@ export default function RoomSchedule() {
         if (!scheduleData) return [];
 
         try {
-            const START_OF_DAY = 7 * 60; // 7:00 AM
+            const START_OF_DAY = 7 * 60 + 30; // 7:30 AM
             const END_OF_DAY = 19 * 60;  // 7:00 PM
 
             const formatRange = (s, e) => `${minutesToTime(s)} – ${minutesToTime(e)}`;
@@ -151,7 +150,7 @@ export default function RoomSchedule() {
             });
 
             // Checkpoints for standard slots
-            const SLOT_BOUNDARIES = [510, 600, 690, 780, 870, 960, 1050, 1140];
+            const SLOT_BOUNDARIES = [540, 630, 720, 780, 870, 960, 1050, 1140];
 
             const pushVacantSlots = (timeline, start, end, day) => {
                 if (start >= end) return;
@@ -330,7 +329,7 @@ export default function RoomSchedule() {
                             Full Day Schedule
                             {fetchingSchedule && <span className="text-xs font-normal text-blue-500 animate-pulse bg-blue-50 px-2 py-0.5 rounded-full">Updating...</span>}
                         </h2>
-                        <p className="text-sm text-slate-500 mt-1">7:00 AM – 7:00 PM time slots</p>
+                        <p className="text-sm text-slate-500 mt-1">7:30 AM – 7:00 PM time slots</p>
                     </div>
                 </div>
 

@@ -1,0 +1,20 @@
+2026-04-05 01:52:52,503 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 16 (CC 101) auto-scheduled: Automatically scheduled using recommendation: GS ER 2 on M-W at 10:30 AM - 11:30 AM with Instructor 36
+2026-04-05 01:52:52,539 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 27 (CC 101) auto-scheduled: Automatically scheduled using recommendation: GS ER 1 on M-W at 8:30 AM - 10:00 AM with Instructor 36
+2026-04-05 01:53:31,591 - api.scheduler.cp_scheduler - INFO - [DIAGNOSTICS FALLBACK] Checking 16 subjects. Scheduled clones: 16
+2026-04-05 01:57:51,874 - api.scheduler.cp_scheduler - INFO - [DIAGNOSTICS FALLBACK] Checking 27 subjects. Scheduled clones: 26
+2026-04-05 01:57:52,331 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 440 (GE - AA) auto-scheduled: Automatically scheduled using recommendation: GS ER 1 on T-TH at 7:00 AM - 8:30 AM with Instructor 3
+2026-04-05 01:57:52,527 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 580 (GE - PC) auto-scheduled: Automatically scheduled using recommendation: Bio Lab on T-TH at 9:00 AM - 10:00 AM with Instructor 3
+2026-04-05 03:32:01,077 - api.scheduler.cp_scheduler - INFO - [DIAGNOSTICS FALLBACK] Checking 27 subjects. Scheduled clones: 26
+2026-04-05 03:32:01,235 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 440 (GE - AA) auto-scheduled: Automatically scheduled using recommendation: GS ER 1 on T-TH at 7:00 AM - 8:30 AM with Instructor 3
+2026-04-05 03:32:01,338 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 580 (GE - PC) auto-scheduled: Automatically scheduled using recommendation: Bio Lab on T-TH at 9:00 AM - 10:00 AM with Instructor 3
+2026-04-05 21:30:59,437 - api.scheduler.cp_scheduler - INFO - [DIAGNOSTICS FALLBACK] Checking 27 subjects. Scheduled clones: 23
+2026-04-05 21:30:59,803 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 440 (GE - AA) auto-scheduled: Automatically scheduled using recommendation: Bio Lab on T-TH at 9:00 AM - 10:00 AM with John Doe
+2026-04-05 21:30:59,896 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 587 (GE - AA) auto-scheduled: Automatically scheduled using recommendation: GS ER 1 on T-TH at 7:00 AM - 8:30 AM with John Doe
+2026-04-05 22:16:44,968 - api.scheduler.cp_scheduler - INFO - [DIAGNOSTICS FALLBACK] Checking 27 subjects. Scheduled clones: 26
+2026-04-05 22:16:45,263 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 587 (GE - AA) auto-scheduled: Automatically scheduled using recommendation: Bio Lab on T-TH at 9:00 AM - 10:00 AM with John Doe
+2026-04-05 22:16:45,772 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 286 (GE - PC) auto-scheduled: Automatically scheduled using recommendation: GS ER 1 on T-TH at 7:00 AM - 8:30 AM with John Doe
+2026-04-06 00:45:22,883 - api.scheduler.cp_scheduler - INFO - [DIAGNOSTICS FALLBACK] Checking 27 subjects. Scheduled clones: 26
+2026-04-06 00:45:23,413 - api.scheduler.cp_scheduler - INFO - [REC FLOW] Clone 587 (orig=146, block=C): is_newly_discovered=True, recs=15
+2026-04-06 00:45:23,446 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 587 (GE - AA) block C: Automatically scheduled using recommendation: Bio Lab on T-TH at 9:00 AM - 10:00 AM with John Doe
+2026-04-06 00:45:23,737 - api.scheduler.cp_scheduler - INFO - [REC FLOW] Clone 580 (orig=139, block=C): is_newly_discovered=True, recs=15
+2026-04-06 00:45:23,758 - api.scheduler.cp_scheduler - INFO - [RECOMMENDATION APPLIED] Subject 580 (GE - PC) block C: Automatically scheduled using recommendation: GS ER 1 on T-TH at 7:00 AM - 8:30 AM with John Doe

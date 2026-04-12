@@ -23,6 +23,40 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _time_str_to_minutes(t: str) -> Optional[int]:
+    """Convert time string like '9:00 AM' or '14:30' to minutes from midnight."""
+    t = t.strip().upper()
+    match = re.match(r'^(\d{1,2}):(\d{2})\s*(AM|PM)?$', t)
+    if not match:
+        return None
+    h, m = int(match.group(1)), int(match.group(2))
+    ampm = match.group(3)
+    if ampm == 'PM' and h != 12:
+        h += 12
+    elif ampm == 'AM' and h == 12:
+        h = 0
+    return h * 60 + m
+
+
+def _parse_time_range_to_minutes(time_label: str):
+    """Parse a time range string like '9:00 AM - 10:30 AM' or 'SUN 8:00–11:00' 
+    into (start_min, end_min). Returns (None, None) on failure."""
+    label = (time_label or "").strip()
+    if not label:
+        return None, None
+    # Strip leading day prefix (M, T, W, TH, F, SAT, SUN, MON, etc.)
+    label = re.sub(r'^(MON|TUE|WED|THU|FRI|SAT|SUN|M|T|W|TH|F)\s+', '', label, flags=re.IGNORECASE)
+    # Normalize dashes
+    normalized = label.replace("—", "-").replace("–", "-").replace("−", "-")
+    parts = [p.strip() for p in normalized.split("-") if p.strip()]
+    if len(parts) != 2:
+        return None, None
+    start = _time_str_to_minutes(parts[0])
+    end = _time_str_to_minutes(parts[1])
+    if start is None or end is None or end <= start:
+        return None, None
+    return start, end
+
 
 def run_scheduler(
     db: Session,
@@ -298,7 +332,7 @@ def run_scheduler(
             # Helper to normalize time strings for matching (handle different dash types)
             def normalize_time_str(s):
                 if not s: return ""
-                return s.replace("–", "-").replace("—", "-").replace(" ", "").upper()
+                return s.replace("–", "-").replace("—", "-").replace(" ", "").upper().replace("AM", "").replace("PM", "")
 
             # Create lookup map for normalized time labels -> (start_min, end_min)
             # We map standard block labels to their true minute ranges
@@ -660,7 +694,8 @@ def save_schedule(
     course_id: int,
     year: int,
     semester: int,
-    schedule_items: List[Dict]
+    schedule_items: List[Dict],
+    school_year: Optional[str] = None,
 ) -> List[models.Schedule]:
     """
     Save schedule to database
@@ -671,16 +706,20 @@ def save_schedule(
         year: Year level
         semester: Semester
         schedule_items: List of schedule item dicts
+        school_year: Academic year string e.g. "2025-2026"
     
     Returns:
         List of saved Schedule models
     """
-    # Delete existing schedule for this course/year/semester
-    db.query(models.Schedule).filter(
+    # Delete existing schedule for this course/year/semester (and school_year if given)
+    delete_query = db.query(models.Schedule).filter(
         models.Schedule.course_id == course_id,
         models.Schedule.year == year,
         models.Schedule.semester == semester
-    ).delete()
+    )
+    if school_year:
+        delete_query = delete_query.filter(models.Schedule.school_year == school_year)
+    delete_query.delete()
     
     # Create new schedule entries
     schedules = []
@@ -755,16 +794,98 @@ def save_schedule(
         if len(schedules) < 3:
             logger.info(f"[SAVE] Saving subject {subject_id}: day_id={day_id}, time={time_str}, room_id={item.get('room_id')}, instructor_id={item.get('instructor_id')}, block={block_value}")
         
+        _sy = school_year or "2025-2026"
+        _block_str = str(block_value) if block_value is not None else None
+        _room_id = item.get("room_id")
+
+        # CONFLICT PREVENTION (First-Saved-First-Served):
+        # Check if this item conflicts with an already-saved schedule from another course.
+        # If so, SKIP this item (don't save it) rather than deleting the existing record.
+        # This preserves previously-saved courses' schedules.
+        # IMPORTANT: Skip conflict checks for shared rooms (FIELD, GYM, COURT).
+        room_id = item.get("room_id")
+        _start_min = item.get("start_min")
+        _end_min = item.get("end_min")
+        _instr_id = item.get("instructor_id")
+        
+        has_cross_course_conflict = False
+        conflict_reason = None
+        
+        if room_id is not None and day_id is not None and room_id not in _shared_room_ids:
+            if _start_min is not None and _end_min is not None:
+                try:
+                    # Check for room overlap with OTHER courses
+                    existing_records = db.query(models.Schedule).filter(
+                        models.Schedule.room_id == _room_id,
+                        models.Schedule.day_id == day_id,
+                        models.Schedule.year == year,
+                        models.Schedule.semester == semester,
+                        models.Schedule.school_year == _sy,
+                        models.Schedule.course_id != course_id,
+                    ).all()
+                    
+                    for rec in existing_records:
+                        rec_time = (rec.time or "").strip()
+                        rec_start, rec_end = _parse_time_range_to_minutes(rec_time)
+                        if rec_start is not None and rec_end is not None:
+                            if not (_end_min <= rec_start or _start_min >= rec_end):
+                                has_cross_course_conflict = True
+                                conflict_reason = (f"Room conflict: room={_room_id} day={day_id} "
+                                                 f"existing=[{rec_start}-{rec_end}] (course {rec.course_id}) "
+                                                 f"new=[{_start_min}-{_end_min}] (course {course_id})")
+                                break
+                        elif time_str and rec_time == time_str:
+                            has_cross_course_conflict = True
+                            conflict_reason = f"Room conflict (exact match): room={_room_id} day={day_id}"
+                            break
+                except Exception as e:
+                    logger.warning(f"[SAVE] Error checking room conflicts: {e}")
+        
+        # Also check instructor overlap with OTHER courses (skip for shared rooms / NSTP instructors)
+        if not has_cross_course_conflict and _instr_id is not None and day_id is not None:
+            if _start_min is not None and _end_min is not None:
+                try:
+                    existing_instr = db.query(models.Schedule).filter(
+                        models.Schedule.instructor_id == _instr_id,
+                        models.Schedule.day_id == day_id,
+                        models.Schedule.year == year,
+                        models.Schedule.semester == semester,
+                        models.Schedule.school_year == _sy,
+                        models.Schedule.course_id != course_id,
+                    ).all()
+                    
+                    for rec in existing_instr:
+                        rec_time = (rec.time or "").strip()
+                        rec_start, rec_end = _parse_time_range_to_minutes(rec_time)
+                        if rec_start is not None and rec_end is not None:
+                            if not (_end_min <= rec_start or _start_min >= rec_end):
+                                has_cross_course_conflict = True
+                                conflict_reason = (f"Instructor conflict: instr={_instr_id} day={day_id} "
+                                                 f"existing=[{rec_start}-{rec_end}] (course {rec.course_id}) "
+                                                 f"new=[{_start_min}-{_end_min}] (course {course_id})")
+                                break
+                except Exception as e:
+                    logger.warning(f"[SAVE] Error checking instructor conflicts: {e}")
+        
+        if has_cross_course_conflict:
+            logger.warning(f"[SAVE SKIP] First-saved-first-served: {conflict_reason}")
+            skipped_duplicates.append({
+                "skipped_item": item,
+                "reason": conflict_reason,
+            })
+            continue
+
         schedule = models.Schedule(
             course_id=course_id,
             year=year,
             semester=semester,
             subject_id=subject_id,
             instructor_id=item.get("instructor_id"),
-            room_id=item.get("room_id"),
+            room_id=_room_id,
             day_id=day_id,  # Use solver's day_id, NOT subject default
             time=time_str,  # Use solver's time, NOT subject default
-            block=str(block_value) if block_value is not None else None,
+            block=_block_str,
+            school_year=_sy,
         )
         db.add(schedule)
         schedules.append(schedule)
@@ -787,10 +908,11 @@ def load_schedule(
     course_id: int,
     year: int,
     semester: int,
-    instructor_id: Optional[int] = None
+    instructor_id: Optional[int] = None,
+    school_year: Optional[str] = None,
 ) -> List[models.Schedule]:
     """
-    Load schedule from database using stored procedure for optimization.
+    Load schedule from database.
     
     Args:
         db: Database session
@@ -798,12 +920,11 @@ def load_schedule(
         year: Year level
         semester: Semester
         instructor_id: Optional instructor ID to filter by
+        school_year: Optional academic year string to filter by
     
     Returns:
         List of Schedule models
     """
-    # IMPORTANT: Query directly from the Schedule table so we always include
-    # the latest columns (e.g., the "block" field used for A/B/C blocks).
     query = db.query(models.Schedule).filter(
         models.Schedule.course_id == course_id,
         models.Schedule.year == year,
@@ -812,6 +933,8 @@ def load_schedule(
 
     if instructor_id is not None:
         query = query.filter(models.Schedule.instructor_id == instructor_id)
+    if school_year:
+        query = query.filter(models.Schedule.school_year == school_year)
 
     return query.all()
 

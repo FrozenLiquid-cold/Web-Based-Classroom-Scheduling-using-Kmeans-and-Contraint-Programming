@@ -1,4 +1,4 @@
-import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { logout } from '../store/auth'
 
 const nav = [
@@ -97,7 +97,6 @@ function NavIcon({ label }) {
 }
 
 export default function RegistrarLayout() {
-    const navigate = useNavigate()
     const { pathname } = useLocation()
     const isDashboard = pathname === '/r/dashboard' || pathname === '/r'
     return (
@@ -126,17 +125,12 @@ export default function RegistrarLayout() {
                 {/* Logout moved to Users section */}
             </aside>
             <main className="flex-1 bg-[url('/assets/bg-circuit.png')] bg-cover bg-fixed">
-                <div className="p-6">
-                    <div className="flex justify-end items-center mb-4">
-                        <button className="relative rounded-full w-14 h-14 bg-white/90 border border-white/60 shadow hover:shadow-lg transition-all duration-300" title="Notifications" onClick={() => navigate('/r/user')}>
-                            <img src="/assets/notification-bell.png" alt="Notifications" className="absolute inset-0 m-auto w-6 h-6 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
-                        </button>
-                    </div>
+                <div className="p-2">
                     {isDashboard ? (
                         <Outlet />
                     ) : (
-                        <div className="bg-white/90 rounded-xl shadow p-6">
-                            <div className="h-[520px] overflow-auto pr-1 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
+                        <div className="bg-white/95 rounded-xl shadow p-4">
+                            <div className="h-[calc(100vh-48px)] overflow-auto pr-1 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
                                 <Outlet />
                             </div>
                         </div>

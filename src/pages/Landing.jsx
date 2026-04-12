@@ -25,7 +25,7 @@ export default function Landing() {
 					<div className="text-green-600 font-oswald uppercase text-3xl">JOSE RIZAL MEMORIAL STATE UNIVERSITY</div>
 					<div className="flex flex-col items-center space-y-1">
 						<div className="text-navy font-archivoBlack uppercase text-4xl">K-MEANS AND CONSTRAINT PROGRAMMING</div>
-						<div className="text-navy font-archivoBlack uppercase text-4xl">CLASSROOM SCHEDULING SYSTEM</div>
+						<div className="text-navy font-archivoBlack uppercase text-4xl">INTELLIGENT TIMETABLING SYSTEM</div>
 					</div>
 					<div className="grid grid-cols-3 gap-16 max-w-5xl mx-auto pt-6">
 						{/* Admin */}

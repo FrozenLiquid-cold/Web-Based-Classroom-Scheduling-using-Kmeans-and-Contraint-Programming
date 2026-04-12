@@ -134,20 +134,75 @@ export default function Instructor() {
 		return college?.code || ''
 	}
 
+	// Build a map of code → all variant subjects (for showing descriptions)
+	const subjectVariantsMap = useMemo(() => {
+		const map = {} // normalised code → [{ code, description, type, unit, semester, id }]
+		for (const s of (subjects || [])) {
+			if (!s || !s.code) continue
+			const norm = s.code.trim().toUpperCase().replace(/\s+/g, ' ')
+			if (!map[norm]) map[norm] = { code: s.code, variants: [], semesters: new Set() }
+			// Avoid duplicate description+type combos
+			const key = `${(s.description || '').toLowerCase()}|${s.type}`
+			if (!map[norm].variants.find(v => `${(v.description || '').toLowerCase()}|${v.type}` === key)) {
+				map[norm].variants.push({ id: s.id, code: s.code, description: s.description, type: s.type, unit: s.unit, semester: s.semester })
+			}
+			if (s.semester) map[norm].semesters.add(s.semester)
+		}
+		return map
+	}, [subjects])
+
 	const subjectOptions = useMemo(() => {
 		const query = specializationSearch.trim().toLowerCase()
 		const selectedSet = new Set(specialization)
+		// Group subjects by normalised code and return one entry per code
+		const seen = new Set()
 		return (subjects || [])
 			.filter(s => {
 				if (!s || !s.code) return false
+				const norm = s.code.trim().toUpperCase().replace(/\s+/g, ' ')
+				if (seen.has(norm)) return false
 				if (selectedSet.has(s.code)) return false
-				if (!query) return true
-				const code = String(s.code || '').toLowerCase()
-				const desc = String(s.description || '').toLowerCase()
-				return code.includes(query) || desc.includes(query)
+				if (selectedSet.has(norm)) return false
+				// Also check if any variant's code is already selected
+				if ([...selectedSet].some(sel => sel.trim().toUpperCase().replace(/\s+/g, ' ') === norm)) return false
+				if (!query) { seen.add(norm); return true }
+				// Search across ALL variants of this code
+				const group = subjectVariantsMap[norm]
+				if (!group) return false
+				const matchesCode = norm.toLowerCase().includes(query) || s.code.toLowerCase().includes(query)
+				const matchesDesc = group.variants.some(v => (v.description || '').toLowerCase().includes(query))
+				if (matchesCode || matchesDesc) { seen.add(norm); return true }
+				return false
 			})
 			.slice(0, 10)
-	}, [subjects, specialization, specializationSearch])
+	}, [subjects, specialization, specializationSearch, subjectVariantsMap])
+
+	// Map subject codes to their semester(s) for display
+	const subjectSemMap = useMemo(() => {
+		const map = {} // normalised code -> Set of semesters
+		for (const s of (subjects || [])) {
+			if (!s || !s.code) continue
+			const norm = s.code.trim().toUpperCase().replace(/\s+/g, ' ')
+			if (!map[norm]) map[norm] = new Set()
+			if (s.semester) map[norm].add(s.semester)
+		}
+		return map
+	}, [subjects])
+
+	function getSubjectSem(code) {
+		const norm = (code || '').trim().toUpperCase().replace(/\s+/g, ' ')
+		const sems = subjectSemMap[norm]
+		if (!sems || sems.size === 0) return { label: '?', color: 'bg-slate-200 text-slate-600' }
+		if (sems.has(1) && sems.has(2)) return { label: 'S1+S2', color: 'bg-emerald-100 text-emerald-700' }
+		if (sems.has(1)) return { label: 'S1', color: 'bg-indigo-100 text-indigo-700' }
+		if (sems.has(2)) return { label: 'S2', color: 'bg-teal-100 text-teal-700' }
+		return { label: '?', color: 'bg-slate-200 text-slate-600' }
+	}
+
+	function getVariantCount(code) {
+		const norm = (code || '').trim().toUpperCase().replace(/\s+/g, ' ')
+		return subjectVariantsMap[norm]?.variants?.length || 0
+	}
 
 	function addSpecialization(code) {
 		if (!code) return
@@ -314,35 +369,92 @@ export default function Instructor() {
 								onChange={e => setSpecializationSearch(e.target.value)}
 							/>
 							{specialization.length > 0 && (
+								<>
 								<div className="flex flex-wrap gap-2 mt-1">
-									{specialization.map(code => (
-										<button
-											key={code}
-											type="button"
-											className="px-2 py-1 rounded-full bg-royal text-white text-xs flex items-center gap-1"
-											onClick={() => removeSpecialization(code)}
-										>
-											<span>{code}</span>
-											<span className="text-white/80 text-[10px]">✕</span>
-										</button>
-									))}
+									{specialization.map(code => {
+										const sem = getSubjectSem(code)
+										const vCount = getVariantCount(code)
+										const norm = code.trim().toUpperCase().replace(/\s+/g, ' ')
+										const group = subjectVariantsMap[norm]
+										const tooltip = group?.variants?.map(v => `${v.description} (${v.type} ${v.unit}u)`).join('\n') || ''
+										return (
+											<button
+												key={code}
+												type="button"
+												className="px-2 py-1 rounded-full bg-royal text-white text-xs flex items-center gap-1"
+												onClick={() => removeSpecialization(code)}
+												title={vCount > 1 ? `Matches ${vCount} subjects:\n${tooltip}` : tooltip}
+											>
+												<span>{code}</span>
+												{vCount > 1 && <span className="text-[9px] font-bold px-1 py-px rounded bg-amber-400 text-amber-900">×{vCount}</span>}
+												<span className={`text-[9px] font-bold px-1 py-px rounded ${sem.color}`}>{sem.label}</span>
+												<span className="text-white/80 text-[10px]">✕</span>
+											</button>
+										)
+									})}
 								</div>
+								{/* Semester balance summary */}
+								{(() => {
+									const s1 = specialization.filter(c => { const s = getSubjectSem(c); return s.label === 'S1' || s.label === 'S1+S2' }).length
+									const s2 = specialization.filter(c => { const s = getSubjectSem(c); return s.label === 'S2' || s.label === 'S1+S2' }).length
+									const unmatched = specialization.filter(c => getSubjectSem(c).label === '?').length
+									const maxS = Math.max(s1, s2, 1)
+									const isLopsided = (s1 > 0 && s2 === 0) || (s2 > 0 && s1 === 0)
+									return (
+										<div className={`mt-2 p-2 rounded-lg border text-xs ${isLopsided ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'}`}>
+											<div className="flex items-center gap-3 mb-1">
+												<span className="font-bold text-slate-500">Semester Balance</span>
+												{isLopsided && <span className="text-[10px] text-amber-600 font-bold">⚠ Lopsided</span>}
+											</div>
+											<div className="flex items-center gap-2">
+												<span className="text-[10px] font-bold text-indigo-600 w-5">S1</span>
+												<div className="flex-1 bg-slate-200 rounded-full h-2 overflow-hidden">
+													<div className="h-2 rounded-full bg-indigo-500 transition-all" style={{width: `${(s1 / maxS) * 100}%`}}></div>
+												</div>
+												<span className="font-bold text-slate-700 w-4 text-right">{s1}</span>
+												<span className="text-[10px] font-bold text-teal-600 w-5 ml-2">S2</span>
+												<div className="flex-1 bg-slate-200 rounded-full h-2 overflow-hidden">
+													<div className="h-2 rounded-full bg-teal-500 transition-all" style={{width: `${(s2 / maxS) * 100}%`}}></div>
+												</div>
+												<span className="font-bold text-slate-700 w-4 text-right">{s2}</span>
+											</div>
+											{unmatched > 0 && <div className="text-[10px] text-rose-500 mt-1">⚠ {unmatched} subject(s) not found in database</div>}
+										</div>
+									)
+								})()}
+								</>
 							)}
 							<div className="max-h-40 overflow-auto border rounded mt-1 bg-gray-50">
 								{subjectOptions.length === 0 && (
 									<div className="px-3 py-2 text-xs text-gray-500">No matching subjects</div>
 								)}
-								{subjectOptions.map(s => (
-									<button
-										key={s.id}
-										type="button"
-										className="w-full text-left px-3 py-1.5 text-xs hover:bg-royal/10 border-b last:border-b-0 border-gray-200"
-										onClick={() => addSpecialization(s.code)}
-									>
-										<span className="font-semibold">{s.code}</span>
-										<span className="ml-2 text-gray-600">{s.description}</span>
-									</button>
-								))}
+								{subjectOptions.map(s => {
+									const sem = getSubjectSem(s.code)
+									const norm = s.code.trim().toUpperCase().replace(/\s+/g, ' ')
+									const group = subjectVariantsMap[norm]
+									const variants = group?.variants || [{ description: s.description, type: s.type, unit: s.unit }]
+									return (
+										<button
+											key={s.id}
+											type="button"
+											className="w-full text-left px-3 py-2 text-xs hover:bg-royal/10 border-b last:border-b-0 border-gray-200"
+											onClick={() => addSpecialization(s.code)}
+										>
+											<div className="flex items-center gap-2">
+												<span className="font-semibold">{s.code}</span>
+												<span className={`text-[9px] font-bold px-1 py-px rounded ${sem.color}`}>{sem.label}</span>
+												{variants.length > 1 && <span className="text-[9px] font-bold px-1 py-px rounded bg-amber-100 text-amber-700">{variants.length} subjects</span>}
+											</div>
+											{variants.map((v, vi) => (
+												<div key={vi} className="text-[10px] text-gray-500 pl-1 mt-0.5 flex items-center gap-1">
+													<span className="text-[9px] font-bold text-slate-400">{v.type}</span>
+													<span className="text-[9px] text-slate-400">{v.unit}u</span>
+													<span className="truncate">{v.description}</span>
+												</div>
+											))}
+										</button>
+									)
+								})}
 							</div>
 						</div>
 						{error && <div className="text-sm text-red-600">{error}</div>}

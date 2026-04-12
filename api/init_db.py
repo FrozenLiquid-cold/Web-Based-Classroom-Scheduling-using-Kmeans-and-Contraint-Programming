@@ -205,25 +205,26 @@ def seed_data():
         if db.query(models.TimeBlock).count() == 0:
             from scheduler.timeslots import time_to_minutes
             registrar_windows = [
-                (1, "07:00", "08:30"),
-                (2, "07:30", "08:30"),
-                (3, "07:30", "09:00"),
-                (4, "08:00", "09:00"),
-                (5, "08:30", "10:00"),
-                (6, "09:00", "10:00"),
-                (7, "09:00", "10:30"),
-                (8, "09:00", "12:00"),
-                (9, "10:30", "11:30"),
-                (10, "10:30", "12:00"),
-                (11, "11:00", "12:00"),
-                (12, "13:00", "14:00"),
-                (13, "13:00", "14:30"),
-                (14, "13:00", "15:00"),
-                (15, "14:00", "15:00"),
-                (16, "14:30", "16:00"),
-                (17, "15:00", "17:00"),
-                (18, "16:00", "17:30"),
-                (19, "17:30", "19:00"),
+                # Morning 1-hour slots
+                (1, "07:30", "08:30"),
+                (2, "09:00", "10:00"),
+                (3, "10:30", "11:30"),
+                # Morning 1.5-hour slots
+                (4, "07:30", "09:00"),
+                (5, "09:00", "10:30"),
+                (6, "10:30", "12:00"),
+                # Afternoon 1-hour slots
+                (7, "13:00", "14:00"),
+                (8, "14:30", "15:30"),
+                (9, "16:00", "17:00"),
+                # Afternoon 1.5-hour slots
+                (10, "13:00", "14:30"),
+                (11, "14:30", "16:00"),
+                (12, "16:00", "17:30"),
+                # Evening
+                (13, "17:30", "19:00"),
+                # NSTP (Sunday 3-hour)
+                (14, "08:00", "11:00"),
             ]
             for block_id, start_label, end_label in registrar_windows:
                 time_block = models.TimeBlock(
@@ -235,7 +236,7 @@ def seed_data():
                 )
                 db.add(time_block)
             db.commit()
-            print("  - Created 19 time blocks (registrar windows)")
+            print("  - Created 14 time blocks (registrar windows)")
         
         # Create users
         user_registrar = models.User(
