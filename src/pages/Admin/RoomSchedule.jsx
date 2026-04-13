@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo } from 'react'
 import { getRoomSchedule, list } from '../../services/api'
+import { computeDefaultSY } from '../../components/SchoolYearSelector'
 
 // Master time slots from 7:30 AM to 7:00 PM (based on registrar time blocks)
 const MASTER_TIME_SLOTS = [
@@ -15,11 +16,16 @@ const MASTER_TIME_SLOTS = [
 export default function RoomSchedule() {
     const [days, setDays] = useState([])
     const [rooms, setRooms] = useState([])
+    const [buildings, setBuildings] = useState([])
+    const [departments, setDepartments] = useState([])
     const [loading, setLoading] = useState(true)
 
     // Filters
     const [semester, setSemester] = useState('1')
+    const [schoolYear, setSchoolYear] = useState(() => localStorage.getItem('jrmsu.schoolYear') || computeDefaultSY())
+    const [departmentId, setDepartmentId] = useState('')
     const [selectedDay, setSelectedDay] = useState('')
+    const [dayPattern, setDayPattern] = useState('MW')
     const [selectedRoom, setSelectedRoom] = useState('')
 
     const [scheduleData, setScheduleData] = useState([])
@@ -29,12 +35,16 @@ export default function RoomSchedule() {
     useEffect(() => {
         const loadMetadata = async () => {
             try {
-                const [d, r] = await Promise.all([
+                const [d, r, b, dept] = await Promise.all([
                     list('day'),
-                    list('room')
+                    list('room'),
+                    list('building'),
+                    list('college'),
                 ])
                 setDays(d)
                 setRooms(r)
+                setBuildings(b || [])
+                setDepartments(dept || [])
                 if (d.length > 0) setSelectedDay(d[0].id)
                 if (r.length > 0) setSelectedRoom(r[0].id)
             } catch (err) {
@@ -46,14 +56,61 @@ export default function RoomSchedule() {
         loadMetadata()
     }, [])
 
-    // Fetch schedule when filters change
+    // Filter rooms by department (college -> building -> room)
+    const filteredRooms = useMemo(() => {
+        if (!departmentId) return rooms
+        const deptBuildingIds = new Set(
+            buildings
+                .filter(b => String(b.college_id) === String(departmentId) || b.is_shared)
+                .map(b => Number(b.id))
+        )
+        return rooms.filter(r => {
+            // Include rooms with no building (accessible to all)
+            if (!r.building_id) return true
+            return deptBuildingIds.has(Number(r.building_id))
+        })
+    }, [rooms, buildings, departmentId])
+
+    // Reset selected room when department changes
+    useEffect(() => {
+        if (filteredRooms.length > 0 && !filteredRooms.find(r => String(r.id) === String(selectedRoom))) {
+            setSelectedRoom(filteredRooms[0].id)
+        }
+    }, [filteredRooms])
+
+    // Build day label -> id lookup
+    const dayLabelToId = useMemo(() => {
+        const map = {}
+        days.forEach(d => { map[d.label.toUpperCase()] = d.id })
+        return map
+    }, [days])
+
+    // Day pattern definitions
+    const DAY_PATTERNS = [
+        { key: 'ALL', label: 'All Days', dayLabels: [] },
+        { key: 'MW', label: 'M-W', dayLabels: ['M', 'W'] },
+        { key: 'TTH', label: 'T-TH', dayLabels: ['T', 'TH'] },
+        { key: 'F', label: 'F', dayLabels: ['F'] },
+        { key: 'SAT', label: 'SAT', dayLabels: ['SAT', 'S'] },
+        { key: 'SUN', label: 'SUN', dayLabels: ['SUN'] },
+    ]
+
+    // Get day IDs for the selected pattern
+    const patternDayIds = useMemo(() => {
+        if (dayPattern === 'ALL') return null // null = all days
+        const pattern = DAY_PATTERNS.find(p => p.key === dayPattern)
+        if (!pattern) return null
+        return new Set(pattern.dayLabels.map(l => dayLabelToId[l]).filter(Boolean))
+    }, [dayPattern, dayLabelToId])
+
+    // Fetch schedule when filters change (always fetch all days, filter client-side)
     useEffect(() => {
         if (!selectedRoom || !semester) return
 
         const fetchSchedule = async () => {
             setFetchingSchedule(true)
             try {
-                const data = await getRoomSchedule(selectedRoom, semester, selectedDay || null)
+                const data = await getRoomSchedule(selectedRoom, semester, null, schoolYear || null)
                 if (!Array.isArray(data)) throw new Error("Invalid response format")
                 setScheduleData(data)
             } catch (err) {
@@ -64,7 +121,7 @@ export default function RoomSchedule() {
             }
         }
         fetchSchedule()
-    }, [selectedRoom, semester, selectedDay])
+    }, [selectedRoom, semester, schoolYear])
 
     // Robust time parser using Regex
     const parseTimeRange = (timeStr) => {
@@ -152,67 +209,156 @@ export default function RoomSchedule() {
             // Checkpoints for standard slots
             const SLOT_BOUNDARIES = [540, 630, 720, 780, 870, 960, 1050, 1140];
 
+            const LUNCH_START = 720; // 12:00 PM
+            const LUNCH_END = 780;   // 1:00 PM
+
             const pushVacantSlots = (timeline, start, end, day) => {
                 if (start >= end) return;
                 const breaks = SLOT_BOUNDARIES.filter(b => b > start && b < end);
                 let current = start;
-                breaks.forEach(b => {
+                const pushSlot = (from, to) => {
+                    const isBreak = from >= LUNCH_START && to <= LUNCH_END;
                     timeline.push({
                         isVacant: true,
+                        isBreak,
                         day_label: day.label,
-                        time: formatRange(current, b),
-                        key: `vacant-${day.id}-${current}`
+                        time: formatRange(from, to),
+                        key: `vacant-${day.id}-${from}`
                     });
+                };
+                breaks.forEach(b => {
+                    pushSlot(current, b);
                     current = b;
                 });
                 if (current < end) {
-                    timeline.push({
-                        isVacant: true,
-                        day_label: day.label,
-                        time: formatRange(current, end),
-                        key: `vacant-${day.id}-${current}`
-                    });
+                    pushSlot(current, end);
                 }
             }
 
             let timeline = [];
-            const daysToProcess = selectedDay
-                ? days.filter(d => String(d.id) === String(selectedDay))
+            const daysToProcess = patternDayIds
+                ? days.filter(d => patternDayIds.has(d.id))
                 : days;
 
-            daysToProcess.forEach(day => {
-                const dayScheds = schedulesByDay[day.id] || [];
-                dayScheds.sort((a, b) => a._start - b._start);
+            // Check if selected room is in a shared building (GYM, FIELD, etc.)
+            const selectedRoomObj = rooms.find(r => String(r.id) === String(selectedRoom));
+            const selectedBuildingObj = selectedRoomObj?.building_id
+                ? buildings.find(b => Number(b.id) === Number(selectedRoomObj.building_id))
+                : null;
+            const isSharedRoom = selectedBuildingObj?.is_shared || false;
 
+            // Shared subjects that can legitimately overlap in shared venues
+            const SHARED_SUBJECT_KEYWORDS = ['PE', 'NSTP', 'PATHFIT', 'CWTS', 'LTS', 'ROTC'];
+            const isSharedSubject = (code) => {
+                if (!code) return false;
+                const upper = code.toUpperCase();
+                return SHARED_SUBJECT_KEYWORDS.some(kw => upper.startsWith(kw) || upper.includes(kw));
+            };
+
+            // Check if this is a grouped multi-day pattern (MW, TTH)
+            const currentPattern = DAY_PATTERNS.find(p => p.key === dayPattern);
+            const isGroupedPattern = currentPattern && currentPattern.dayLabels.length > 1;
+
+            if (isGroupedPattern) {
+                // ── MERGED TIMELINE for MW / TTH ──
+                // Collect all schedules with day info
+                const allDayScheds = [];
+                daysToProcess.forEach(day => {
+                    (schedulesByDay[day.id] || []).forEach(s => {
+                        allDayScheds.push({ ...s, _dayLabel: day.label, _dayId: day.id });
+                    });
+                });
+
+                // Group identical schedules across days
+                const mergeGroups = {};
+                allDayScheds.forEach(s => {
+                    const key = `${s._start}-${s._end}-${s.subject_code || ''}-${s.instructor_name || ''}-${s.block || ''}`;
+                    if (!mergeGroups[key]) {
+                        mergeGroups[key] = { sched: s, days: [s._dayLabel], ids: [s.id] };
+                    } else {
+                        if (!mergeGroups[key].days.includes(s._dayLabel)) {
+                            mergeGroups[key].days.push(s._dayLabel);
+                        }
+                        mergeGroups[key].ids.push(s.id);
+                    }
+                });
+
+                // Canonical day order for consistent labels (M/W not W/M)
+                const DAY_ORDER = { 'M': 0, 'T': 1, 'W': 2, 'TH': 3, 'F': 4, 'SAT': 5, 'S': 5, 'SUN': 6 };
+                const sortDays = (arr) => [...arr].sort((a, b) => (DAY_ORDER[a] ?? 99) - (DAY_ORDER[b] ?? 99));
+
+                // Convert to flat list with merged day labels
+                const patternLabel = sortDays(daysToProcess.map(d => d.label)).join('/');
+                const mergedScheds = Object.values(mergeGroups).map(g => ({
+                    ...g.sched,
+                    day_label: g.days.length === daysToProcess.length ? patternLabel : sortDays(g.days).join('/'),
+                    _mergedKey: g.ids.join('-'),
+                }));
+
+                // Sort by start time, then by subject
+                mergedScheds.sort((a, b) => a._start - b._start || (a.subject_code || '').localeCompare(b.subject_code || ''));
+
+                // Build single timeline
+                const dummyDay = { label: '', id: 'merged' };
                 let cursor = START_OF_DAY;
-
-                dayScheds.forEach((sched) => {
-                    // Gap before this schedule?
+                mergedScheds.forEach(sched => {
                     if (sched._start > cursor) {
-                        pushVacantSlots(timeline, cursor, sched._start, day);
+                        pushVacantSlots(timeline, cursor, sched._start, dummyDay);
                     }
 
-                    // Check for conflict (overlap with previous)
-                    // If sched starts before cursor, it overlaps with what we just processed
-                    const isConflict = sched._start < cursor;
+                    let isConflict = sched._start < cursor;
+                    if (isConflict && isSharedRoom && isSharedSubject(sched.subject_code)) {
+                        isConflict = false;
+                    }
 
-                    // Add the schedule itself
                     timeline.push({
                         ...sched,
                         isVacant: false,
-                        isConflict: isConflict,
-                        key: `sched-${sched.id}`
+                        isConflict,
+                        isSharedSlot: isSharedRoom && isSharedSubject(sched.subject_code),
+                        key: `sched-${sched._mergedKey}`
                     });
 
-                    // Move cursor
-                    // Handle overlaps: if cursor was already passed this schedule's end (nested?), don't move back
                     cursor = Math.max(cursor, sched._end);
                 });
 
                 if (cursor < END_OF_DAY) {
-                    pushVacantSlots(timeline, cursor, END_OF_DAY, day);
+                    pushVacantSlots(timeline, cursor, END_OF_DAY, dummyDay);
                 }
-            });
+            } else {
+                // ── SINGLE DAY timeline (F, SAT, SUN, ALL) ──
+                daysToProcess.forEach(day => {
+                    const dayScheds = schedulesByDay[day.id] || [];
+                    dayScheds.sort((a, b) => a._start - b._start);
+
+                    let cursor = START_OF_DAY;
+
+                    dayScheds.forEach((sched) => {
+                        if (sched._start > cursor) {
+                            pushVacantSlots(timeline, cursor, sched._start, day);
+                        }
+
+                        let isConflict = sched._start < cursor;
+                        if (isConflict && isSharedRoom && isSharedSubject(sched.subject_code)) {
+                            isConflict = false;
+                        }
+
+                        timeline.push({
+                            ...sched,
+                            isVacant: false,
+                            isConflict: isConflict,
+                            isSharedSlot: isSharedRoom && isSharedSubject(sched.subject_code),
+                            key: `sched-${sched.id}`
+                        });
+
+                        cursor = Math.max(cursor, sched._end);
+                    });
+
+                    if (cursor < END_OF_DAY) {
+                        pushVacantSlots(timeline, cursor, END_OF_DAY, day);
+                    }
+                });
+            }
 
             return timeline;
 
@@ -220,26 +366,49 @@ export default function RoomSchedule() {
             console.error("Critical error building timeline:", err);
             return []; // Prevent page crash
         }
-    }, [scheduleData, days, selectedDay]);
+    }, [scheduleData, days, patternDayIds]);
 
     // Helper to format time robustly
     const formatTime = (timeStr) => {
         if (!timeStr) return '—'
-        const timePattern = /(\d{1,2}):(\d{2})/g
+
+        // Check if the string already contains AM/PM indicators
+        const hasAmPm = /AM|PM/i.test(timeStr)
+
+        const timePattern = /(\d{1,2}):(\d{2})\s*(AM|PM)?/gi
         const matches = [...timeStr.matchAll(timePattern)]
         if (matches.length === 0) return timeStr
 
-        const to12Hour = (hour, minute) => {
-            const h = parseInt(hour)
-            const ampm = h >= 12 ? 'PM' : 'AM'
-            const h12 = h % 12 || 12
+        const to12Hour = (hour, minute, period) => {
+            let h = parseInt(hour)
+            let explicitPeriod = period ? period.toUpperCase() : null
+
+            if (!explicitPeriod && !hasAmPm) {
+                // School hours heuristic: 7-11 = AM, 12 = PM, 1-6 = PM
+                if (h >= 7 && h <= 11) explicitPeriod = 'AM'
+                else if (h === 12) explicitPeriod = 'PM'
+                else if (h >= 1 && h <= 6) explicitPeriod = 'PM'
+                else if (h >= 13) { explicitPeriod = h >= 12 ? 'PM' : 'AM' }
+            }
+
+            // Convert 24h to 12h if needed
+            if (h >= 13) {
+                explicitPeriod = 'PM'
+                h -= 12
+            } else if (h === 0) {
+                h = 12
+                explicitPeriod = 'AM'
+            }
+
+            const ampm = explicitPeriod || (h >= 7 && h <= 11 ? 'AM' : 'PM')
+            const h12 = h || 12
             return `${h12}:${minute} ${ampm}`
         }
 
         if (matches.length >= 2) {
-            return `${to12Hour(matches[0][1], matches[0][2])} – ${to12Hour(matches[1][1], matches[1][2])}`
+            return `${to12Hour(matches[0][1], matches[0][2], matches[0][3])} – ${to12Hour(matches[1][1], matches[1][2], matches[1][3])}`
         }
-        return to12Hour(matches[0][1], matches[0][2])
+        return to12Hour(matches[0][1], matches[0][2], matches[0][3])
     }
 
     const getTypeBadge = (type) => {
@@ -280,7 +449,27 @@ export default function RoomSchedule() {
             </header>
 
             {/* Filters */}
-            <div className="bg-white/80 backdrop-blur-xl p-6 rounded-2xl shadow-sm border border-slate-200 grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="bg-white/80 backdrop-blur-xl p-6 rounded-2xl shadow-sm border border-slate-200 grid grid-cols-1 md:grid-cols-5 gap-6">
+                <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">School Year</label>
+                    <select
+                        value={schoolYear}
+                        onChange={e => setSchoolYear(e.target.value)}
+                        className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all font-medium text-slate-700"
+                    >
+                        {(() => {
+                            const now = new Date();
+                            const currentYear = now.getFullYear();
+                            const opts = [];
+                            for (let start = currentYear + 1; start >= 2020; start--) {
+                                const sy = `${start}-${start + 1}`;
+                                opts.push(<option key={sy} value={sy}>SY {sy}</option>);
+                            }
+                            return opts;
+                        })()}
+                    </select>
+                </div>
+
                 <div>
                     <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Semester</label>
                     <select
@@ -294,15 +483,28 @@ export default function RoomSchedule() {
                 </div>
 
                 <div>
-                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Filter by Day</label>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Department</label>
                     <select
-                        value={selectedDay}
-                        onChange={e => setSelectedDay(e.target.value)}
+                        value={departmentId}
+                        onChange={e => setDepartmentId(e.target.value)}
                         className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all font-medium text-slate-700"
                     >
-                        <option value="">All Days</option>
-                        {days.map(d => (
-                            <option key={d.id} value={d.id}>{d.label}</option>
+                        <option value="">All Departments</option>
+                        {departments.map(d => (
+                            <option key={d.id} value={d.id}>{d.code || d.name}</option>
+                        ))}
+                    </select>
+                </div>
+
+                <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Day Pattern</label>
+                    <select
+                        value={dayPattern}
+                        onChange={e => setDayPattern(e.target.value)}
+                        className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all font-medium text-slate-700"
+                    >
+                        {DAY_PATTERNS.map(p => (
+                            <option key={p.key} value={p.key}>{p.label}</option>
                         ))}
                     </select>
                 </div>
@@ -314,7 +516,7 @@ export default function RoomSchedule() {
                         onChange={e => setSelectedRoom(e.target.value)}
                         className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all font-medium text-slate-700"
                     >
-                        {rooms.map(r => (
+                        {filteredRooms.map(r => (
                             <option key={r.id} value={r.id}>{r.name} ({r.type})</option>
                         ))}
                     </select>
@@ -345,7 +547,7 @@ export default function RoomSchedule() {
                                 <tr>
                                     <th className="text-left px-6 py-4 text-slate-500 font-semibold text-xs uppercase tracking-wider">#</th>
                                     <th className="text-left px-6 py-4 text-slate-500 font-semibold text-xs uppercase tracking-wider">Time Slot</th>
-                                    {!selectedDay && <th className="text-left px-6 py-4 text-slate-500 font-semibold text-xs uppercase tracking-wider">Day</th>}
+                                    {(dayPattern === 'ALL' || dayPattern === 'MW' || dayPattern === 'TTH') && <th className="text-left px-6 py-4 text-slate-500 font-semibold text-xs uppercase tracking-wider">Day</th>}
                                     <th className="text-left px-6 py-4 text-slate-500 font-semibold text-xs uppercase tracking-wider">Subject Code</th>
                                     <th className="text-left px-6 py-4 text-slate-500 font-semibold text-xs uppercase tracking-wider">Description</th>
                                     <th className="text-left px-6 py-4 text-slate-500 font-semibold text-xs uppercase tracking-wider">Type</th>
@@ -356,17 +558,21 @@ export default function RoomSchedule() {
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {fullDayGrid.map((slot, idx) => (
-                                    <tr key={slot.key} className={`transition-colors ${slot.isVacant
-                                        ? 'bg-green-50/30 hover:bg-green-50/50'
-                                        : slot.isConflict
-                                            ? 'bg-red-50 border-l-4 border-red-500'
-                                            : 'hover:bg-slate-50'
+                                    <tr key={slot.key} className={`transition-colors ${slot.isBreak
+                                        ? 'bg-amber-50/50'
+                                        : slot.isVacant
+                                            ? 'bg-green-50/30 hover:bg-green-50/50'
+                                            : slot.isConflict
+                                                ? 'bg-red-50 border-l-4 border-red-500'
+                                                : slot.isSharedSlot
+                                                    ? 'bg-blue-50/30 hover:bg-blue-50/50'
+                                                    : 'hover:bg-slate-50'
                                         }`}>
                                         <td className="px-6 py-4 text-slate-400 font-mono text-sm">{idx + 1}</td>
                                         <td className="px-6 py-4 text-slate-600 font-mono text-sm font-medium">
                                             {slot.isVacant ? slot.time : formatTime(slot.time)}
                                         </td>
-                                        {!selectedDay && (
+                                        {(dayPattern === 'ALL' || dayPattern === 'MW' || dayPattern === 'TTH') && (
                                             <td className="px-6 py-4">
                                                 {slot.isVacant ? (
                                                     <span className="text-slate-400">—</span>
@@ -385,7 +591,7 @@ export default function RoomSchedule() {
                                         </td>
                                         <td className="px-6 py-4 text-sm max-w-xs truncate" title={slot.subject_description}>
                                             <span className={slot.isVacant ? 'text-slate-400 italic' : 'text-slate-600'}>
-                                                {slot.isVacant ? 'Available for schedule' : (slot.subject_description || '—')}
+                                                {slot.isBreak ? '🍽️ Lunch Break' : slot.isVacant ? 'Available for schedule' : (slot.subject_description || '—')}
                                             </span>
                                         </td>
                                         <td className="px-6 py-4">
@@ -412,31 +618,41 @@ export default function RoomSchedule() {
                                             )}
                                         </td>
                                         <td className="px-6 py-4">
-                                            {slot.isVacant ? (
+                                            {slot.isBreak ? (
+                                                <div className="flex items-center gap-1.5">
+                                                    <span className="relative flex h-2.5 w-2.5">
+                                                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-400"></span>
+                                                    </span>
+                                                    <span className="text-xs font-medium text-amber-600">Break</span>
+                                                </div>
+                                            ) : slot.isVacant ? (
                                                 <div className="flex items-center gap-1.5">
                                                     <span className="relative flex h-2.5 w-2.5">
                                                         <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
                                                     </span>
                                                     <span className="text-xs font-medium text-emerald-600">Vacant</span>
                                                 </div>
+                                            ) : slot.isSharedSlot ? (
+                                                <div className="flex items-center gap-1.5">
+                                                    <span className="relative flex h-2.5 w-2.5">
+                                                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-500"></span>
+                                                    </span>
+                                                    <span className="text-xs font-medium text-blue-600">Shared</span>
+                                                </div>
+                                            ) : slot.isConflict ? (
+                                                <div className="flex items-center gap-1.5">
+                                                    <span className="relative flex h-2.5 w-2.5">
+                                                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-600"></span>
+                                                    </span>
+                                                    <span className="text-xs font-bold text-red-700">CONFLICT</span>
+                                                </div>
                                             ) : (
                                                 <div className="flex items-center gap-1.5">
                                                     <span className="relative flex h-2.5 w-2.5">
-                                                        {slot.isConflict ? (
-                                                            <>
-                                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                                                                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-600"></span>
-                                                            </>
-                                                        ) : (
-                                                            <>
-                                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                                                                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500"></span>
-                                                            </>
-                                                        )}
+                                                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-orange-500"></span>
                                                     </span>
-                                                    <span className={`text-xs font-medium ${slot.isConflict ? 'text-red-700 font-bold' : 'text-red-600'}`}>
-                                                        {slot.isConflict ? 'CONFLICT' : 'Occupied'}
-                                                    </span>
+                                                    <span className="text-xs font-medium text-orange-600">Occupied</span>
                                                 </div>
                                             )}
                                         </td>

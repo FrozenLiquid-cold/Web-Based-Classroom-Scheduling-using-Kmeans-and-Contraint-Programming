@@ -8,6 +8,7 @@ const ENTITY_MAP = {
   day: 'days',
   subject: 'subjects',
   room: 'rooms',
+  building: 'buildings',
   user: 'users',
 }
 

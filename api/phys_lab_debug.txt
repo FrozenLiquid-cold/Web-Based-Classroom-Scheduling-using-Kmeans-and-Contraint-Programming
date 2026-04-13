@@ -1727,3 +1727,6 @@
 === Block 2 SOURCE DEBUG ===
 [SOURCE DEBUG] scheduled_rows[4]: subject_id=193, time=1:00 PM - 2:00 PM, block=A
 === Block 2 SOURCE DEBUG ===
+=== Block 3 SOURCE DEBUG ===
+[SOURCE DEBUG] scheduled_rows[0]: subject_id=184, time=1:00 PM - 2:30 PM, block=A
+=== Block 3 SOURCE DEBUG ===

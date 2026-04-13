@@ -66,7 +66,7 @@ export default function Dashboard() {
     const fetchStaffing = async (blocksOverride) => {
         setStaffingLoading(true)
         try {
-            const data = await getStaffingAnalysis(semester, blocksOverride || staffingBlocks, departmentId, schoolYear)
+            const data = await getStaffingAnalysis(semester, blocksOverride || staffingBlocks, "", schoolYear)
             if (data) setStaffingData(data)
         } catch (err) {
             console.error("Failed to load staffing analysis", err)
@@ -75,7 +75,7 @@ export default function Dashboard() {
         }
     }
     // Initial load for stat card
-    useEffect(() => { fetchStaffing() }, [semester, departmentId, schoolYear])
+    useEffect(() => { fetchStaffing() }, [semester, schoolYear])
     // Re-fetch when blocks change in modal
     useEffect(() => { if (showStaffingModal) fetchStaffing() }, [staffingBlocks])
 
@@ -354,7 +354,10 @@ export default function Dashboard() {
                                         <div className="col-span-1 text-center">
                                             <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${room.type === 'LAB' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>{room.type}</span>
                                         </div>
-                                        <div className="col-span-1 text-center text-sm font-bold text-slate-700">{room.scheduled_slots}<span className="text-[10px] text-slate-400 font-normal">/{room.max_slots || '?'}</span></div>
+                                        <div className="col-span-1 text-center text-sm font-bold text-slate-700">
+                                            {room.weekday_slots || room.scheduled_slots}<span className="text-[10px] text-slate-400 font-normal">/{room.max_slots || '?'}</span>
+                                            {room.weekend_slots > 0 && <span className="block text-[9px] text-orange-500 font-medium">+{room.weekend_slots} wknd</span>}
+                                        </div>
                                         <div className="col-span-5 flex items-center gap-3">
                                             <div className="flex-1 bg-slate-100 rounded-full h-2.5">
                                                 <div className={`h-2.5 rounded-full transition-all ${room.utilization_pct >= 90 ? 'bg-red-500' : room.utilization_pct >= 70 ? 'bg-amber-500' : room.utilization_pct > 0 ? 'bg-emerald-500' : 'bg-slate-200'}`} style={{ width: `${Math.min(room.utilization_pct, 100)}%` }}></div>

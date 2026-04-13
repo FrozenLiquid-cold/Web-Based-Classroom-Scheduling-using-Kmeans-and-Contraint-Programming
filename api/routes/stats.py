@@ -69,8 +69,8 @@ def get_admin_stats():
         
         scheduled_subject_ids = set()
         
-        # Count slots per room and detect conflicts
-        room_slot_count = {}      # room_id -> total slots
+        room_slot_count = {}          # room_id -> weekday slots only
+        room_weekend_slot_count = {}   # room_id -> weekend slots
         room_day_slots = {}       # room_id -> {day_id -> [time_strings]}
         # Group schedules by (room_id, day_id) for overlap-based conflict detection
         room_day_schedules = {}   # (room_id, day_id) -> [schedule_objs]
@@ -80,7 +80,11 @@ def get_admin_stats():
                 scheduled_subject_ids.add(sched.subject_id)
             
             if sched.room_id:
-                room_slot_count[sched.room_id] = room_slot_count.get(sched.room_id, 0) + 1
+                # Separate weekday vs weekend slot counts
+                if sched.day_id and sched.day_id not in weekday_ids:
+                    room_weekend_slot_count[sched.room_id] = room_weekend_slot_count.get(sched.room_id, 0) + 1
+                else:
+                    room_slot_count[sched.room_id] = room_slot_count.get(sched.room_id, 0) + 1
                 if sched.day_id:
                     room_day_slots.setdefault(sched.room_id, {}).setdefault(sched.day_id, []).append(sched.time or '')
             
@@ -249,20 +253,24 @@ def get_admin_stats():
 
         total_rooms = len(rooms)
 
-        # Room Stats (slot-based)
-        active_rooms = sum(1 for r in rooms if room_slot_count.get(r.id, 0) > 0)
+        # Room Stats (slot-based, weekday only for utilization)
+        active_rooms = sum(1 for r in rooms if room_slot_count.get(r.id, 0) > 0 or room_weekend_slot_count.get(r.id, 0) > 0)
         avg_utilization = 0
         if rooms and MAX_ROOM_SLOTS > 0:
-            total_used_slots = sum(room_slot_count.get(r.id, 0) for r in rooms)
+            total_used_slots = sum(room_slot_count.get(r.id, 0) for r in rooms)  # weekday only
             total_capacity_slots = total_rooms * MAX_ROOM_SLOTS
             avg_utilization = (total_used_slots / total_capacity_slots) * 100 if total_capacity_slots > 0 else 0
+            avg_utilization = min(avg_utilization, 100.0)  # cap at 100%
 
         # Per-room detail list
         room_details = []
         for r in rooms:
-            slot_count = room_slot_count.get(r.id, 0)
-            pct = round((slot_count / MAX_ROOM_SLOTS) * 100, 1) if MAX_ROOM_SLOTS > 0 else 0
-            # Cap at 100% (overflow to weekend can push above)
+            weekday_slots = room_slot_count.get(r.id, 0)
+            weekend_slots = room_weekend_slot_count.get(r.id, 0)
+            total_slots = weekday_slots + weekend_slots
+            pct = round((weekday_slots / MAX_ROOM_SLOTS) * 100, 1) if MAX_ROOM_SLOTS > 0 else 0
+            # Cap at 100% — weekend overflow is shown separately
+            pct = min(pct, 100.0)
             building_name = r.building.name if r.building else None
             room_details.append({
                 "id": r.id,
@@ -270,7 +278,9 @@ def get_admin_stats():
                 "type": r.type,
                 "building": building_name,
                 "capacity": r.capacity or 0,
-                "scheduled_slots": slot_count,
+                "scheduled_slots": total_slots,
+                "weekday_slots": weekday_slots,
+                "weekend_slots": weekend_slots,
                 "max_slots": MAX_ROOM_SLOTS,
                 "utilization_pct": pct,
             })
@@ -283,9 +293,11 @@ def get_admin_stats():
             
         instructors = instructors_query.all()
         total_instructors = len(instructors)
+        dept_instructor_ids = {i.id for i in instructors}
         
         active_instructor_ids = set(s.instructor_id for s in schedules if s.instructor_id)
-        active_instructors = len(active_instructor_ids)
+        # Only count instructors that belong to this department's roster
+        active_instructors = len(active_instructor_ids & dept_instructor_ids) if department_id else len(active_instructor_ids)
 
         # Per-instructor detail list with load info
         instructor_details = []
@@ -402,7 +414,7 @@ def get_admin_stats():
             "instructors": {
                 "total": total_instructors,
                 "active": active_instructors,
-                "utilization_pct": round((active_instructors/total_instructors)*100, 1) if total_instructors else 0,
+                "utilization_pct": min(round((active_instructors/total_instructors)*100, 1), 100.0) if total_instructors else 0,
                 "overloaded": overloaded_count,
                 "near_capacity": near_cap_count,
                 "details": instructor_details
