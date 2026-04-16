@@ -821,6 +821,121 @@ def _seed_default_time_blocks_for_day(db, day_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Day Pattern routes
+# ---------------------------------------------------------------------------
+@entities_bp.route("/day-patterns", methods=["GET"])
+def list_day_patterns():
+    with _get_session() as db:
+        patterns = db.query(models.DayPattern).order_by(models.DayPattern.priority).all()
+        return jsonify(_serialize_list(patterns, schemas.DayPatternResponse))
+
+
+@entities_bp.route("/day-patterns", methods=["POST"])
+def create_day_pattern():
+    payload = request.get_json(force=True) or {}
+    try:
+        data = schemas.DayPatternCreate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        pattern = models.DayPattern(**data.model_dump())
+        db.add(pattern)
+        db.commit()
+        db.refresh(pattern)
+        return jsonify(_serialize(pattern, schemas.DayPatternResponse)), 201
+
+
+@entities_bp.route("/day-patterns/<int:pattern_id>", methods=["PUT"])
+def update_day_pattern(pattern_id: int):
+    payload = request.get_json(force=True) or {}
+    try:
+        data = schemas.DayPatternUpdate(**payload)
+    except ValidationError as exc:
+        return jsonify({"detail": exc.errors()}), 422
+
+    with _get_session() as db:
+        pattern = db.query(models.DayPattern).filter(models.DayPattern.id == pattern_id).first()
+        if not pattern:
+            return jsonify({"detail": "Pattern not found"}), 404
+
+        for key, value in data.model_dump(exclude_unset=True).items():
+            setattr(pattern, key, value)
+
+        db.commit()
+        db.refresh(pattern)
+        return jsonify(_serialize(pattern, schemas.DayPatternResponse))
+
+
+@entities_bp.route("/day-patterns/<int:pattern_id>", methods=["DELETE"])
+def delete_day_pattern(pattern_id: int):
+    with _get_session() as db:
+        pattern = db.query(models.DayPattern).filter(models.DayPattern.id == pattern_id).first()
+        if not pattern:
+            return jsonify({"detail": "Pattern not found"}), 404
+        db.delete(pattern)
+        db.commit()
+        return "", 204
+
+
+@entities_bp.route("/day-patterns/reset-defaults", methods=["POST"])
+def reset_day_patterns():
+    """Delete all patterns and re-seed the standard MW / TTH / F defaults."""
+    with _get_session() as db:
+        db.query(models.DayPattern).delete()
+        db.commit()
+
+        # Look up day IDs by label
+        all_days = db.query(models.Day).all()
+        label_to_id = {d.label.upper(): d.id for d in all_days}
+
+        defaults = [
+            ("M-W",  [label_to_id.get("M"), label_to_id.get("W")],   0, "ALL"),
+            ("T-TH", [label_to_id.get("T"), label_to_id.get("TH")],  1, "ALL"),
+            ("F",    [label_to_id.get("F")],                          2, "ALL"),
+        ]
+
+        created = []
+        for name, ids, priority, applies_to in defaults:
+            # Filter out None (in case a standard day doesn't exist)
+            valid_ids = [str(i) for i in ids if i is not None]
+            if not valid_ids:
+                continue
+            p = models.DayPattern(
+                name=name,
+                day_ids=",".join(valid_ids),
+                priority=priority,
+                is_active=True,
+                applies_to=applies_to,
+            )
+            db.add(p)
+            created.append(p)
+
+        db.commit()
+        for p in created:
+            db.refresh(p)
+        return jsonify(_serialize_list(created, schemas.DayPatternResponse))
+
+
+@entities_bp.route("/day-patterns/reorder", methods=["POST"])
+def reorder_day_patterns():
+    """Accept an ordered list of pattern IDs and update their priorities."""
+    payload = request.get_json(force=True) or {}
+    ordered_ids = payload.get("ordered_ids", [])
+    if not ordered_ids:
+        return jsonify({"detail": "ordered_ids is required"}), 400
+
+    with _get_session() as db:
+        for idx, pid in enumerate(ordered_ids):
+            pattern = db.query(models.DayPattern).filter(models.DayPattern.id == pid).first()
+            if pattern:
+                pattern.priority = idx
+        db.commit()
+        patterns = db.query(models.DayPattern).order_by(models.DayPattern.priority).all()
+        return jsonify(_serialize_list(patterns, schemas.DayPatternResponse))
+
+
+# ---------------------------------------------------------------------------
 # Subject routes
 # ---------------------------------------------------------------------------
 
@@ -1700,3 +1815,55 @@ def reset_time_blocks_to_defaults():
 
         db.commit()
         return jsonify({"message": f"Reset {len(created)} time blocks across {len(days)} days", "count": len(created)}), 200
+
+
+# ═══════════════════════════════════════════════════════════════
+#  System Settings
+# ═══════════════════════════════════════════════════════════════
+
+@entities_bp.route("/system-settings", methods=["GET"])
+def get_system_settings():
+    """Return all system settings as a list."""
+    with _get_session() as db:
+        rows = db.query(models.SystemSetting).order_by(models.SystemSetting.id).all()
+        return jsonify([
+            {"id": r.id, "key": r.key, "value": r.value, "description": r.description}
+            for r in rows
+        ]), 200
+
+
+@entities_bp.route("/system-settings/<string:key>", methods=["PUT"])
+def update_system_setting(key):
+    """Update a single system setting by key."""
+    data = request.get_json(silent=True) or {}
+    new_value = data.get("value")
+    if new_value is None:
+        return jsonify({"detail": "Missing 'value'"}), 400
+
+    with _get_session() as db:
+        row = db.query(models.SystemSetting).filter(models.SystemSetting.key == key).first()
+        if not row:
+            # Auto-create if it doesn't exist
+            row = models.SystemSetting(key=key, value=str(new_value), description=data.get("description", ""))
+            db.add(row)
+        else:
+            row.value = str(new_value)
+            if "description" in data:
+                row.description = data["description"]
+        db.commit()
+        return jsonify({"id": row.id, "key": row.key, "value": row.value, "description": row.description}), 200
+
+
+@entities_bp.route("/system-settings/reset-defaults", methods=["POST"])
+def reset_system_settings():
+    """Reset system settings to defaults."""
+    defaults = [
+        ("regular_base_hours", "24", "Base weekly hour limit for regular instructors (before designation deductions)"),
+        ("visiting_base_hours", "30", "Weekly hour limit for visiting lecturers (no deduction applied)"),
+    ]
+    with _get_session() as db:
+        db.query(models.SystemSetting).delete()
+        for key, value, desc in defaults:
+            db.add(models.SystemSetting(key=key, value=value, description=desc))
+        db.commit()
+        return jsonify({"message": "System settings reset to defaults"}), 200

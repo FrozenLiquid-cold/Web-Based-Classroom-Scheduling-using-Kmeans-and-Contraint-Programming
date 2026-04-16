@@ -194,6 +194,24 @@ class TimeBlock(Base):
     )
 
 
+class DayPattern(Base):
+    """Configurable day patterns for scheduling (e.g., M-W, T-TH, F).
+
+    Each pattern defines which days a subject can be assigned to.
+    Paired patterns (2+ days) mean the subject meets on all listed days
+    at the same time. Single-day patterns are for one-off assignments.
+    Priority controls the order the scheduler tries patterns (lower = first).
+    """
+    __tablename__ = "day_patterns"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(50), nullable=False)                   # e.g. "M-W", "T-TH", "F"
+    day_ids = Column(Text, nullable=False)                      # comma-separated day IDs: "1,3"
+    priority = Column(Integer, nullable=False, default=0)       # lower = tried first
+    is_active = Column(Boolean, nullable=False, default=True)
+    applies_to = Column(String(10), nullable=False, default="ALL")  # "LEC", "LAB", or "ALL"
+
+
 class Timeslot(Base):
     __tablename__ = "timeslots"
 
@@ -347,4 +365,14 @@ class DesignationDeduction(Base):
     id = Column(Integer, primary_key=True, index=True)
     designation = Column(String(100), nullable=False, unique=True)
     deduction_hours = Column(Integer, nullable=False, default=0)
+
+
+class SystemSetting(Base):
+    """Key-value store for system-wide configuration settings."""
+    __tablename__ = "system_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(100), nullable=False, unique=True, index=True)
+    value = Column(String(255), nullable=False)
+    description = Column(String(500), nullable=True)
 

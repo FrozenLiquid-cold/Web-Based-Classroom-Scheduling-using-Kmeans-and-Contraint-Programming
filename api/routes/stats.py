@@ -320,7 +320,8 @@ def get_admin_stats():
                 subject_units[s.id] = s.unit or 0
 
         for instr in instructors:
-            max_u = instr.max_units or 24
+            _, regular_cap = _load_caps()
+            max_u = instr.max_units or regular_cap
             # Sum units of distinct (subject, block) pairs assigned
             loaded_units = 0
             assigned_pairs = instr_subject_block_map.get(instr.id, set())
@@ -639,8 +640,16 @@ DESIGNATION_CAPS = {
     "director":          9,
     "college secretary": 12,
 }
-VISITING_CAP    = 15
-REGULAR_CAP     = 24
+
+def _load_caps():
+    """Load base hour limits from system_settings."""
+    try:
+        from ..scheduler.settings import get_system_settings
+        s = get_system_settings()
+        return int(s.get("visiting_base_hours", 30)), int(s.get("regular_base_hours", 24))
+    except Exception:
+        return 30, 24
+
 MAX_LEC_SECTIONS = 3   # time-slot limit per prof for same LEC subject
 MAX_LAB_SECTIONS = 4   # time-slot limit per prof for same LAB subject
 
@@ -649,11 +658,12 @@ def _instructor_unit_cap(instructor):
     """Return the teaching-unit cap for an instructor based on designation."""
     if instructor.max_units:
         return instructor.max_units
+    visiting_cap, regular_cap = _load_caps()
     emp = (instructor.employment_type or "regular").strip().lower()
     if emp == "visiting":
-        return VISITING_CAP
+        return visiting_cap
     desg = (instructor.designation or "").strip().lower()
-    return DESIGNATION_CAPS.get(desg, REGULAR_CAP)
+    return DESIGNATION_CAPS.get(desg, regular_cap)
 
 
 def _normalize_code(code):

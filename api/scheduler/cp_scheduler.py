@@ -598,14 +598,15 @@ def generate_all_subject_start_options(
     slots_by_day: Dict[str, List[Dict]],
     slot_to_block_map: Dict[Tuple[int, int], int],
     sampling: int = 1,
+    day_patterns: List[Dict[str, Any]] = None,
 ) -> Dict[int, List[Dict]]:
     """
     For all subjects, compute valid start windows using the updated LEC/LAB pattern logic.
     Returns {subject_id: [option_dicts...]}
 
     Rules:
-    - LEC subjects: Only MW, TTh, or F patterns
-    - LAB subjects: Single meeting on any day, but still restricted to MW, TTh, or F patterns
+    - If day_patterns is provided from DB, uses those patterns dynamically
+    - Otherwise falls back to hardcoded MW, TTh, F patterns
     """
     all_options = defaultdict(list)
 
@@ -633,7 +634,8 @@ def generate_all_subject_start_options(
             slots_by_day=slots_by_day,
             slot_to_block_map=slot_to_block_map,
             days=days,
-            logger=logger
+            logger=logger,
+            day_patterns=day_patterns,
         )
 
         # Attach metadata and validate blocks_by_day
@@ -794,6 +796,7 @@ def generate_subject_start_options(
     slot_to_block_map: Dict[Tuple[int, int], int],
     days: List,
     logger: Any = None,
+    day_patterns: List[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate start options for a single subject with detailed debug logging.
@@ -871,6 +874,130 @@ def generate_subject_start_options(
 
     if logger:
         logger.debug("generate_subject_start_options: Subject %s type='%s'", subj_id, subj_type)
+
+    # ── Dynamic DB-driven pattern generation ──────────────────────────────
+    # If day_patterns are provided from the database, use them instead of
+    # hardcoded MW/TTH/F blocks.  Each DayPattern has day_ids (comma-sep),
+    # applies_to (ALL/LEC/LAB), is_active, and priority (already sorted).
+    if day_patterns is not None and len(day_patterns) > 0:
+        active_patterns = [
+            p for p in day_patterns
+            if p.get("is_active", True) and (
+                p.get("applies_to", "ALL") == "ALL" or
+                p.get("applies_to", "ALL") == subj_type
+            )
+        ]
+        if active_patterns:
+            debug_log(f"Using {len(active_patterns)} DB day patterns for {subj_type}")
+            day_id_to_label = {d.id: d.label for d in days}
+
+            for pat in active_patterns:
+                pat_day_ids = [int(x) for x in str(pat["day_ids"]).split(",") if x.strip()]
+                pat_day_labels = [day_id_to_label.get(did) for did in pat_day_ids]
+                # Skip if any day doesn't exist
+                if None in pat_day_labels:
+                    continue
+                pat_day_objs = [day_label_to_day.get(lbl) for lbl in pat_day_labels]
+                if None in pat_day_objs:
+                    continue
+                # Skip if no slots available for the days in this pattern
+                if not all(lbl in slots_by_day and len(slots_by_day[lbl]) > 0 for lbl in pat_day_labels):
+                    continue
+
+                is_paired = len(pat_day_labels) >= 2
+
+                if is_paired:
+                    # Paired pattern: find matching slots across all days
+                    first_label = pat_day_labels[0]
+                    for first_slot in slots_by_day[first_label]:
+                        # Find matching slot on every other day
+                        matched_slots = [first_slot]
+                        all_match = True
+                        for other_label in pat_day_labels[1:]:
+                            match = _find_matching_slot(slots_by_day[other_label], first_slot)
+                            if match is None:
+                                all_match = False
+                                break
+                            matched_slots.append(match)
+
+                        if not all_match:
+                            continue
+
+                        # Build option from matched slots
+                        all_slot_indexes = []
+                        all_block_indices = set()
+                        blocks_by_day = {}
+                        slot_labels = []
+                        all_blocks_spanned = set()
+
+                        for i, (slot, dobj) in enumerate(zip(matched_slots, pat_day_objs)):
+                            si = slot.get("index", [])
+                            if isinstance(si, int):
+                                si = [si]
+                            all_slot_indexes.extend(si)
+
+                            bi = set(slot.get("block_indices", []))
+                            if not bi:
+                                bi = {si[0]} if si else set()
+                            all_block_indices |= bi
+                            blocks_by_day[dobj.id] = bi
+                            slot_labels.append(slot.get("label", ""))
+                            all_blocks_spanned |= set(slot.get("blocks_spanned", []))
+
+                        start_min = first_slot.get("start_min")
+                        end_min = first_slot.get("end_min")
+                        duration_min = end_min - start_min
+
+                        options.append({
+                            "days": pat_day_labels,
+                            "day_ids": [d.id for d in pat_day_objs],
+                            "day_id": pat_day_objs[0].id,
+                            "start_min": start_min,
+                            "end_min": end_min,
+                            "duration_min": duration_min,
+                            "block_indices": all_block_indices,
+                            "blocks_by_day": blocks_by_day,
+                            "slot_indexes": all_slot_indexes,
+                            "blocks_spanned": all_blocks_spanned,
+                            "slot_labels": slot_labels,
+                            "num_slots": len(all_slot_indexes),
+                        })
+                else:
+                    # Single-day pattern
+                    single_label = pat_day_labels[0]
+                    single_day = pat_day_objs[0]
+                    for slot in slots_by_day[single_label]:
+                        si = slot.get("index", [])
+                        if isinstance(si, int):
+                            si = [si]
+                        bi = set(slot.get("block_indices", []))
+                        if not bi:
+                            bi = {si[0]} if si else set()
+                        start_min = slot.get("start_min")
+                        end_min = slot.get("end_min")
+                        duration_min = end_min - start_min
+
+                        options.append({
+                            "days": [single_label],
+                            "day_ids": [single_day.id],
+                            "day_id": single_day.id,
+                            "start_min": start_min,
+                            "end_min": end_min,
+                            "duration_min": duration_min,
+                            "block_indices": bi,
+                            "blocks_by_day": {single_day.id: bi},
+                            "slot_indexes": si,
+                            "blocks_spanned": set(slot.get("blocks_spanned", [])),
+                            "slot_labels": [slot.get("label", "")],
+                            "num_slots": len(si),
+                        })
+
+            if logger:
+                logger.info("generate_subject_start_options: Subject %s (%s) -> %d options from DB patterns",
+                           subj_id, subj_type, len(options))
+            return options
+
+    # ── Hardcoded fallback (only if no DB patterns configured) ────────────
 
     # --- LAB logic: MW, TTh, F patterns (same as LEC, prioritizing MW/TTh) ---
     # LAB subjects use same day patterns as LEC per user requirements
@@ -3411,6 +3538,7 @@ def _generate_fallback_time_windows(
     slots_by_day: Dict[str, List[Dict[str, Any]]],
     days: List,
     logger: Any,
+    day_patterns: List[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate fallback time windows for a subject when no valid options exist.
@@ -4245,7 +4373,12 @@ def run_cp_scheduler(
     logger.info(f"Loaded {len(instructors)} instructors")
 
     from .deductions import get_deduction_map
+    from .settings import get_system_settings
     deductions = get_deduction_map(db)
+    sys_settings = get_system_settings(db)
+    REGULAR_BASE_HOURS = int(sys_settings.get("regular_base_hours", 24))
+    VISITING_BASE_HOURS = int(sys_settings.get("visiting_base_hours", 30))
+    logger.info(f"Instructor limits: Regular base={REGULAR_BASE_HOURS}hrs, Visiting={VISITING_BASE_HOURS}hrs")
 
     instructor_limit_minutes: Dict[int, int] = {}
     for inst in instructors:
@@ -4256,10 +4389,10 @@ def run_cp_scheduler(
         employment_type = (getattr(inst, "employment_type", None) or "regular").strip().lower()
         designation = (getattr(inst, "designation", None) or "").strip().lower()
         if employment_type == "visiting":
-            limit_hours = 30
+            limit_hours = VISITING_BASE_HOURS
         else:
             deduction = deductions.get(designation, 0) if designation else 0
-            limit_hours = max(0, 24 - deduction)
+            limit_hours = max(0, REGULAR_BASE_HOURS - deduction)
         instructor_limit_minutes[inst_id] = int(limit_hours) * 60
 
     instructor_current_minutes: Dict[int, int] = defaultdict(int)
@@ -4380,6 +4513,24 @@ def run_cp_scheduler(
     day_labels = [d.label for d in days]
     day_id_map = {d.label: d.id for d in days}
     day_id_to_label = {d.id: d.label for d in days}
+
+    # Load day patterns from database (configurable scheduling patterns)
+    try:
+        db_day_patterns = db.query(models.DayPattern).order_by(models.DayPattern.priority).all()
+        day_patterns_list = [
+            {
+                "name": p.name,
+                "day_ids": p.day_ids,
+                "priority": p.priority,
+                "is_active": p.is_active,
+                "applies_to": p.applies_to,
+            }
+            for p in db_day_patterns
+        ]
+        logger.info(f"Loaded {len(day_patterns_list)} day patterns from DB: {[p['name'] for p in day_patterns_list]}")
+    except Exception as e:
+        logger.warning(f"Failed to load day patterns from DB: {e} — using hardcoded fallback")
+        day_patterns_list = []
     
     # Build slots_by_day directly from DB time blocks (real registrar grid)
     slots_by_day = {day: [] for day in day_labels}
@@ -4418,7 +4569,8 @@ def run_cp_scheduler(
             slots_by_day=slots_by_day,
             slot_to_block_map=slot_to_block_map,
             days=days,
-            logger=logger
+            logger=logger,
+            day_patterns=day_patterns_list,
         )
         if not options:
             logger.warning(f"⚠️ No valid start options for subject: {subject.code} - {getattr(subject, 'description', 'Unnamed')} "
@@ -5118,6 +5270,7 @@ def run_cp_scheduler(
             slots_by_day=slots_by_day,
             slot_to_block_map=slot_to_block_map,
             sampling=sampling,
+            day_patterns=day_patterns_list,
         )
         
         # NEW APPROACH: Create CP variables from options with room/instructor filtering
@@ -5393,7 +5546,7 @@ def run_cp_scheduler(
                 logger.warning(f"  - Available days: {list(slots_by_day.keys())}")
                 
                 # FALLBACK: Generate basic time windows for this subject
-                subj_opts = _generate_fallback_time_windows(subject, slots_by_day, days, logger)
+                subj_opts = _generate_fallback_time_windows(subject, slots_by_day, days, logger, day_patterns=day_patterns_list)
                 
                 if subj_opts:
                     logger.warning(f"  - Generated {len(subj_opts)} fallback time windows")
@@ -8744,6 +8897,7 @@ def run_cp_scheduler(
                     year=subj_year,
                     block_label=subj_block,
                     max_recommendations=5,
+                    day_patterns=day_patterns_list,
                 )
                 
                 diagnostic_entry["recommendations"] = recommendations
@@ -9493,6 +9647,7 @@ def run_cp_scheduler(
                                 year=subj_year,
                                 block_label=removed_block,
                                 max_recommendations=5,
+                                day_patterns=day_patterns_list,
                             )
                             entry["recommendations"] = recommendations
                             logger.info(f"[DIAGNOSTICS 2ND PASS] Generated {len(recommendations)} recommendations for subject {removed_sid} block {removed_block}")
