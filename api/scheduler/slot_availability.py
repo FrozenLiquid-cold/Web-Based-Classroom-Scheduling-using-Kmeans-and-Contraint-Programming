@@ -149,17 +149,19 @@ def generate_recommendations(
         ("T-TH", ["T", "TH"]),
     ]
     SINGLE_PATTERNS = [("F", ["F"])]
-    WEEKDAY_LABELS = {"M", "T", "W", "TH", "F"}
+    STANDARD_LABELS = {"M", "T", "W", "TH", "F"}
     WEEKEND_LABELS = {"SAT", "SUN"}
     
+    # Extra days: any day in the DB that isn't part of the standard set
+    extra_singles = [(d.label, [d.label]) for d in days if d.label.upper() not in STANDARD_LABELS]
+    
     if is_lab:
-        # LAB: paired M-W / T-TH patterns + single Friday, then weekends
+        # LAB: paired M-W / T-TH patterns + single Friday, then extra days
         friday_single = [(d.label, [d.label]) for d in days if d.label.upper() == "F"]
-        weekend_singles = [(d.label, [d.label]) for d in days if d.label.upper() in WEEKEND_LABELS]
-        patterns_to_try = PAIRED_PATTERNS + friday_single + weekend_singles
+        patterns_to_try = PAIRED_PATTERNS + friday_single + extra_singles
     else:
-        # LEC: paired M-W / T-TH patterns + Friday single-day
-        patterns_to_try = PAIRED_PATTERNS + SINGLE_PATTERNS
+        # LEC: paired M-W / T-TH patterns + Friday single-day + extra days
+        patterns_to_try = PAIRED_PATTERNS + SINGLE_PATTERNS + extra_singles
 
     def _check_slot_on_day(room_id, day_id, start_min, end_min):
         """Check if room is free for the given time range on the given day."""

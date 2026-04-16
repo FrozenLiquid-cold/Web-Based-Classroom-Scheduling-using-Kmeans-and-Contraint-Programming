@@ -490,13 +490,8 @@ def get_instructor_workload(instructor_id: int):
         employment_type = (getattr(instructor, "employment_type", None) or "regular").strip().lower()
         designation = (getattr(instructor, "designation", None) or "").strip()
 
-        deductions = {
-            "program chair": 3,
-            "college secretary": 3,
-            "dean": 12,
-            "associate dean": 12,
-            "director": 12,
-        }
+        from ..scheduler.deductions import get_deduction_map
+        deductions = get_deduction_map(db)
 
         if employment_type == "visiting":
             limit_hours = 30
@@ -726,6 +721,10 @@ def create_day():
         db.add(db_day)
         db.commit()
         db.refresh(db_day)
+
+        # Auto-create default time blocks for the new day
+        _seed_default_time_blocks_for_day(db, db_day.id)
+
         return jsonify(_serialize(db_day, schemas.DayResponse)), 201
 
 
@@ -766,9 +765,59 @@ def delete_day(day_id: int):
         day = db.query(models.Day).filter(models.Day.id == day_id).first()
         if not day:
             return jsonify({"detail": "Day not found"}), 404
+        # Auto-delete associated time blocks first
+        db.query(models.TimeBlock).filter(models.TimeBlock.day_id == day_id).delete()
         db.delete(day)
         db.commit()
         return "", 204
+
+
+def _seed_default_time_blocks_for_day(db, day_id: int):
+    """Create the 14 default registrar time windows for a single day.
+
+    Called automatically when a new Day is created via the API so that
+    it is immediately schedulable without manual time-block setup.
+    """
+    # The original 14 registrar windows  (start, end, is_lab)
+    registrar_windows = [
+        ("07:30", "08:30", False),
+        ("09:00", "10:00", False),
+        ("10:30", "11:30", False),
+        ("07:30", "09:00", True),
+        ("09:00", "10:30", True),
+        ("10:30", "12:00", True),
+        ("13:00", "14:00", False),
+        ("14:30", "15:30", False),
+        ("16:00", "17:00", False),
+        ("13:00", "14:30", True),
+        ("14:30", "16:00", True),
+        ("16:00", "17:30", True),
+        ("17:30", "19:00", False),
+        ("08:00", "11:00", False),  # NSTP
+    ]
+
+    # Find the max block_id to auto-increment
+    max_bid = db.query(models.TimeBlock.block_id).order_by(models.TimeBlock.block_id.desc()).first()
+    next_bid = (max_bid[0] + 1) if max_bid else 1
+
+    for start, end, is_lab in registrar_windows:
+        s_min = _time_str_to_minutes(start)
+        e_min = _time_str_to_minutes(end)
+        tb = models.TimeBlock(
+            block_id=next_bid,
+            day_id=day_id,
+            label=_format_time_label(start, end),
+            start_time=start,
+            end_time=end,
+            start_min=s_min,
+            end_min=e_min,
+            is_lab=is_lab,
+        )
+        db.add(tb)
+        next_bid += 1
+
+    db.commit()
+    logger.info("Auto-created 14 default time blocks for day_id=%s", day_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1337,3 +1386,317 @@ def delete_room(room_id: int):
         db.commit()
         return "", 204
 
+
+# ---------------------------------------------------------------------------
+# Designation Deductions routes
+# ---------------------------------------------------------------------------
+@entities_bp.route("/designation-deductions", methods=["GET"])
+def list_deductions():
+    with _get_session() as db:
+        rows = db.query(models.DesignationDeduction).order_by(models.DesignationDeduction.designation).all()
+        return jsonify([
+            {"id": r.id, "designation": r.designation, "deduction_hours": r.deduction_hours}
+            for r in rows
+        ])
+
+
+@entities_bp.route("/designation-deductions", methods=["POST"])
+def create_deduction():
+    payload = request.get_json(force=True) or {}
+    designation = (payload.get("designation") or "").strip()
+    deduction_hours = payload.get("deduction_hours")
+
+    if not designation:
+        return jsonify({"detail": "Designation is required"}), 400
+    if deduction_hours is None or not isinstance(deduction_hours, (int, float)):
+        return jsonify({"detail": "Deduction hours must be a number"}), 400
+
+    with _get_session() as db:
+        existing = db.query(models.DesignationDeduction).filter(
+            models.DesignationDeduction.designation == designation.lower()
+        ).first()
+        if existing:
+            return jsonify({"detail": f"Designation '{designation}' already exists"}), 400
+
+        row = models.DesignationDeduction(
+            designation=designation.lower(),
+            deduction_hours=int(deduction_hours),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return jsonify({"id": row.id, "designation": row.designation, "deduction_hours": row.deduction_hours}), 201
+
+
+@entities_bp.route("/designation-deductions/<int:deduction_id>", methods=["PUT"])
+def update_deduction(deduction_id: int):
+    payload = request.get_json(force=True) or {}
+    with _get_session() as db:
+        row = db.query(models.DesignationDeduction).filter(models.DesignationDeduction.id == deduction_id).first()
+        if not row:
+            return jsonify({"detail": "Not found"}), 404
+
+        if "designation" in payload:
+            new_desig = (payload["designation"] or "").strip().lower()
+            if new_desig and new_desig != row.designation:
+                dup = db.query(models.DesignationDeduction).filter(
+                    models.DesignationDeduction.designation == new_desig,
+                    models.DesignationDeduction.id != deduction_id,
+                ).first()
+                if dup:
+                    return jsonify({"detail": f"Designation '{new_desig}' already exists"}), 400
+                row.designation = new_desig
+
+        if "deduction_hours" in payload:
+            row.deduction_hours = int(payload["deduction_hours"])
+
+        db.commit()
+        db.refresh(row)
+        return jsonify({"id": row.id, "designation": row.designation, "deduction_hours": row.deduction_hours})
+
+
+@entities_bp.route("/designation-deductions/<int:deduction_id>", methods=["DELETE"])
+def delete_deduction(deduction_id: int):
+    with _get_session() as db:
+        row = db.query(models.DesignationDeduction).filter(models.DesignationDeduction.id == deduction_id).first()
+        if not row:
+            return jsonify({"detail": "Not found"}), 404
+        db.delete(row)
+        db.commit()
+        return "", 204
+
+
+# ---------------------------------------------------------------------------
+# Time Block (Time Slots) routes
+# ---------------------------------------------------------------------------
+
+def _format_time_label(start_time_str: str, end_time_str: str) -> str:
+    """Build a human-readable label like '7:30–9:00' from 24-hour HH:MM strings."""
+    def _fmt(t):
+        t = (t or "").strip()
+        # Handle datetime.time objects
+        if hasattr(t, 'strftime'):
+            t = t.strftime("%H:%M")
+        # Strip leading zero and trailing :00 seconds
+        t = re.sub(r":\d{2}$", "", t) if t.count(":") > 1 else t
+        parts = t.split(":")
+        if len(parts) != 2:
+            return t
+        h, m = int(parts[0]), int(parts[1])
+        return f"{h}:{m:02d}"
+    return f"{_fmt(start_time_str)}–{_fmt(end_time_str)}"
+
+
+def _serialize_time_block(tb) -> dict:
+    """Serialize a TimeBlock ORM row to a JSON-safe dict."""
+    start_str = tb.start_time.strftime("%H:%M") if hasattr(tb.start_time, "strftime") else str(tb.start_time)
+    end_str = tb.end_time.strftime("%H:%M") if hasattr(tb.end_time, "strftime") else str(tb.end_time)
+    # Strip seconds if present (e.g. "07:30:00" -> "07:30")
+    start_str = re.sub(r":\d{2}$", "", start_str) if start_str.count(":") > 1 else start_str
+    end_str = re.sub(r":\d{2}$", "", end_str) if end_str.count(":") > 1 else end_str
+    return {
+        "block_id": tb.block_id,
+        "day_id": tb.day_id,
+        "label": tb.label or _format_time_label(start_str, end_str),
+        "start_time": start_str,
+        "end_time": end_str,
+        "start_min": tb.start_min,
+        "end_min": tb.end_min,
+        "is_lab": bool(tb.is_lab),
+    }
+
+
+@entities_bp.route("/time-blocks", methods=["GET"])
+def list_time_blocks():
+    """List all time blocks, optionally filtered by day_id."""
+    with _get_session() as db:
+        q = db.query(models.TimeBlock).order_by(models.TimeBlock.day_id, models.TimeBlock.start_min)
+        day_id = request.args.get("day_id", type=int)
+        if day_id is not None:
+            q = q.filter(models.TimeBlock.day_id == day_id)
+        rows = q.all()
+        return jsonify([_serialize_time_block(r) for r in rows])
+
+
+@entities_bp.route("/time-blocks", methods=["POST"])
+def create_time_block():
+    """Create one or more time blocks.
+
+    Accepts ``day_ids`` (list) to bulk-create the same window across multiple
+    days, or a single ``day_id``.
+    """
+    payload = request.get_json(force=True) or {}
+
+    start_time = (payload.get("start_time") or "").strip()
+    end_time = (payload.get("end_time") or "").strip()
+    is_lab = bool(payload.get("is_lab", False))
+
+    if not start_time or not end_time:
+        return jsonify({"detail": "start_time and end_time are required (HH:MM)"}), 400
+
+    try:
+        start_min = _time_str_to_minutes(start_time)
+        end_min = _time_str_to_minutes(end_time)
+    except Exception:
+        return jsonify({"detail": "Invalid time format. Use HH:MM (24-hour)."}), 400
+
+    if end_min <= start_min:
+        return jsonify({"detail": "end_time must be after start_time"}), 400
+
+    # Support both single day_id and bulk day_ids
+    day_ids = payload.get("day_ids") or []
+    if not day_ids:
+        single = payload.get("day_id")
+        if single is not None:
+            day_ids = [int(single)]
+    if not day_ids:
+        return jsonify({"detail": "day_id or day_ids is required"}), 400
+
+    label = _format_time_label(start_time, end_time)
+
+    created = []
+    with _get_session() as db:
+        # Validate all day_ids exist
+        existing_days = {d.id for d in db.query(models.Day).all()}
+        for did in day_ids:
+            if int(did) not in existing_days:
+                return jsonify({"detail": f"Day ID {did} not found"}), 404
+
+        # Find the max block_id to auto-increment
+        max_bid = db.query(models.TimeBlock.block_id).order_by(models.TimeBlock.block_id.desc()).first()
+        next_bid = (max_bid[0] + 1) if max_bid else 1
+
+        for did in day_ids:
+            # Check for duplicates (same day, same time range, same type)
+            dup = db.query(models.TimeBlock).filter(
+                models.TimeBlock.day_id == int(did),
+                models.TimeBlock.start_min == start_min,
+                models.TimeBlock.end_min == end_min,
+                models.TimeBlock.is_lab == is_lab,
+            ).first()
+            if dup:
+                # Skip duplicates silently
+                continue
+
+            tb = models.TimeBlock(
+                block_id=next_bid,
+                day_id=int(did),
+                label=label,
+                start_time=start_time,
+                end_time=end_time,
+                start_min=start_min,
+                end_min=end_min,
+                is_lab=is_lab,
+            )
+            db.add(tb)
+            created.append(tb)
+            next_bid += 1
+
+        db.commit()
+        for tb in created:
+            db.refresh(tb)
+
+        return jsonify([_serialize_time_block(tb) for tb in created]), 201
+
+
+@entities_bp.route("/time-blocks/<int:block_id>", methods=["PUT"])
+def update_time_block(block_id: int):
+    payload = request.get_json(force=True) or {}
+    with _get_session() as db:
+        tb = db.query(models.TimeBlock).filter(models.TimeBlock.block_id == block_id).first()
+        if not tb:
+            return jsonify({"detail": "Time block not found"}), 404
+
+        if "start_time" in payload or "end_time" in payload:
+            start_time = (payload.get("start_time") or tb.start_time.strftime("%H:%M") if hasattr(tb.start_time, "strftime") else str(tb.start_time)).strip()
+            end_time = (payload.get("end_time") or tb.end_time.strftime("%H:%M") if hasattr(tb.end_time, "strftime") else str(tb.end_time)).strip()
+            # Strip seconds
+            start_time = re.sub(r":\d{2}$", "", start_time) if start_time.count(":") > 1 else start_time
+            end_time = re.sub(r":\d{2}$", "", end_time) if end_time.count(":") > 1 else end_time
+            try:
+                start_min = _time_str_to_minutes(start_time)
+                end_min = _time_str_to_minutes(end_time)
+            except Exception:
+                return jsonify({"detail": "Invalid time format"}), 400
+            if end_min <= start_min:
+                return jsonify({"detail": "end_time must be after start_time"}), 400
+            tb.start_time = start_time
+            tb.end_time = end_time
+            tb.start_min = start_min
+            tb.end_min = end_min
+            tb.label = _format_time_label(start_time, end_time)
+
+        if "is_lab" in payload:
+            tb.is_lab = bool(payload["is_lab"])
+
+        if "day_id" in payload:
+            tb.day_id = int(payload["day_id"])
+
+        db.commit()
+        db.refresh(tb)
+        return jsonify(_serialize_time_block(tb))
+
+
+@entities_bp.route("/time-blocks/<int:block_id>", methods=["DELETE"])
+def delete_time_block(block_id: int):
+    with _get_session() as db:
+        tb = db.query(models.TimeBlock).filter(models.TimeBlock.block_id == block_id).first()
+        if not tb:
+            return jsonify({"detail": "Time block not found"}), 404
+        db.delete(tb)
+        db.commit()
+        return "", 204
+
+
+@entities_bp.route("/time-blocks/reset-defaults", methods=["POST"])
+def reset_time_blocks_to_defaults():
+    """Delete all time blocks and re-seed with the original 14 registrar windows for all existing days."""
+    with _get_session() as db:
+        # Delete all existing time blocks
+        db.query(models.TimeBlock).delete()
+        db.commit()
+
+        days = db.query(models.Day).order_by(models.Day.id).all()
+        if not days:
+            return jsonify({"detail": "No days found in database. Add days first."}), 400
+
+        # The original 14 registrar windows
+        registrar_windows = [
+            ("07:30", "08:30", False),
+            ("09:00", "10:00", False),
+            ("10:30", "11:30", False),
+            ("07:30", "09:00", True),
+            ("09:00", "10:30", True),
+            ("10:30", "12:00", True),
+            ("13:00", "14:00", False),
+            ("14:30", "15:30", False),
+            ("16:00", "17:00", False),
+            ("13:00", "14:30", True),
+            ("14:30", "16:00", True),
+            ("16:00", "17:30", True),
+            ("17:30", "19:00", False),
+            ("08:00", "11:00", False),  # NSTP
+        ]
+
+        next_bid = 1
+        created = []
+        for day in days:
+            for start, end, is_lab in registrar_windows:
+                s_min = _time_str_to_minutes(start)
+                e_min = _time_str_to_minutes(end)
+                tb = models.TimeBlock(
+                    block_id=next_bid,
+                    day_id=day.id,
+                    label=_format_time_label(start, end),
+                    start_time=start,
+                    end_time=end,
+                    start_min=s_min,
+                    end_min=e_min,
+                    is_lab=is_lab,
+                )
+                db.add(tb)
+                created.append(tb)
+                next_bid += 1
+
+        db.commit()
+        return jsonify({"message": f"Reset {len(created)} time blocks across {len(days)} days", "count": len(created)}), 200

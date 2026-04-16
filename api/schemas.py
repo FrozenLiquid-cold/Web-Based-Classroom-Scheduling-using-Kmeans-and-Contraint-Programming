@@ -80,12 +80,14 @@ class CollegeResponse(BaseModel):
 class CourseCreate(BaseModel):
     code: str
     description: str
+    major: Optional[str] = None
     college_id: int
 
 
 class CourseUpdate(BaseModel):
     code: Optional[str] = None
     description: Optional[str] = None
+    major: Optional[str] = None
     college_id: Optional[int] = None
 
 
@@ -93,6 +95,7 @@ class CourseResponse(BaseModel):
     id: int
     code: str
     description: str
+    major: Optional[str] = None
     college_id: int
 
     class Config:

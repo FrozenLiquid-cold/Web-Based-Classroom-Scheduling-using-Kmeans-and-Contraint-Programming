@@ -162,6 +162,7 @@ class QueueManager:
                         force_refit=job.payload.get("force_refit", False),
                         block_capacity_overrides=job.payload.get("block_capacities"),
                         blocks_count=job.payload.get("blocks_count"),
+                        school_year=job.payload.get("school_year"),
                         progress_callback=progress_callback,
                         phase_callback=phase_callback,
                     )

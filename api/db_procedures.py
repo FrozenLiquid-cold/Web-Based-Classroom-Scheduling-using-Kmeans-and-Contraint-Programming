@@ -100,7 +100,8 @@ def get_existing_bookings(
     semester: int,
     years: Optional[List[int]] = None,
     exclude_course_id: Optional[int] = None,
-    exclude_years: Optional[List[int]] = None
+    exclude_years: Optional[List[int]] = None,
+    school_year: Optional[str] = None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Get existing room and instructor bookings using stored procedure.
@@ -114,11 +115,60 @@ def get_existing_bookings(
             combined with exclude_course_id). When provided, only records
             matching BOTH the course AND the year levels are excluded.
             Records from the same course but different year levels are kept.
+        school_year: Optional academic year string (e.g. "2026-2027") to scope
+            bookings. If None, all school years are included.
     
     Returns:
         Tuple of (room_bookings, instructor_bookings) where each is a list of dicts
         with booking_type, resource_id, resource_name, day_id, time_label
     """
+    # Use ORM fallback when school_year filtering is needed
+    # (stored procedure doesn't support school_year parameter yet)
+    if school_year:
+        from api import models as _m
+        from sqlalchemy.orm import joinedload
+        
+        query = db.query(_m.Schedule).filter(
+            _m.Schedule.semester == semester,
+            _m.Schedule.school_year == school_year
+        ).options(joinedload(_m.Schedule.room))
+        
+        if exclude_course_id is not None:
+            if exclude_years:
+                # Exclude only records matching BOTH course AND year levels
+                from sqlalchemy import and_, not_
+                query = query.filter(
+                    not_(and_(
+                        _m.Schedule.course_id == exclude_course_id,
+                        _m.Schedule.year.in_(exclude_years)
+                    ))
+                )
+            else:
+                query = query.filter(_m.Schedule.course_id != exclude_course_id)
+        
+        schedules = query.all()
+        
+        room_bookings = []
+        instructor_bookings = []
+        for sched in schedules:
+            if sched.room_id and sched.room:
+                room_bookings.append({
+                    "resource_id": sched.room_id,
+                    "resource_name": sched.room.name,
+                    "day_id": sched.day_id,
+                    "time_label": sched.time or ""
+                })
+            if sched.instructor_id:
+                instructor_bookings.append({
+                    "resource_id": sched.instructor_id,
+                    "resource_name": str(sched.instructor_id),
+                    "day_id": sched.day_id,
+                    "time_label": sched.time or ""
+                })
+        
+        return room_bookings, instructor_bookings
+
+    # Original stored procedure path (no school_year filter)
     years_array = years if years else None
     exclude_years_array = exclude_years if exclude_years else None
     result = db.execute(

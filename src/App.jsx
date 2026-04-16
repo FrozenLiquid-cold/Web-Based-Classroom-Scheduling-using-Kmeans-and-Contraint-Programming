@@ -6,7 +6,7 @@ import InstructorLayout from './layouts/InstructorLayout'
 import Dashboard from './pages/Registrar/Dashboard'
 import InstructorDashboard from './pages/Instructor/Dashboard'
 import College from './pages/Registrar/College'
-import Course from './pages/Registrar/Course'
+import Course from './pages/Registrar/Program'
 import Instructor from './pages/Registrar/Instructor'
 import Day from './pages/Registrar/Day'
 import Subject from './pages/Registrar/Subject'
@@ -17,6 +17,7 @@ import Schedule from './pages/Registrar/Schedule'
 import InstructorSchedule from './pages/Instructor/Schedule'
 import InstructorSwapRequests from './pages/Instructor/SwapRequests'
 import Curriculum from './pages/Registrar/Curriculum'
+import Settings from './pages/Registrar/Settings'
 
 import RegistrarAccount from './pages/Registrar/Account'
 import InstructorAccount from './pages/Instructor/Account'
@@ -58,6 +59,7 @@ export default function App() {
 				<Route path="distances" element={<BuildingDistances />} />
 				<Route path="curriculum" element={<Curriculum />} />
 				<Route path="schedule" element={<Schedule />} />
+				<Route path="settings" element={<Settings />} />
 
 				<Route path="account" element={<RegistrarAccount />} />
 			</Route>

@@ -4,15 +4,16 @@ import { logout } from '../store/auth'
 const nav = [
     { to: '/r/dashboard', label: 'Dashboard' },
     { to: '/r/college', label: 'College' },
-    { to: '/r/course', label: 'Course' },
+    { to: '/r/course', label: 'Program' },
     { to: '/r/instructor', label: 'Instructor' },
     { to: '/r/day', label: 'Day' },
-    { to: '/r/subject', label: 'Subject' },
+    { to: '/r/subject', label: 'Course' },
     { to: '/r/room', label: 'Room' },
     { to: '/r/buildings', label: 'Buildings' },
     { to: '/r/distances', label: 'Matrix' },
     { to: '/r/schedule', label: 'Schedule' },
     { to: '/r/curriculum', label: 'Curriculum' },
+    { to: '/r/settings', label: 'Settings' },
     { to: '/r/account', label: 'Account' },
 ]
 
@@ -31,7 +32,7 @@ function NavIcon({ label }) {
                     <path d="M12 2L1 7l11 5 9-4.09V17h2V7L12 2zM3 19h18v2H3z" />
                 </svg>
             )
-        case 'Course':
+        case 'Program':
             return (
                 <svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                     <path d="M4 3h16v2H4V3zm0 4h16v12H4V7zm2 2v8h12V9H6z" />
@@ -49,7 +50,7 @@ function NavIcon({ label }) {
                     <path d="M7 2v2H5a2 2 0 00-2 2v3h18V6a2 2 0 00-2-2h-2V2h-2v2H9V2H7zm14 9H3v9a2 2 0 002 2h14a2 2 0 002-2v-9z" />
                 </svg>
             )
-        case 'Subject':
+        case 'Course':
             return (
                 <svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                     <path d="M6 2h9l5 5v15a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2zm8 6h4.5L14 3.5V8z" />
@@ -89,6 +90,12 @@ function NavIcon({ label }) {
             return (
                 <svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                     <path d="M12 12c2.761 0 5-2.239 5-5s-2.239-5-5-5-5 2.239-5 5 2.239 5 5 5zm0 2c-3.866 0-7 3.134-7 7h2a5 5 0 0110 0h2c0-3.866-3.134-7-7-7z" />
+                </svg>
+            )
+        case 'Settings':
+            return (
+                <svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                    <path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 00-.48-.41h-3.84a.48.48 0 00-.48.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87a.48.48 0 00.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.26.41.48.41h3.84c.24 0 .44-.17.48-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.61 3.61 0 0112 15.6z" />
                 </svg>
             )
         default:

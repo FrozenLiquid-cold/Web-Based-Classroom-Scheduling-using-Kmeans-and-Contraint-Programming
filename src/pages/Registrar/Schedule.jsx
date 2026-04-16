@@ -45,6 +45,7 @@ export default function RegistrarSchedule() {
     blocks_count: "",
     semester: "",
   });
+  const [selectedProgramCode, setSelectedProgramCode] = useState("");
   const [isSubmitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [schedule, setSchedule] = useState([]);
@@ -261,15 +262,78 @@ export default function RegistrarSchedule() {
     loadData();
   }, []);
 
-  const courseOptions = useMemo(
-    () =>
-      courses.map((course) => (
-        <option key={course.id} value={course.id}>
-          {course.code || course.name || `Course ${course.id}`}
-        </option>
-      )),
-    [courses]
+  // Build unique program options grouped by code
+  const programGroups = useMemo(() => {
+    const groups = {};
+    courses.forEach((c) => {
+      const code = (c.code || '').toUpperCase();
+      if (!groups[code]) {
+        groups[code] = { code, description: c.description, entries: [] };
+      }
+      groups[code].entries.push(c);
+    });
+    return groups;
+  }, [courses]);
+
+  const programOptions = useMemo(
+    () => {
+      const codes = Object.keys(programGroups).sort();
+      return codes.map((code) => {
+        const g = programGroups[code];
+        return (
+          <option key={code} value={code}>
+            {code}
+          </option>
+        );
+      });
+    },
+    [programGroups]
   );
+
+  // Majors for the selected program code
+  const selectedProgramGroup = programGroups[selectedProgramCode] || null;
+  const hasMajors = selectedProgramGroup
+    ? selectedProgramGroup.entries.some((e) => e.major)
+    : false;
+  const majorOptions = useMemo(() => {
+    if (!selectedProgramGroup || !hasMajors) return [];
+    return selectedProgramGroup.entries
+      .filter((e) => e.major)
+      .sort((a, b) => (a.major || '').localeCompare(b.major || ''))
+      .map((e) => (
+        <option key={e.id} value={e.id}>
+          {e.major}
+        </option>
+      ));
+  }, [selectedProgramGroup, hasMajors]);
+
+  // Handle program code selection
+  const handleProgramCodeChange = (e) => {
+    const code = e.target.value;
+    setSelectedProgramCode(code);
+    const group = programGroups[code];
+    if (!group) {
+      setForm((prev) => ({ ...prev, course_id: "" }));
+      return;
+    }
+    // If only one entry or no majors, auto-select course_id
+    const hasM = group.entries.some((en) => en.major);
+    if (!hasM && group.entries.length === 1) {
+      setForm((prev) => ({ ...prev, course_id: String(group.entries[0].id) }));
+    } else if (!hasM) {
+      // Multiple entries without majors — pick first
+      setForm((prev) => ({ ...prev, course_id: String(group.entries[0].id) }));
+    } else {
+      // Has majors — wait for major selection
+      setForm((prev) => ({ ...prev, course_id: "" }));
+    }
+  };
+
+  // Handle major selection
+  const handleMajorChange = (e) => {
+    const courseId = e.target.value;
+    setForm((prev) => ({ ...prev, course_id: courseId }));
+  };
 
   const handleChange = (event) => {
     const { name, value } = event.target;
@@ -311,7 +375,7 @@ export default function RegistrarSchedule() {
           if (items.length > 0) {
             setSavedScheduleMessage(`Loaded saved schedule (${items.length} entries).`);
           } else {
-            setSavedScheduleMessage("No saved schedule found for the selected course, year, and semester.");
+            setSavedScheduleMessage("No saved schedule found for the selected program, year, and semester.");
           }
           return;
         }
@@ -325,7 +389,7 @@ export default function RegistrarSchedule() {
 
         setSchedule([]);
         setHasCheckedSavedSchedule(true);
-        setSavedScheduleMessage("No saved schedule found for the selected course, year, and semester.");
+        setSavedScheduleMessage("No saved schedule found for the selected program, year, and semester.");
       } catch (err) {
         if (cancelled) return;
         setSchedule([]);
@@ -1602,7 +1666,7 @@ export default function RegistrarSchedule() {
       }
     }
 
-    // 3. All rooms of a type booked on a weekday — one recommendation per type
+    // 3. All rooms of a type booked on a weekday AND at high capacity — one recommendation per type
     const fullDaysByType = {};  // type -> [day labels]
     for (const u of utilization) {
       if (u.isWeekend) continue;
@@ -1615,6 +1679,9 @@ export default function RegistrarSchedule() {
     }
     for (const [rType, info] of Object.entries(fullDaysByType)) {
       const avgPct = Math.round(info.avgPct / info.count);
+      // Only recommend adding rooms when capacity is genuinely strained (≥80%)
+      // Below 80% there are still plenty of free time slots available
+      if (avgPct < 80) continue;
       const daysList = info.days.join(', ');
       recommendations.push({
         type: 'room_full',
@@ -1957,18 +2024,34 @@ export default function RegistrarSchedule() {
 
       <form onSubmit={handleSubmit} className="grid gap-4 sm:grid-cols-2">
         <label className="flex flex-col gap-1 text-sm">
-          Select Course
+          Select Program
           <select
-            name="course_id"
-            value={form.course_id}
-            onChange={handleChange}
+            name="program_code"
+            value={selectedProgramCode}
+            onChange={handleProgramCodeChange}
             className="px-3 py-2 border rounded"
             required
           >
-            <option value="">Choose a course</option>
-            {courseOptions}
+            <option value="">Choose a program</option>
+            {programOptions}
           </select>
         </label>
+
+        {hasMajors && (
+          <label className="flex flex-col gap-1 text-sm">
+            Select Major
+            <select
+              name="course_id"
+              value={form.course_id}
+              onChange={handleMajorChange}
+              className="px-3 py-2 border rounded"
+              required
+            >
+              <option value="">Choose a major</option>
+              {majorOptions}
+            </select>
+          </label>
+        )}
 
         <label className="flex flex-col gap-1 text-sm">
           Select Year
@@ -2494,7 +2577,7 @@ export default function RegistrarSchedule() {
                         onClick={() => setMergeModal(prev => ({ ...prev, showAllCourses: !prev.showAllCourses }))}
                         className="text-[10px] bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full hover:bg-indigo-200 transition-colors"
                       >
-                        {mergeModal.showAllCourses ? 'All courses' : 'Same course'}
+                        {mergeModal.showAllCourses ? 'All programs' : 'Same program'}
                       </button>
                     </div>
                     <div className="p-4 space-y-3">

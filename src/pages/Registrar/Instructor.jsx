@@ -6,6 +6,7 @@ export default function Instructor() {
 	const [items, setItems] = useState([])
 	const [colleges, setColleges] = useState([])
 	const [subjects, setSubjects] = useState([])
+	const [designations, setDesignations] = useState([])
 	const [q, setQ] = useState('')
 	const [show, setShow] = useState(false)
 	const [editing, setEditing] = useState(null)
@@ -18,7 +19,7 @@ export default function Instructor() {
 	const [specialization, setSpecialization] = useState([])
 	const [specializationSearch, setSpecializationSearch] = useState('')
 	const [error, setError] = useState('')
-	const [entries, setEntries] = useState(10)
+	const [entries, setEntries] = useState(50)
 	const [processing, setProcessing] = useState(false)
 	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
@@ -42,6 +43,11 @@ export default function Instructor() {
 			setItems(instructorsData)
 			setColleges(collegesData)
 			setSubjects(subjectsData || [])
+			// Load designations from settings
+			try {
+				const dRes = await fetch('http://localhost:8000/api/designation-deductions')
+				if (dRes.ok) setDesignations(await dRes.json())
+			} catch (e) { console.error('Failed to load designations', e) }
 			dataLoadedRef.current = true;
 		} catch (error) {
 			console.error('Error loading data:', error);
@@ -239,6 +245,49 @@ export default function Instructor() {
 		})
 	}
 
+	// Group instructors by college for display
+	const grouped = useMemo(() => {
+		const collegeMap = {}
+		colleges.forEach(c => { collegeMap[c.id] = c })
+
+		const byCollege = {}
+		const unassigned = []
+
+		shown.forEach(it => {
+			const cid = it.college_id || it.collegeId
+			if (!cid) {
+				unassigned.push(it)
+				return
+			}
+			if (!byCollege[cid]) byCollege[cid] = []
+			byCollege[cid].push(it)
+		})
+
+		const groups = []
+		const sortedIds = Object.keys(byCollege).sort((a, b) => {
+			const ca = collegeMap[a]?.code || ''
+			const cb = collegeMap[b]?.code || ''
+			return ca.localeCompare(cb)
+		})
+
+		sortedIds.forEach(cid => {
+			groups.push({
+				college: collegeMap[cid],
+				instructors: byCollege[cid].sort((a, b) => {
+					const nameA = `${a.last_name || ''} ${a.first_name || ''}`.toLowerCase()
+					const nameB = `${b.last_name || ''} ${b.first_name || ''}`.toLowerCase()
+					return nameA.localeCompare(nameB)
+				}),
+			})
+		})
+
+		if (unassigned.length > 0) {
+			groups.push({ college: null, instructors: unassigned })
+		}
+
+		return groups
+	}, [shown, colleges])
+
 	return (
 		<div>
 			<div className="flex items-center justify-between mb-4">
@@ -250,7 +299,7 @@ export default function Instructor() {
 			</div>
 			{/* Standardized fixed-height container for list/table area */}
 			<div className="h-[520px] overflow-auto pr-1 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
-				<div className="mb-1 text-navy text-1xl font-semibold">List of Instructor</div>
+				<div className="mb-1 text-navy text-1xl font-semibold">Core Faculty per College</div>
 
 				<div className="flex items-center justify-between mb-3 gap-4">
 					<div className="flex items-center gap-2 text-sm">
@@ -266,74 +315,91 @@ export default function Instructor() {
 					</div>
 					<input className="w-full max-w-sm px-3 py-2 rounded-full border" placeholder="Search: Instructor" value={q} onChange={e => setQ(e.target.value)} />
 				</div>
-				<div className="overflow-x-auto">
-					<table className="min-w-full text-sm border border-gray-400">
-						<thead>
-							<tr className="bg-navy text-white border-b-2 border-gray-500">
-								<th className="text-left px-3 py-2 border-r border-gray-300">No.</th>
-								<th className="text-left px-3 py-2 border-r border-gray-300">Instructor</th>
-								<th className="text-left px-3 py-2 border-r border-gray-300">College</th>
-								<th className="text-left px-3 py-2 border-r border-gray-300">Specialization</th>
-								<th className="text-center px-3 py-2 border-r border-gray-300">Status</th>
-								<th className="text-center px-3 py-2 w-36">Action</th>
-							</tr>
-						</thead>
-						<tbody className="divide-y divide-gray-300">
-							{shown.map((it, idx) => {
-								const firstName = it.first_name || it.firstName || ''
-								const middleName = it.middle_name || it.middleName || ''
-								const lastName = it.last_name || it.lastName || ''
-								const fullName = `${firstName} ${middleName ? middleName + ' ' : ''}${lastName}`.trim()
-								const specializationText = it.assignable_courses || it.assignableCourses || ''
-								return (
-									<tr key={it.id} className={idx % 2 ? 'bg-gray-50' : ''}>
-										<td className="px-3 py-2 border-r border-gray-300">{idx + 1}</td>
-										<td className="px-3 py-2 border-r border-gray-300">{fullName || 'N/A'}</td>
-										<td className="px-3 py-2 border-r border-gray-300">{collegeName(it.college_id || it.collegeId) || '-'}</td>
-										<td className="px-3 py-2 border-r border-gray-300">{specializationText || '-'}</td>
-										<td className="px-3 py-2 border-r border-gray-300 text-center">
-											<button
-												className={`inline-block px-2 py-0.5 rounded-full text-xs font-semibold cursor-pointer hover:opacity-80 ${it.is_active !== false ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-													}`}
-												title={it.is_active !== false ? 'Click to deactivate' : 'Click to activate'}
-												onClick={() => {
-													const fullName = `${it.first_name || ''} ${it.last_name || ''}`.trim()
-													const newActive = it.is_active === false
-													setConfirmDialog({
-														open: true,
-														title: newActive ? 'Activate Instructor' : 'Deactivate Instructor',
-														message: `Are you sure you want to ${newActive ? 'activate' : 'deactivate'} "${fullName}"?`,
-														confirmText: newActive ? 'Activate' : 'Deactivate',
-														variant: 'warning',
-														onConfirm: async () => {
-															setConfirmDialog({ open: false })
-															try {
-																await upsert('instructor', { id: it.id, is_active: newActive })
-																await load(true)
-															} catch (err) { alert(err.message || 'Failed to toggle status') }
-														},
-													})
-												}}
-											>
-												{it.is_active !== false ? 'Active' : 'Inactive'}
-											</button>
-										</td>
-										<td className="px-3 py-2 space-x-3 text-center">
-											<button className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-600 hover:opacity-90" title="Edit" onClick={() => openEdit(it)}>
-												<img src="/assets/edit.png" alt="Edit" className="w-4 h-4 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
-											</button>
-											<button className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-red-600 hover:opacity-90" title="Delete" onClick={() => onDelete(it.id)}>
-												<img src="/assets/delete.png" alt="Delete" className="w-4 h-4 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
-											</button>
-										</td>
+				<div className="overflow-x-auto space-y-4">
+					{grouped.length === 0 && (
+						<div className="text-center text-gray-400 py-10">No records found</div>
+					)}
+					{grouped.map(({ college, instructors: instrList }) => (
+						<div key={college?.id || 'unassigned'} className="border border-gray-300 rounded-lg overflow-hidden">
+							{/* College header */}
+							<div className="bg-navy/90 text-white px-4 py-2 font-semibold text-sm flex items-center gap-2">
+								<svg className="w-4 h-4 opacity-70" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3L1 9l4 2.18v6L12 21l7-3.82v-6l2-1.09V17h2V9L12 3zm6.82 6L12 12.72 5.18 9 12 5.28 18.82 9zM17 15.99l-5 2.73-5-2.73v-3.72L12 15l5-2.73v3.72z" /></svg>
+								<span>{college?.code || 'Unassigned'}</span>
+								{college && <span className="font-normal opacity-70">— {college.description}</span>}
+								<span className="ml-auto text-xs opacity-60">{instrList.length} instructor{instrList.length !== 1 ? 's' : ''}</span>
+							</div>
+							{/* Instructors table */}
+							<table className="min-w-full text-sm">
+								<thead>
+									<tr className="bg-gray-100 border-b border-gray-300">
+										<th className="text-left px-3 py-1.5 w-12 text-gray-500 text-xs font-medium">#</th>
+										<th className="text-left px-3 py-1.5 text-gray-500 text-xs font-medium">Instructor</th>
+										<th className="text-left px-3 py-1.5 text-gray-500 text-xs font-medium">Designation</th>
+										<th className="text-left px-3 py-1.5 text-gray-500 text-xs font-medium">Specialization</th>
+										<th className="text-center px-3 py-1.5 w-20 text-gray-500 text-xs font-medium">Status</th>
+										<th className="text-center px-3 py-1.5 w-28 text-gray-500 text-xs font-medium">Action</th>
 									</tr>
-								)
-							})}
-							{filtered.length === 0 && (
-								<tr className="border-t border-gray-300"><td className="px-3 py-6 text-center text-gray-500" colSpan={6}>No records</td></tr>
-							)}
-						</tbody>
-					</table>
+								</thead>
+								<tbody className="divide-y divide-gray-200">
+									{instrList.map((it, idx) => {
+										const fName = it.first_name || it.firstName || ''
+										const mName = it.middle_name || it.middleName || ''
+										const lName = it.last_name || it.lastName || ''
+										const fullName = `${fName} ${mName ? mName + ' ' : ''}${lName}`.trim()
+										const specializationText = it.assignable_courses || it.assignableCourses || ''
+										return (
+											<tr key={it.id} className={idx % 2 ? 'bg-gray-50/50' : ''}>
+												<td className="px-3 py-2 text-gray-400 text-xs">{idx + 1}</td>
+												<td className="px-3 py-2 font-medium">{fullName || 'N/A'}</td>
+												<td className="px-3 py-2">
+													{it.designation
+														? <span className="inline-block bg-amber-50 text-amber-700 text-xs px-2 py-0.5 rounded-full font-medium">{it.designation}</span>
+														: <span className="text-gray-300">—</span>
+													}
+												</td>
+												<td className="px-3 py-2 text-xs text-gray-600">{specializationText || '-'}</td>
+												<td className="px-3 py-2 text-center">
+													<button
+														className={`inline-block px-2 py-0.5 rounded-full text-xs font-semibold cursor-pointer hover:opacity-80 ${it.is_active !== false ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+															}`}
+														title={it.is_active !== false ? 'Click to deactivate' : 'Click to activate'}
+														onClick={() => {
+															const fn = `${it.first_name || ''} ${it.last_name || ''}`.trim()
+															const newActive = it.is_active === false
+															setConfirmDialog({
+																open: true,
+																title: newActive ? 'Activate Instructor' : 'Deactivate Instructor',
+																message: `Are you sure you want to ${newActive ? 'activate' : 'deactivate'} "${fn}"?`,
+																confirmText: newActive ? 'Activate' : 'Deactivate',
+																variant: 'warning',
+																onConfirm: async () => {
+																	setConfirmDialog({ open: false })
+																	try {
+																		await upsert('instructor', { id: it.id, is_active: newActive })
+																		await load(true)
+																	} catch (err) { alert(err.message || 'Failed to toggle status') }
+																},
+															})
+														}}
+													>
+														{it.is_active !== false ? 'Active' : 'Inactive'}
+													</button>
+												</td>
+												<td className="px-3 py-2 space-x-2 text-center">
+													<button className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-blue-600 hover:opacity-90" title="Edit" onClick={() => openEdit(it)}>
+														<img src="/assets/edit.png" alt="Edit" className="w-3.5 h-3.5 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
+													</button>
+													<button className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-red-600 hover:opacity-90" title="Delete" onClick={() => onDelete(it.id)}>
+														<img src="/assets/delete.png" alt="Delete" className="w-3.5 h-3.5 object-contain" onError={(e) => { e.currentTarget.style.display = 'none' }} />
+													</button>
+												</td>
+											</tr>
+										)
+									})}
+								</tbody>
+							</table>
+						</div>
+					))}
 				</div>
 			</div>
 
@@ -350,11 +416,11 @@ export default function Instructor() {
 						</select>
 						<select className="w-full px-3 py-2 rounded border" value={designation} onChange={e => setDesignation(e.target.value)}>
 							<option value="">No designation</option>
-							<option value="Program Chair">Program Chair</option>
-							<option value="College Secretary">College Secretary</option>
-							<option value="Dean">Dean</option>
-							<option value="Associate Dean">Associate Dean</option>
-							<option value="Director">Director</option>
+							{designations.map(d => (
+								<option key={d.id} value={d.designation.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}>
+									{d.designation.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')} (−{d.deduction_hours} hrs)
+								</option>
+							))}
 						</select>
 						<select className="w-full px-3 py-2 rounded border" value={collegeId} onChange={e => setCollegeId(e.target.value)}>
 							<option value="">Select College (optional)</option>

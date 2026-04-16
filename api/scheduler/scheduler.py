@@ -74,6 +74,7 @@ def run_scheduler(
     force_refit: bool = False,
     block_capacity_overrides: Optional[List[Dict[str, Any]]] = None,
     blocks_count: Optional[int] = None,
+    school_year: Optional[str] = None,
     progress_callback: Optional[Any] = None,
     phase_callback: Optional[Any] = None,
 ) -> Tuple[List[Dict], Dict[int, Dict]]:
@@ -313,11 +314,14 @@ def run_scheduler(
             # Detect booking from other courses/years to prevent inter-run conflicts
             logger.info("Loading existing bookings to prevent conflicts...")
             
-            # Fetch all schedules for this semester
+            # Fetch all schedules for this semester AND school year
             # We want to BLOCK everything except what we are currently regenerating
-            existing_schedules = db.query(models.Schedule).filter(
+            _existing_q = db.query(models.Schedule).filter(
                 models.Schedule.semester == semester
-            ).options(joinedload(models.Schedule.room)).all()
+            )
+            if school_year:
+                _existing_q = _existing_q.filter(models.Schedule.school_year == school_year)
+            existing_schedules = _existing_q.options(joinedload(models.Schedule.room)).all()
             
             booked_room_ranges = defaultdict(list)
             booked_instr_ranges = defaultdict(list)
@@ -493,6 +497,7 @@ def run_scheduler(
                 booked_room_ranges_global=booked_room_ranges,
                 booked_instr_ranges_global=booked_instr_ranges,
                 phase_callback=phase_callback,
+                school_year=school_year,
             )
             
             cp_elapsed = time.time() - cp_start
@@ -1006,6 +1011,7 @@ def get_suggestions(
     course_id: int,
     year: int,
     semester: int,
+    school_year: Optional[str] = None,
 ) -> List[Dict]:
     """Get alternative scheduling suggestions for an unscheduled subject."""
     from .cp_scheduler import find_alternative_slots
@@ -1091,9 +1097,12 @@ def get_suggestions(
     
     # 3. Load Existing Bookings (Global)
     # Similar to run_scheduler, we need to know what's booked.
-    existing_schedules = db.query(models.Schedule).filter(
+    _sugg_q = db.query(models.Schedule).filter(
         models.Schedule.semester == semester
-    ).options(joinedload(models.Schedule.room)).all()
+    )
+    if school_year:
+        _sugg_q = _sugg_q.filter(models.Schedule.school_year == school_year)
+    existing_schedules = _sugg_q.options(joinedload(models.Schedule.room)).all()
 
     booked_room_slots_global = set()
     booked_instr_slots_global = set()

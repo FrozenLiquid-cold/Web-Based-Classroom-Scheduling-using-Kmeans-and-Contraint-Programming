@@ -42,6 +42,7 @@ def _load_course_and_candidates(
     course_id: int,
     year: int,
     semester: int,
+    school_year: Optional[str] = None,
 ) -> Tuple[models.Course, List[CandidateSlot], Dict[str, Any]]:
     """Fetch course metadata, candidate slots, and existing bookings."""
 
@@ -75,14 +76,17 @@ def _load_course_and_candidates(
             )
         )
 
+    _assign_q = session.query(models.Schedule).filter(
+        and_(
+            models.Schedule.semester == semester,
+            models.Schedule.year == year,
+        )
+    )
+    if school_year:
+        _assign_q = _assign_q.filter(models.Schedule.school_year == school_year)
     existing_room_assignments = {
         (sched.room_id, sched.day_id, sched.time)
-        for sched in session.query(models.Schedule).filter(
-            and_(
-                models.Schedule.semester == semester,
-                models.Schedule.year == year,
-            )
-        )
+        for sched in _assign_q
         if sched.room_id and sched.day_id and sched.time
     }
 
@@ -211,6 +215,7 @@ def schedule_course_refactored(
     year: int,
     semester: int,
     blocks_count: int,
+    school_year: Optional[str] = None,
 ) -> Dict[str, Any]:
     """End-to-end orchestration for course-specific scheduling."""
 
@@ -218,7 +223,7 @@ def schedule_course_refactored(
         course,
         candidates,
         context,
-    ) = _load_course_and_candidates(session, course_id, year, semester)
+    ) = _load_course_and_candidates(session, course_id, year, semester, school_year=school_year)
 
     clustered = _cluster_candidates(
         candidates,

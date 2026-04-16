@@ -832,9 +832,11 @@ def generate_subject_start_options(
     """
     options: List[Dict[str, Any]] = []
 
-    # Short day names
+    # Short day names (standard paired-pattern days)
     MON, TUE, WED, THU, FRI = "M", "T", "W", "TH", "F"
-    allowed_days = [MON, TUE, WED, THU, FRI]
+    STANDARD_DAYS = {MON, TUE, WED, THU, FRI}
+    # Dynamic: use ALL days from the database, not just M-F
+    allowed_days = [d.label for d in days]
     
     # Debug: Log input parameters
     # Safely get subject attributes with defaults
@@ -997,21 +999,54 @@ def generate_subject_start_options(
                     "num_slots": len(fri_slot_indexes),
                 })
 
+        # Extra days (any day not in the standard MW/TTH/F pattern set)
+        extra_days = [lbl for lbl in slots_by_day if lbl not in STANDARD_DAYS]
+        for extra_label in extra_days:
+            extra_day = day_label_to_day.get(extra_label)
+            if not extra_day or extra_label not in slots_by_day:
+                continue
+            for slot in slots_by_day[extra_label]:
+                slot_indexes = slot.get("index", [])
+                if isinstance(slot_indexes, int):
+                    slot_indexes = [slot_indexes]
+                block_indices = set(slot.get("block_indices", []))
+                if not block_indices:
+                    block_indices = {slot_indexes[0]} if slot_indexes else set()
+                start_min = slot.get("start_min")
+                end_min = slot.get("end_min")
+                duration_min = end_min - start_min
+                options.append({
+                    "days": [extra_label],
+                    "day_ids": [extra_day.id],
+                    "day_id": extra_day.id,
+                    "start_min": start_min,
+                    "end_min": end_min,
+                    "duration_min": duration_min,
+                    "block_indices": block_indices,
+                    "blocks_by_day": {extra_day.id: block_indices},
+                    "slot_indexes": slot_indexes,
+                    "blocks_spanned": set(slot.get("blocks_spanned", [])),
+                    "slot_labels": [slot.get("label", "")],
+                    "num_slots": len(slot_indexes),
+                })
+
         if logger and options:
-            logger.info(f"generate_subject_start_options: Subject {subj_id} (LAB) -> {len(options)} options (MW/TTh/F/single-day)")
+            logger.info(f"generate_subject_start_options: Subject {subj_id} (LAB) -> {len(options)} options (MW/TTh/F/extra-day)")
             
             # Track unique days and pattern types in options
             all_days_set = set()
             pattern_types = defaultdict(int)
             for opt in options:
-                days = opt.get("days", [])
-                all_days_set.update(days)
-                if set(days) == {MON, WED}:
+                opt_days = opt.get("days", [])
+                all_days_set.update(opt_days)
+                if set(opt_days) == {MON, WED}:
                     pattern_types["MW"] += 1
-                elif set(days) == {TUE, THU}:
+                elif set(opt_days) == {TUE, THU}:
                     pattern_types["TTh"] += 1
-                elif len(days) == 1 and FRI in days:
+                elif len(opt_days) == 1 and FRI in opt_days:
                     pattern_types["F"] += 1
+                else:
+                    pattern_types["EXTRA"] += 1
                     
             # Debug logging
             try:
@@ -1019,14 +1054,14 @@ def generate_subject_start_options(
                 start_min = options[0].get("start_min") if options else None
                 end_min = options[0].get("end_min") if options else None
                 duration_min = options[0].get("duration_min") if options else None
-                days = options[0].get("days") if options else []
+                opt_days = options[0].get("days") if options else []
                 slot_labels = options[0].get("slot_labels") if options else []
                 
                 logger.debug(
                     "[DEBUG OPTIONS] LAB subject %s code=%s days=%s time=%s (%d-%d, dur=%d)",
                     subj_id_int,
                     getattr(subject, "code", ""),
-                    days,
+                    opt_days,
                     slot_labels or "N/A",
                     start_min,
                     end_min,
@@ -1163,6 +1198,37 @@ def generate_subject_start_options(
                     "num_slots": len(slot_indexes),
                 })
 
+        # Extra days for LEC (any day not in the standard MW/TTH/F pattern set)
+        extra_days = [lbl for lbl in slots_by_day if lbl not in STANDARD_DAYS]
+        for extra_label in extra_days:
+            extra_day = day_label_to_day.get(extra_label)
+            if not extra_day or extra_label not in slots_by_day:
+                continue
+            for slot in slots_by_day[extra_label]:
+                slot_indexes = slot.get("index", [])
+                if isinstance(slot_indexes, int):
+                    slot_indexes = [slot_indexes]
+                block_indices = set(slot.get("block_indices", []))
+                if not block_indices:
+                    block_indices = {slot_indexes[0]} if slot_indexes else set()
+                start_min = slot.get("start_min")
+                end_min = slot.get("end_min")
+                duration_min = end_min - start_min
+                options.append({
+                    "days": [extra_label],
+                    "day_ids": [extra_day.id],
+                    "day_id": extra_day.id,
+                    "start_min": start_min,
+                    "end_min": end_min,
+                    "duration_min": duration_min,
+                    "block_indices": block_indices,
+                    "blocks_by_day": {extra_day.id: block_indices},
+                    "slot_indexes": slot_indexes,
+                    "blocks_spanned": set(slot.get("blocks_spanned", [])),
+                    "slot_labels": [slot.get("label", "")],
+                    "num_slots": len(slot_indexes),
+                })
+
         if logger:
             logger.info("generate_subject_start_options: Subject %s (LEC) -> %d options", subj_id, len(options))
 
@@ -1173,7 +1239,7 @@ def generate_subject_start_options(
             subj_id_int = None
         if subj_id_int is not None and subj_id_int in DEBUG_SUBJECT_IDS and logger:
             for opt in options:
-                days = opt.get("days")
+                opt_days = opt.get("days")
                 start_min = opt.get("start_min")
                 end_min = opt.get("end_min")
                 duration_min = opt.get("duration_min")
@@ -1182,7 +1248,7 @@ def generate_subject_start_options(
                     "[DEBUG OPTIONS] LEC subject %s code=%s days=%s time=%s (%d-%d, dur=%d)",
                     subj_id_int,
                     getattr(subject, "code", ""),
-                    days,
+                    opt_days,
                     slot_labels or "N/A",
                     start_min,
                     end_min,
@@ -1407,7 +1473,25 @@ def build_eligibility_maps(
 
         # Room restriction logic: use DB-configured preferred rooms if available,
         # otherwise fall back to shared-building / non-shared building filtering.
-        subj_pref_ids = set(_subject_pref_room_ids.get(sid, set()))
+        # CRITICAL: Validate that room preferences actually belong to this subject's code+type
+        # to prevent ID collisions when in-memory block clones reuse DB subject IDs.
+        subj_pref_ids = set()
+        _raw_pref_ids = _subject_pref_room_ids.get(sid, set())
+        if _raw_pref_ids:
+            # Verify the preference belongs to a subject with the same code and type
+            _pref_key = (subj_code, subj_type)
+            if _pref_key in _code_type_to_pref and _code_type_to_pref[_pref_key] == _raw_pref_ids:
+                subj_pref_ids = set(_raw_pref_ids)
+            elif db:
+                # Direct DB check: does subject_id `sid` in DB have the same code?
+                _db_subj = db.query(models.Subject).get(sid)
+                if _db_subj and (_db_subj.code or '').upper().strip() == subj_code:
+                    subj_pref_ids = set(_raw_pref_ids)
+                else:
+                    logger.debug(
+                        "[ELIGIBILITY] Subject %s (ID:%d) skipping room prefs from DB subject %s (ID collision)",
+                        subj_code, sid, (_db_subj.code if _db_subj else 'N/A')
+                    )
         if not is_shared_room_subject and subj_pref_ids:
             subj_pref_ids = {rid for rid in subj_pref_ids if rid not in _shared_room_ids}
         if subj_pref_ids:
@@ -1528,7 +1612,8 @@ def get_existing_bookings(
     exclude_course_id: Optional[int] = None,
     exclude_years: Optional[List[int]] = None,
     slots_by_day: Optional[Dict[str, List[Dict]]] = None,
-    day_id_map: Optional[Dict[str, int]] = None
+    day_id_map: Optional[Dict[str, int]] = None,
+    school_year: Optional[str] = None
 ) -> Tuple[Set[Tuple[str, int, int]], Set[Tuple[int, int, int]]]:
     """
     Get existing room and instructor bookings from database using stored procedure.
@@ -1558,7 +1643,8 @@ def get_existing_bookings(
         semester=semester,
         years=years,
         exclude_course_id=exclude_course_id,
-        exclude_years=exclude_years
+        exclude_years=exclude_years,
+        school_year=school_year
     )
     
     # Build (day_id, start_min) -> block_index mapping from slots_by_day
@@ -1954,10 +2040,17 @@ def _retry_unscheduled_subjects(
                     
                     # Check instructor availability — sort by current load (least loaded first)
                     subj_units = int(getattr(subject, "unit", 0) or 0)
-                    DESIGNATED_ROLES_GREEDY = {"dean", "associate dean", "director", "program chair", "college secretary"}
+                    from .deductions import get_designated_roles
+                    DESIGNATED_ROLES_GREEDY = get_designated_roles()
+
+                    # Compute subject's college for instructor priority
+                    _greedy_subj_college = getattr(subject, 'college_id', None)
+                    if not _greedy_subj_college and subject.course_id and db:
+                        _gc = db.query(models.Course).get(subject.course_id)
+                        _greedy_subj_college = _gc.college_id if _gc else None
                     
                     def _instr_sort_key(iid):
-                        """Sort instructors: least loaded first, overloaded visiting last."""
+                        """Sort instructors: same-college first, least loaded first, overloaded visiting last."""
                         cur = instructor_current_units.get(iid, 0)
                         prefs = instructor_prefs.get(iid, {})
                         mx = prefs.get('max_units')
@@ -1966,8 +2059,11 @@ def _retry_unscheduled_subjects(
                             mx = lm // 60
                         is_over = cur + subj_units > mx
                         is_visiting = prefs.get('employment_type', 'regular') == 'visiting'
-                        # Priority: (0=under cap, 1=over cap visiting) then by current load
-                        return (1 if (is_over and is_visiting) else (2 if is_over else 0), cur)
+                        # College priority: 0=same college, 1=different/no college
+                        i_college = prefs.get('college_id')
+                        college_match = 0 if (_greedy_subj_college and i_college == _greedy_subj_college) else 1
+                        # Priority: college match, then (0=under cap, 1=over cap visiting), then by current load
+                        return (college_match, 1 if (is_over and is_visiting) else (2 if is_over else 0), cur)
                     
                     sorted_eligible = sorted(eligible_instrs, key=_instr_sort_key)
                     
@@ -2613,7 +2709,8 @@ def _cp_retry_mini_model(
                     
                     # Sort instructors by current load (least loaded first) for fairer distribution
                     retry_subj_units = int(getattr(subject, "unit", 0) or 0)
-                    DESIGNATED_ROLES_RETRY = {"dean", "associate dean", "director", "program chair", "college secretary"}
+                    from .deductions import get_designated_roles
+                    DESIGNATED_ROLES_RETRY = get_designated_roles()
                     
                     def _retry_instr_sort(iid):
                         cur = instructor_current_units.get(iid, 0)
@@ -2624,7 +2721,10 @@ def _cp_retry_mini_model(
                             mx = lm // 60
                         is_over = cur + retry_subj_units > mx
                         is_visiting = prefs.get('employment_type', 'regular') == 'visiting'
-                        return (1 if (is_over and is_visiting) else (2 if is_over else 0), cur)
+                        # College priority: 0=same college, 1=different/no college
+                        i_college = prefs.get('college_id')
+                        college_match = 0 if (_retry_subj_college and i_college == _retry_subj_college) else 1
+                        return (college_match, 1 if (is_over and is_visiting) else (2 if is_over else 0), cur)
                     
                     eligible_instrs_sorted = sorted(eligible_instrs, key=_retry_instr_sort)
 
@@ -3490,6 +3590,33 @@ def _generate_fallback_time_windows(
                         "slot_labels": [slot.get("label", "")],
                         "num_slots": 1,
                     })
+
+        # Extra days (any non-standard day) as single-day fallback
+        STANDARD_DAYS = {MON, TUE, WED, THU, FRI}
+        for lbl in slots_by_day:
+            if lbl in STANDARD_DAYS:
+                continue
+            day_obj = day_label_to_day.get(lbl)
+            if not day_obj:
+                continue
+            for slot in slots_by_day[lbl][:3]:
+                start_min = slot.get("start_min")
+                end_min = slot.get("end_min")
+                duration_min = end_min - start_min
+                options.append({
+                    "days": [lbl],
+                    "day_ids": [day_obj.id],
+                    "day_id": day_obj.id,
+                    "start_min": start_min,
+                    "end_min": end_min,
+                    "duration_min": duration_min,
+                    "block_indices": {slot.get("index", 0)},
+                    "blocks_by_day": {day_obj.id: {slot.get("index", 0)}},
+                    "slot_indexes": [slot.get("index", 0)],
+                    "blocks_spanned": set(),
+                    "slot_labels": [slot.get("label", "")],
+                    "num_slots": 1,
+                })
     
     logger.warning(f"[FALLBACK] Generated {len(options)} time windows for subject {subj_id}")
     return options
@@ -3512,6 +3639,7 @@ def run_cp_scheduler(
     booked_room_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     booked_instr_ranges_global: Optional[Dict[Tuple[Any, int], List[Tuple[int, int]]]] = None,
     phase_callback: Optional[Any] = None,
+    school_year: Optional[str] = None,
 ) -> List[Dict]:
     # Debug: Log input parameters
     logger.info("\n" + "="*80)
@@ -3906,7 +4034,10 @@ def run_cp_scheduler(
                                     existing_scheds = db.query(models.Schedule).filter(
                                         models.Schedule.instructor_id == instr.id,
                                         models.Schedule.semester == semester
-                                    ).all()
+                                    )
+                                    if school_year:
+                                        existing_scheds = existing_scheds.filter(models.Schedule.school_year == school_year)
+                                    existing_scheds = existing_scheds.all()
                                     for sched in existing_scheds:
                                         raw_time = (getattr(sched, 'time', None) or '').strip()
                                         parsed = _parse_time_range_minutes(raw_time.split(' ', 1)[-1] if ' ' in raw_time else raw_time)
@@ -3925,7 +4056,8 @@ def run_cp_scheduler(
                                     limit_mins = 30 * 60  # 1800 min
                                 else:
                                     designation = (getattr(instr, 'designation', None) or '').strip().lower()
-                                    deduction_map = {"program chair": 3, "college secretary": 3, "dean": 12, "associate dean": 12, "director": 12}
+                                    from .deductions import get_deduction_map as _get_dm
+                                    deduction_map = _get_dm()
                                     deduction = deduction_map.get(designation, 0)
                                     limit_mins = max(0, 24 - deduction) * 60
                                 
@@ -4112,13 +4244,8 @@ def run_cp_scheduler(
     instructors = db.query(models.Instructor).filter(models.Instructor.is_active == True).all()
     logger.info(f"Loaded {len(instructors)} instructors")
 
-    deductions = {
-        "program chair": 3,
-        "college secretary": 3,
-        "dean": 12,
-        "associate dean": 12,
-        "director": 12,
-    }
+    from .deductions import get_deduction_map
+    deductions = get_deduction_map(db)
 
     instructor_limit_minutes: Dict[int, int] = {}
     for inst in instructors:
@@ -4152,11 +4279,13 @@ def run_cp_scheduler(
             continue
 
     try:
-        existing_scheds = (
+        _instr_q = (
             db.query(models.Schedule)
             .filter(models.Schedule.semester == semester, models.Schedule.instructor_id.isnot(None))
-            .all()
         )
+        if school_year:
+            _instr_q = _instr_q.filter(models.Schedule.school_year == school_year)
+        existing_scheds = _instr_q.all()
     except Exception:
         existing_scheds = []
 
@@ -4360,6 +4489,7 @@ def run_cp_scheduler(
             'max_units': max_units,
             'employment_type': employment_type,
             'designation': designation,
+            'college_id': getattr(inst, 'college_id', None),
         }
     
     # Track currently assigned units per instructor (for max_units enforcement)
@@ -4503,6 +4633,7 @@ def run_cp_scheduler(
         exclude_years=normalized_years,
         slots_by_day=slots_by_day,
         day_id_map=day_id_map,
+        school_year=school_year,
     )
     
     # DEBUG: Room Utilization Summary
@@ -4639,8 +4770,21 @@ def run_cp_scheduler(
     _phase_plan = []
     if _pe_subjects:
         _phase_plan.append(("PE/PATHFIT", _pe_subjects))
+
+    # Split MAJORS by subject code so each subject gets its own solver run.
+    # This prevents CC 101 and CC 102 from competing for the same comp labs
+    # and hitting the solver's constraint wall when scheduled together.
     if _major_subjects:
-        _phase_plan.append(("MAJORS", _major_subjects))
+        _major_by_code = {}
+        for s in _major_subjects:
+            code = (getattr(s, 'code', '') or '').upper().strip()
+            if code not in _major_by_code:
+                _major_by_code[code] = []
+            _major_by_code[code].append(s)
+        # Sort by code for deterministic ordering
+        for code in sorted(_major_by_code.keys()):
+            _phase_plan.append((f"MAJORS:{code}", _major_by_code[code]))
+
     if _ge_subjects:
         _phase_plan.append(("GE/MINORS", _ge_subjects))
 
@@ -4648,16 +4792,21 @@ def run_cp_scheduler(
     if not _phase_plan:
         _phase_plan.append(("ALL", _all_subjects_for_phases))
 
+    # Count major sub-phases for logging
+    _major_phase_count = sum(1 for name, _ in _phase_plan if name.startswith("MAJORS:"))
+    _major_codes = [name.split(":")[1] for name, _ in _phase_plan if name.startswith("MAJORS:")]
     logger.info(
         "\n" + "=" * 80 + "\n"
         "4-PHASE SCHEDULING PIPELINE\n"
         "Phase 1: NSTP - %d subjects (pre-scheduled)\n"
         "Phase 2: PE/PATHFIT - %d subjects\n"
-        "Phase 3: MAJORS - %d subjects\n"
+        "Phase 3: MAJORS - %d subjects (%d sub-phases: %s)\n"
         "Phase 4: GE/MINORS - %d subjects\n" +
         "=" * 80,
         len(nstp_subjects) if nstp_subjects else 0,
-        len(_pe_subjects), len(_major_subjects), len(_ge_subjects),
+        len(_pe_subjects),
+        len(_major_subjects), _major_phase_count, ", ".join(_major_codes) if _major_codes else "none",
+        len(_ge_subjects),
     )
 
     # Global booking maps (inter-cluster AND inter-phase propagation) - using block_index
@@ -4849,6 +4998,40 @@ def run_cp_scheduler(
             logger.info(f"[ADAPTIVE] Phase {_iter_phase}: resource pressure={resource_pressure:.1%}, "
                         f"vars/subj={ADAPTIVE_MAX_VARS_PER_SUBJECT}")
 
+            # ---------------------------------------------------------------
+            # FULL ELIGIBILITY MAP REBUILD at MAJORS and GE/MINORS transitions
+            # After PE/PATHFIT books shared rooms (Inner Quad, GYM) and after
+            # each MAJORS sub-phase books rooms, we rebuild maps so the next
+            # phase sees accurate availability instead of stale initial data.
+            # ---------------------------------------------------------------
+            if _iter_phase.startswith("MAJORS:") or _iter_phase == "GE/MINORS":
+                # Collect ALL subjects that belong to this phase
+                _rebuild_subjects = []
+                for _bci, _cid, _csubs, *_phi in block_cluster_plan:
+                    _ph = _phi[0] if _phi else ""
+                    if _ph == _iter_phase:
+                        _rebuild_subjects.extend(_csubs)
+
+                if _rebuild_subjects:
+                    import time as _rebuild_time
+                    _rebuild_start = _rebuild_time.time()
+                    logger.info(
+                        "[REBUILD] Rebuilding eligibility maps for phase %s (%d subjects)...",
+                        _iter_phase, len(_rebuild_subjects)
+                    )
+                    _new_instrs, _new_all_rooms, _new_pref_rooms = build_eligibility_maps(
+                        _rebuild_subjects, instructors, rooms, db
+                    )
+                    # Merge rebuilt maps: overwrite entries for this phase's subjects
+                    course_to_instructors.update(_new_instrs)
+                    course_to_all_rooms.update(_new_all_rooms)
+                    course_to_preferred_rooms.update(_new_pref_rooms)
+                    _rebuild_elapsed = (_rebuild_time.time() - _rebuild_start) * 1000
+                    logger.info(
+                        "[REBUILD] Done in %.0fms. Updated %d instructor maps, %d room maps.",
+                        _rebuild_elapsed, len(_new_instrs), len(_new_all_rooms)
+                    )
+
         # DEBUG: Check ranges before loop
         debug_ranges = booked_room_ranges_global.get(("GS ER 7", 1), [])
         if debug_ranges:
@@ -4955,6 +5138,11 @@ def run_cp_scheduler(
         # Each entry is (presence_var, travel_time_penalty)
         distance_penalties: List[Tuple[Any, int]] = []
         DISTANCE_PENALTY_WEIGHT = 10  # Multiplied by travel_time_minutes
+
+        # College affinity: penalize assigning instructors from a different college
+        # This gives strong preference to core faculty of the program being scheduled
+        college_mismatch_penalties = []
+        COLLEGE_MISMATCH_PENALTY_WEIGHT = 200  # Strong preference for same-college
         
         # Global limit: maximum variables per subject to prevent memory explosion
         # ADAPTIVE: Increases when resources are heavily utilized (80%+) for better solutions
@@ -5004,9 +5192,11 @@ def run_cp_scheduler(
             
             # Compute subject's college building ID for proximity sorting/penalties
             _subj_bldg_id = None
+            _subj_college_id = None
             if subject.course_id and db:
                 _c = db.query(models.Course).get(subject.course_id)
                 if _c and _c.college_id:
+                    _subj_college_id = _c.college_id
                     _college_bldgs = db.query(models.Building).filter(
                         models.Building.college_id == _c.college_id
                     ).all()
@@ -5439,7 +5629,8 @@ def run_cp_scheduler(
                     cp_i_cur = instructor_current_units.get(instructor_id, 0)
                     cp_i_empl = cp_i_prefs.get('employment_type', 'regular')
                     cp_i_desig = cp_i_prefs.get('designation', '')
-                    DESIGNATED_ROLES_CP = {"dean", "associate dean", "director", "program chair", "college secretary"}
+                    from .deductions import get_designated_roles as _get_dr_cp
+                    DESIGNATED_ROLES_CP = _get_dr_cp()
                     
                     if cp_i_cur + cp_subj_units > cp_i_max:
                         if cp_i_desig in DESIGNATED_ROLES_CP or cp_i_empl != 'visiting':
@@ -5496,8 +5687,14 @@ def run_cp_scheduler(
                     compatible_rooms = compatible_rooms[:MAX_ROOMS_PER_OPTION]
                 
                 if len(compatible_instructors) > MAX_INSTRUCTORS_PER_OPTION:
-                    # Prioritize instructors (could use teaching load, availability, etc.)
-                    # For now, just take first N (they're already filtered by availability)
+                    # Prioritize same-college instructors, then by current load
+                    def _instr_cp_sort(iid):
+                        prefs = instructor_prefs.get(iid, {})
+                        i_college = prefs.get('college_id')
+                        college_match = 0 if (_subj_college_id is not None and i_college == _subj_college_id) else 1
+                        cur = instructor_current_units.get(iid, 0)
+                        return (college_match, cur)
+                    compatible_instructors.sort(key=_instr_cp_sort)
                     compatible_instructors = compatible_instructors[:MAX_INSTRUCTORS_PER_OPTION]
                 
                 # Additional safety: if we still have too many combinations, further reduce
@@ -5568,6 +5765,12 @@ def run_cp_scheduler(
                                     _travel = _bldg_dist_map.get((_r_bldg, _subj_bldg_id), 0)
                                 if _travel > PROXIMITY_THRESHOLD_MIN:
                                     distance_penalties.append((presence, _travel))
+
+                        # College affinity: penalize if instructor is from a different college
+                        _i_prefs = instructor_prefs.get(instructor_id, {})
+                        _i_college_id = _i_prefs.get('college_id')
+                        if _subj_college_id is not None and _i_college_id is not None and _i_college_id != _subj_college_id:
+                            college_mismatch_penalties.append(presence)
 
                         # CRITICAL: Create separate interval for EACH day in day_ids
                         # MW options create 2 intervals (Monday + Wednesday)
@@ -6568,6 +6771,17 @@ def run_cp_scheduler(
             ))
             penalty_exprs.append(total_distance_penalty)
             logger.info(f"[PROXIMITY] Added distance penalties for {len(distance_penalties)} room variables in cluster {cluster_id}")
+
+        # Add college affinity penalties: prefer same-college instructors
+        if college_mismatch_penalties:
+            total_college_penalty = model.NewIntVar(
+                0,
+                len(college_mismatch_penalties) * COLLEGE_MISMATCH_PENALTY_WEIGHT,
+                f"cluster_{cluster_id}_college_mismatch_total"
+            )
+            model.Add(total_college_penalty == sum(v * COLLEGE_MISMATCH_PENALTY_WEIGHT for v in college_mismatch_penalties))
+            penalty_exprs.append(total_college_penalty)
+            logger.info(f"[COLLEGE AFFINITY] Added college mismatch penalties for {len(college_mismatch_penalties)} variables in cluster {cluster_id}")
 
         if distribution_penalty is not None:
             penalty_exprs.append(DAY_TARGET_PENALTY_WEIGHT * distribution_penalty)
@@ -8633,7 +8847,7 @@ def run_cp_scheduler(
                                 "time": first_rec["time"],
                                 "start_min": first_rec["start_min"],
                                 "end_min": first_rec["end_min"],
-                                "is_recommended": True,  # Flag for UI
+                                "is_recommended": True,  # Flag for UI — auto-applied, not CP-solved
                                 "recommendation_score": first_rec["score"],
                                 "alternatives": recommendations,  # Pass all generated alternatives to frontend
                             }
@@ -9323,7 +9537,7 @@ def run_cp_scheduler(
                                             "time": first_rec["time"],
                                             "start_min": first_rec["start_min"],
                                             "end_min": first_rec["end_min"],
-                                            "is_recommended": True,
+                                            "is_recommended": True,  # Auto-applied fallback
                                             "recommendation_score": first_rec["score"],
                                             "alternatives": recommendations,
                                         }

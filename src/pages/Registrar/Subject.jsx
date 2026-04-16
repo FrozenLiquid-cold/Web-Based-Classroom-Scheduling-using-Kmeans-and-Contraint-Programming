@@ -143,7 +143,7 @@ export default function Subject() {
 				i.id !== (editing?.id)
 			)
 		})
-		if (duplicate) { setError('Code must be unique within the same course, type, year level, and semester'); return }
+		if (duplicate) { setError('Code must be unique within the same program, type, year level, and semester'); return }
 		try {
 			setProcessing(true)
 			await upsert('subject', {
@@ -178,8 +178,8 @@ export default function Subject() {
 		if (processing) return
 		setConfirmDialog({
 			open: true,
-			title: 'Delete Subject',
-			message: 'Are you sure you want to delete this subject? This action cannot be undone.',
+			title: 'Delete Course',
+			message: 'Are you sure you want to delete this course? This action cannot be undone.',
 			confirmText: 'Delete',
 			variant: 'danger',
 			onConfirm: async () => {
@@ -203,15 +203,15 @@ export default function Subject() {
 	return (
 		<div>
 			<div className="flex items-center justify-between mb-4">
-				<h1 className="text-navy text-3xl font-semibold">SUBJECT</h1>
+				<h1 className="text-navy text-3xl font-semibold">COURSE</h1>
 				<button className="px-3 py-2 rounded bg-royal hover:bg-blue-700 text-white flex items-center gap-2 disabled:opacity-60 transition-colors" onClick={openAdd} disabled={processing}>
 					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M11 11V5h2v6h6v2h-6v6h-2v-6H5v-2h6z" /></svg>
-					<span>Add Subject</span>
+					<span>Add Course</span>
 				</button>
 			</div>
 			{/* Standardized fixed-height container for list/table area */}
 			<div className="h-[520px] overflow-auto pr-1 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
-				<div className="mb-2 text-navy text-1xl font-semibold">List of Subject</div>
+				<div className="mb-2 text-navy text-1xl font-semibold">List of Course</div>
 				<div className="flex items-center justify-between mb-3 gap-4">
 					<div className="flex items-center gap-2 text-sm">
 						<span>Show</span>
@@ -224,7 +224,7 @@ export default function Subject() {
 						</div>
 						<span>entries</span>
 					</div>
-					<input className="w-full max-w-sm px-3 py-2 rounded-full border" placeholder="Search: Subject" value={q} onChange={e => setQ(e.target.value)} />
+					<input className="w-full max-w-sm px-3 py-2 rounded-full border" placeholder="Search: Course" value={q} onChange={e => setQ(e.target.value)} />
 				</div>
 				<div className="overflow-x-auto">
 					<table className="min-w-full text-sm border border-gray-400">
@@ -236,7 +236,7 @@ export default function Subject() {
 								<th className="text-left px-3 py-2 border-r border-gray-300">Priority</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">Year</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">Sem</th>
-								<th className="text-left px-3 py-2 border-r border-gray-300">Course</th>
+								<th className="text-left px-3 py-2 border-r border-gray-300">Program</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">Type</th>
 								<th className="text-left px-3 py-2 border-r border-gray-300">Unit</th>
 								<th className="text-center px-3 py-2 w-44">Action</th>
@@ -293,7 +293,7 @@ export default function Subject() {
 			{show && (
 				<div className="fixed inset-0 bg-black/30 flex items-center justify-center p-4 z-50">
 					<form onSubmit={onSave} className="w-full max-w-md max-h-[90vh] overflow-y-auto bg-white rounded-xl shadow p-5 space-y-3">
-						<div className="text-lg font-semibold text-navy">{editing ? 'Edit Subject' : 'Add Subject'}</div>
+						<div className="text-lg font-semibold text-navy">{editing ? 'Edit Course' : 'Add Course'}</div>
 						<input className="w-full px-3 py-2 rounded border" placeholder="Code" value={code} onChange={e => setCode(e.target.value)} />
 						<input className="w-full px-3 py-2 rounded border" placeholder="Description" value={description} onChange={e => setDescription(e.target.value)} />
 						<select className="w-full px-3 py-2 rounded border" value={priority} onChange={e => setPriority(e.target.value)}>
@@ -315,7 +315,7 @@ export default function Subject() {
 							<option value="2">2</option>
 						</select>
 						<select className="w-full px-3 py-2 rounded border" value={courseId} onChange={e => setCourseId(e.target.value)}>
-							<option value="">Select Course (optional)</option>
+							<option value="">Select Program (optional)</option>
 							{courses.map(c => <option key={c.id} value={c.id}>{c.code} — {c.description}</option>)}
 						</select>
 						<select className="w-full px-3 py-2 rounded border" value={type} onChange={e => setType(e.target.value)}>

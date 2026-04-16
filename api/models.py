@@ -43,6 +43,7 @@ class Course(Base):
     id = Column(Integer, primary_key=True, index=True)
     code = Column(String(50), nullable=False)
     description = Column(Text, nullable=False)
+    major = Column(String(200), nullable=True)
     college_id = Column(Integer, ForeignKey("colleges.id"), nullable=False)
     
     college = relationship("College", back_populates="courses")
@@ -337,4 +338,13 @@ class SubjectRoomPreference(Base):
     __table_args__ = (
         UniqueConstraint('subject_id', 'room_id', name='uq_subject_room_pref'),
     )
+
+
+class DesignationDeduction(Base):
+    """Configurable workload deductions per designation role."""
+    __tablename__ = "designation_deductions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    designation = Column(String(100), nullable=False, unique=True)
+    deduction_hours = Column(Integer, nullable=False, default=0)
 
