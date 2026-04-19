@@ -24,7 +24,7 @@ import InstructorAccount from './pages/Instructor/Account'
 import AdminLayout from './layouts/AdminLayout'
 import AdminDashboard from './pages/Admin/Dashboard'
 import AdminUsers from './pages/Admin/Users'
-import AdminRoomSchedule from './pages/Admin/RoomSchedule'
+import AdminSystemLogs from './pages/Admin/SystemLogs'
 
 import { isAuthenticated } from './store/auth'
 
@@ -91,7 +91,7 @@ export default function App() {
 				<Route index element={<Navigate to="dashboard" replace />} />
 				<Route path="dashboard" element={<AdminDashboard />} />
 				<Route path="users" element={<AdminUsers />} />
-				<Route path="room-schedule" element={<AdminRoomSchedule />} />
+				<Route path="system-logs" element={<AdminSystemLogs />} />
 
 			</Route>
 		</Routes>

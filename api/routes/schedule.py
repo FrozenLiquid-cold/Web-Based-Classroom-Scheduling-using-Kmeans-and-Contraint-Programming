@@ -21,6 +21,7 @@ from api.db import SessionLocal
 from api.job_queue import queue_manager
 from api.scheduler.scheduler import load_schedule, save_schedule as persist_schedule
 from api.scheduler.course_scheduler import schedule_course_refactored
+from api.system_logger import log_event
 from sqlalchemy.orm import joinedload
 
 schedule_bp = Blueprint("schedule", __name__)
@@ -215,6 +216,10 @@ def generate_schedule():
 
         job_id, already_queued = queue_manager.enqueue(queue_key, job_payload)
 
+        # Log the schedule generation
+        course_code = course.code if hasattr(course, 'code') else str(schedule_request.course_id)
+        log_event('schedule', 'generate', f'Schedule generation queued for {course_code} Y{years} Sem{schedule_request.semester} ({schedule_request.blocks_count or 1} blocks)', metadata={'course_id': schedule_request.course_id, 'years': years, 'semester': schedule_request.semester})
+
         if already_queued:
             logger.info(
                 "Scheduling job already queued/running for %s — reusing job_id=%s",
@@ -370,6 +375,7 @@ def save_schedule_route():
             schedule_items=schedule_items,
             school_year=save_request.school_year,
         )
+        log_event('schedule', 'save', f'Schedule saved: course {save_request.course_id} Y{save_request.year} Sem{save_request.semester} ({len(saved_records)} items)', level='SUCCESS', metadata={'course_id': save_request.course_id, 'year': save_request.year, 'count': len(saved_records)})
         return jsonify(
             {
                 "status": "success",
@@ -584,6 +590,58 @@ def load_instructor_schedule():
         db.close()
 
 
+@schedule_bp.route("/instructor-hours-summary", methods=["GET"])
+def instructor_hours_summary():
+    """Return total saved teaching minutes per instructor for a semester.
+
+    Used by the Registrar schedule warnings UI to show
+    'prior load + this schedule' in the Instructor Workload Evidence.
+    """
+    import re
+
+    semester = request.args.get("semester", type=int)
+    if semester is None:
+        return jsonify({"detail": "semester is required"}), 400
+
+    school_year = request.args.get("school_year", type=str)
+
+    db = _get_session()
+    try:
+        query = db.query(
+            models.Schedule.instructor_id,
+            models.Schedule.time,
+        ).filter(
+            models.Schedule.semester == semester,
+            models.Schedule.instructor_id.isnot(None),
+        )
+        if school_year:
+            query = query.filter(models.Schedule.school_year == school_year)
+
+        _time_re = re.compile(r"(\d{1,2}):(\d{2})")
+        result = {}
+        for instructor_id, time_str in query.all():
+            if not time_str:
+                continue
+            matches = _time_re.findall(time_str)
+            if len(matches) >= 2:
+                start_min = int(matches[0][0]) * 60 + int(matches[0][1])
+                end_min = int(matches[1][0]) * 60 + int(matches[1][1])
+                mins = max(0, end_min - start_min)
+            else:
+                continue
+            iid = str(instructor_id)
+            result[iid] = result.get(iid, 0) + mins
+
+        response = jsonify({"hours": result})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response
+    except Exception as e:
+        logger.error(f"Error in instructor-hours-summary: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+
+
 @schedule_bp.route("/delete", methods=["DELETE"])
 def delete_schedule():
     """Delete schedule from database."""
@@ -609,6 +667,7 @@ def delete_schedule():
             query = query.filter(models.Schedule.school_year == school_year)
         deleted = query.delete()
         db.commit()
+        log_event('schedule', 'delete', f'Deleted {deleted} schedule entries for course {course_id} Y{year} Sem{semester}', level='WARNING', metadata={'course_id': course_id, 'year': year, 'semester': semester, 'count': deleted})
         return jsonify(
             {
                 "status": "success",

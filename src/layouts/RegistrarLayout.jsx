@@ -27,7 +27,14 @@ const navGroups = [
             { to: '/r/distances', label: 'Matrix' },
         ]
     },
-    { type: 'link', to: '/r/schedule', label: 'Schedule' },
+    {
+        type: 'group', label: 'Schedule', icon: 'Schedule',
+        children: [
+            { to: '/r/schedule', label: 'Scheduler' },
+            { to: '/r/schedule#dashboard', label: 'Dashboard' },
+            { to: '/r/schedule#room-schedule', label: 'Room Schedule' },
+        ]
+    },
     {
         type: 'group', label: 'Settings', icon: 'Settings',
         children: [
@@ -88,6 +95,10 @@ function NavIcon({ label }) {
             return (<svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg>)
         case 'Deductions':
             return (<svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10H7v-2h10v2z"/></svg>)
+        case 'Scheduler':
+            return (<svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V10h14v10zM9 14H7v-2h2v2zm4 0h-2v-2h2v2zm4 0h-2v-2h2v2zm-8 4H7v-2h2v2zm4 0h-2v-2h2v2zm4 0h-2v-2h2v2z"/></svg>)
+        case 'Room Schedule':
+            return (<svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M15 11V5l-3-3-3 3v2H3v14h18V11h-6zm-8 8H5v-2h2v2zm0-4H5v-2h2v2zm0-4H5V9h2v2zm6 8h-2v-2h2v2zm0-4h-2v-2h2v2zm0-4h-2V9h2v2zm0-4h-2V5h2v2zm6 12h-2v-2h2v2zm0-4h-2v-2h2v2z"/></svg>)
         default:
             return null
     }
@@ -175,9 +186,14 @@ export default function RegistrarLayout() {
                                             const hasHash = child.to.includes('#')
                                             const basePath = child.to.split('#')[0]
                                             const hash = child.to.split('#')[1]
+                                            // For hash links: match base path + hash
+                                            // For non-hash links in a group that has hash siblings: match path + no hash present
+                                            const groupHasHashChildren = item.children.some(c => c.to.includes('#'))
                                             const childActive = hasHash
                                                 ? pathname.startsWith(basePath) && location.hash === `#${hash}`
-                                                : pathname.startsWith(child.to)
+                                                : groupHasHashChildren
+                                                    ? pathname === child.to && !location.hash
+                                                    : pathname.startsWith(child.to)
                                             return (
                                                 <NavLink
                                                     key={child.to}

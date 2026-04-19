@@ -6,6 +6,7 @@ import {
     acceptSwapRequest,
     rejectSwapRequest
 } from '../../services/api'
+import SchoolYearSelector from '../../components/SchoolYearSelector'
 
 export default function SwapRequests() {
     const { isDark } = useOutletContext() || { isDark: false }
@@ -172,7 +173,10 @@ export default function SwapRequests() {
 
     return (
         <div className={`p-6 max-w-5xl mx-auto min-h-screen ${isDark ? 'bg-transparent' : 'bg-transparent'}`}>
-            <h1 className={`text-2xl font-semibold mb-6 ${theme.text}`}>Schedule Swap Requests</h1>
+            <div className="flex items-center justify-between mb-6">
+                <h1 className={`text-2xl font-semibold ${theme.text}`}>Schedule Swap Requests</h1>
+                <SchoolYearSelector />
+            </div>
 
             {error && (
                 <div className={`mb-4 p-3 border rounded ${isDark ? 'bg-red-900/20 border-red-800 text-red-300' : 'bg-red-50 border-red-200 text-red-700'}`}>

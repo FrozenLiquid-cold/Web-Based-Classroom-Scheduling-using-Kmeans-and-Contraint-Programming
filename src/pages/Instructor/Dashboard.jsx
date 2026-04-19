@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useOutletContext, useNavigate } from 'react-router-dom'
 import { getInstructorWorkload } from '../../services/api'
+import SchoolYearSelector, { computeDefaultSY } from '../../components/SchoolYearSelector'
 
 export default function Dashboard() {
     const { mustChangeCredentials } = useOutletContext() || {}
@@ -13,6 +14,7 @@ export default function Dashboard() {
     const instructorId = session?.instructorId || null
     const instructorName = session?.name || 'Instructor'
     const [semester, setSemester] = useState('1')
+    const [schoolYear, setSchoolYear] = useState(() => localStorage.getItem('jrmsu.schoolYear') || computeDefaultSY())
     const [workload, setWorkload] = useState(null)
     const [loading, setLoading] = useState(false)
     const [error, setError] = useState('')
@@ -31,7 +33,7 @@ export default function Dashboard() {
             try {
                 setLoading(true)
                 setError('')
-                const data = await getInstructorWorkload(instructorId, Number(semester))
+                const data = await getInstructorWorkload(instructorId, Number(semester), schoolYear)
                 if (cancelled) return
                 setWorkload(data || null)
             } catch (e) {
@@ -44,7 +46,7 @@ export default function Dashboard() {
         }
         load()
         return () => { cancelled = true }
-    }, [instructorId, semester, refreshTick])
+    }, [instructorId, semester, schoolYear, refreshTick])
 
     useEffect(() => {
         function onVisible() {
@@ -113,6 +115,7 @@ export default function Dashboard() {
                             <option value="1">Semester 1</option>
                             <option value="2">Semester 2</option>
                         </select>
+                        <SchoolYearSelector onChange={setSchoolYear} />
                         <button
                             type="button"
                             className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium transition-all flex items-center gap-2 disabled:opacity-50"

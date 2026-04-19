@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from .. import schemas
 from ..db import SessionLocal
+from ..system_logger import log_event
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -76,8 +77,10 @@ def login():
             .first()
         )
         if not user or not verify_password(credentials.password, user.password_hash):
+            log_event('auth', 'login_failed', f'Failed login attempt for "{credentials.username}"', level='WARNING')
             return jsonify({"detail": "Invalid credentials"}), 401
 
+        log_event('auth', 'login', f'{user.username} logged in as {user.role}', user=user.username)
         return jsonify(
             {
                 "role": user.role,
@@ -194,8 +197,10 @@ def login_by_role(role: str):
             .first()
         )
         if not user or not verify_password(credentials.password, user.password_hash):
+            log_event('auth', 'login_failed', f'Failed login as {role} for "{credentials.username}"', level='WARNING')
             return jsonify({"detail": "Invalid credentials"}), 401
 
+        log_event('auth', 'login', f'{user.username} logged in as {role}', user=user.username)
         token = f"{user.username}:{user.role}"
         return jsonify(
             {
@@ -213,6 +218,7 @@ def login_by_role(role: str):
 @auth_bp.route("/logout", methods=["POST"])
 def logout():
     """Logout endpoint (client should remove token)."""
+    log_event('auth', 'logout', 'User logged out')
     return jsonify({"message": "Logged out successfully"})
 
 

@@ -24,6 +24,7 @@ from .routes.validation import validation_bp
 from .routes.swap_requests import swap_requests_bp
 from .routes.curriculum import curriculum_bp
 from .routes.stats import stats_bp
+from .routes.logs import logs_bp
 
 try:
     from .routes.clustering import clustering_bp
@@ -94,6 +95,7 @@ app.register_blueprint(validation_bp, url_prefix="/api/validate")
 app.register_blueprint(swap_requests_bp)
 app.register_blueprint(curriculum_bp, url_prefix="/api")
 app.register_blueprint(stats_bp, url_prefix="/api/stats")
+app.register_blueprint(logs_bp, url_prefix="/api")
 
 if clustering_bp:
     app.register_blueprint(clustering_bp, url_prefix="/api")

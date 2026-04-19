@@ -2,6 +2,12 @@ import { useEffect, useMemo, useState, useRef } from 'react'
 import { list, upsert, remove } from '../../store/db'
 import ConfirmDialog from '../../components/ConfirmDialog'
 
+// Canonical day ordering: M T W TH F SAT SUN (and aliases)
+const DAY_SORT_ORDER = { M: 1, T: 2, W: 3, TH: 4, F: 5, SAT: 6, SUN: 7, S: 6, HE: 8, SHE: 9 };
+function dayOrder(label) {
+	return DAY_SORT_ORDER[(label || '').toUpperCase()] ?? 99;
+}
+
 export default function Day() {
 	const [items, setItems] = useState([])
 	const [q, setQ] = useState('')
@@ -33,9 +39,14 @@ export default function Day() {
 
 	useEffect(() => { load() }, [])
 
+	// Sort items by canonical day order (M, T, W, TH, F, SAT, SUN)
+	const sorted = useMemo(() => {
+		return [...items].sort((a, b) => dayOrder(a.label) - dayOrder(b.label));
+	}, [items]);
+
 	const filtered = useMemo(() => {
-		return items.filter(i => (i.label || '').toLowerCase().includes(q.toLowerCase()))
-	}, [items, q])
+		return sorted.filter(i => (i.label || '').toLowerCase().includes(q.toLowerCase()))
+	}, [sorted, q])
 
 	const shown = useMemo(() => {
 		const n = Math.max(0, Number(entries) || 0)
@@ -135,7 +146,12 @@ export default function Day() {
 						<thead>
 							<tr className="bg-navy text-white border-b-2 border-gray-500">
 								<th className="text-left px-3 py-2 border-r border-gray-300">No.</th>
-								<th className="text-left px-3 py-2 border-r border-gray-300">Day</th>
+								<th className="text-left px-3 py-2 border-r border-gray-300">
+									<div className="flex items-center gap-1">
+										Day
+										<span className="text-[10px] font-normal text-blue-200 ml-1">(sorted M→SUN)</span>
+									</div>
+								</th>
 								<th className="text-center px-3 py-2 w-36">Action</th>
 							</tr>
 						</thead>
@@ -143,7 +159,12 @@ export default function Day() {
 							{shown.map((it, idx) => (
 								<tr key={it.id} className={idx % 2 ? 'bg-gray-50' : ''}>
 									<td className="px-3 py-2 border-r border-gray-300">{idx + 1}</td>
-									<td className="px-3 py-2 border-r border-gray-300">{it.label}</td>
+									<td className="px-3 py-2 border-r border-gray-300">
+										<div className="flex items-center gap-2">
+											<span>{it.label}</span>
+											<span className="text-[10px] text-gray-400">#{dayOrder(it.label)}</span>
+										</div>
+									</td>
 									<td className="px-3 py-2 space-x-3 text-center">
 										<button className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-600 hover:opacity-90" title="Edit" onClick={() => openEdit(it)} disabled={processing}>
 											<img src="/assets/edit.png" alt="Edit" className="w-4 h-4 object-contain" onError={e => { e.currentTarget.style.display = 'none' }} />

@@ -623,6 +623,10 @@ def get_room_utilization_by_day():
                     "percentage": pct,
                 })
 
+        # Sort by canonical day order: M, T, W, TH, F, SAT, SUN
+        _DAY_ORDER = {'M': 1, 'T': 2, 'W': 3, 'TH': 4, 'F': 5, 'SAT': 6, 'SUN': 7, 'S': 6}
+        result.sort(key=lambda x: (_DAY_ORDER.get(x['day'].upper(), 99), x['type']))
+
         return jsonify(result)
 
     except Exception as e:

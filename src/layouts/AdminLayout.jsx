@@ -6,7 +6,7 @@ import ConfirmDialog from '../components/ConfirmDialog'
 const nav = [
 	{ to: '/a/dashboard', label: 'Dashboard' },
 	{ to: '/a/users', label: 'Users' },
-	{ to: '/a/room-schedule', label: 'Room Schedule' },
+	{ to: '/a/system-logs', label: 'System Logs' },
 ]
 
 function NavIcon({ label }) {
@@ -24,12 +24,14 @@ function NavIcon({ label }) {
 					<path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z" />
 				</svg>
 			)
-		case 'Room Schedule':
+
+		case 'System Logs':
 			return (
-				<svg className={common} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-					<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+				<svg className={common} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+					<path d="M3 3h18v2H3V3zm0 4h12v2H3V7zm0 4h18v2H3v-2zm0 4h12v2H3v-2zm0 4h18v2H3v-2z" />
 				</svg>
 			)
+
 		default:
 			return null
 	}
@@ -38,7 +40,7 @@ function NavIcon({ label }) {
 export default function AdminLayout() {
 	const navigate = useNavigate()
 	const { pathname } = useLocation()
-	const isDashboard = pathname === '/a/dashboard' || pathname === '/a'
+	const isDashboard = pathname === '/a/dashboard' || pathname === '/a' || pathname === '/a/system-logs'
 	const [confirmDialog, setConfirmDialog] = useState({ open: false })
 
 	return (

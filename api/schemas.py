@@ -164,6 +164,35 @@ class DayResponse(BaseModel):
         from_attributes = True
 
 
+# DayPattern schemas
+class DayPatternCreate(BaseModel):
+    name: str
+    day_ids: str        # comma-separated day IDs: "1,3"
+    priority: Optional[int] = 0
+    is_active: Optional[bool] = True
+    applies_to: Optional[str] = "ALL"  # "LEC", "LAB", or "ALL"
+
+
+class DayPatternUpdate(BaseModel):
+    name: Optional[str] = None
+    day_ids: Optional[str] = None
+    priority: Optional[int] = None
+    is_active: Optional[bool] = None
+    applies_to: Optional[str] = None
+
+
+class DayPatternResponse(BaseModel):
+    id: int
+    name: str
+    day_ids: str
+    priority: int
+    is_active: bool
+    applies_to: str
+
+    class Config:
+        from_attributes = True
+
+
 # Subject schemas
 class SubjectCreate(BaseModel):
     code: str

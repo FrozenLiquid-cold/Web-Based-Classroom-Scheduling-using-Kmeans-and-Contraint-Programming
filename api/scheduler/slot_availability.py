@@ -123,6 +123,7 @@ def generate_recommendations(
     year: Optional[int],
     block_label: str = "A",
     max_recommendations: int = 5,
+    day_patterns: List[Dict] = None,
 ) -> List[Dict]:
     """
     Generate scheduling recommendations for a subject that couldn't be scheduled.
@@ -144,24 +145,35 @@ def generate_recommendations(
     is_lab = subj_type == "LAB"
     
     # Define day patterns based on subject type
-    PAIRED_PATTERNS = [
-        ("M-W", ["M", "W"]),
-        ("T-TH", ["T", "TH"]),
-    ]
-    SINGLE_PATTERNS = [("F", ["F"])]
-    STANDARD_LABELS = {"M", "T", "W", "TH", "F"}
-    WEEKEND_LABELS = {"SAT", "SUN"}
-    
-    # Extra days: any day in the DB that isn't part of the standard set
-    extra_singles = [(d.label, [d.label]) for d in days if d.label.upper() not in STANDARD_LABELS]
-    
-    if is_lab:
-        # LAB: paired M-W / T-TH patterns + single Friday, then extra days
-        friday_single = [(d.label, [d.label]) for d in days if d.label.upper() == "F"]
-        patterns_to_try = PAIRED_PATTERNS + friday_single + extra_singles
+    # If DB patterns are provided, use them; otherwise fall back to hardcoded defaults
+    if day_patterns and len(day_patterns) > 0:
+        day_id_to_label = {d.id: d.label for d in days}
+        patterns_to_try = []
+        for pat in day_patterns:
+            if not pat.get("is_active", True):
+                continue
+            applies = pat.get("applies_to", "ALL")
+            if applies != "ALL" and applies != subj_type:
+                continue
+            pat_day_ids = [int(x) for x in str(pat["day_ids"]).split(",") if x.strip()]
+            pat_labels = [day_id_to_label.get(did) for did in pat_day_ids]
+            if None in pat_labels:
+                continue
+            patterns_to_try.append((pat["name"], pat_labels))
     else:
-        # LEC: paired M-W / T-TH patterns + Friday single-day + extra days
-        patterns_to_try = PAIRED_PATTERNS + SINGLE_PATTERNS + extra_singles
+        # Hardcoded fallback
+        PAIRED_PATTERNS = [
+            ("M-W", ["M", "W"]),
+            ("T-TH", ["T", "TH"]),
+        ]
+        SINGLE_PATTERNS = [("F", ["F"])]
+        STANDARD_LABELS = {"M", "T", "W", "TH", "F"}
+        extra_singles = [(d.label, [d.label]) for d in days if d.label.upper() not in STANDARD_LABELS]
+        if is_lab:
+            friday_single = [(d.label, [d.label]) for d in days if d.label.upper() == "F"]
+            patterns_to_try = PAIRED_PATTERNS + friday_single + extra_singles
+        else:
+            patterns_to_try = PAIRED_PATTERNS + SINGLE_PATTERNS + extra_singles
 
     def _check_slot_on_day(room_id, day_id, start_min, end_min):
         """Check if room is free for the given time range on the given day."""

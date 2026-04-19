@@ -376,3 +376,17 @@ class SystemSetting(Base):
     value = Column(String(255), nullable=False)
     description = Column(String(500), nullable=True)
 
+
+class SystemLog(Base):
+    """System-wide activity log for tracking all operations."""
+    __tablename__ = "system_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    level = Column(String(20), nullable=False, default='INFO')      # INFO, WARNING, ERROR, SUCCESS
+    category = Column(String(50), nullable=False, index=True)        # auth, schedule, entity, settings, system
+    action = Column(String(100), nullable=False)                     # login, generate, create, update, delete, etc.
+    user = Column(String(100), nullable=True)                        # username who performed the action
+    detail = Column(Text, nullable=True)                             # human-readable description
+    metadata_json = Column(Text, nullable=True)                      # JSON blob for extra structured data
+

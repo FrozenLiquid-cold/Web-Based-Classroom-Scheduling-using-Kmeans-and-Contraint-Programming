@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { list } from '../../store/db'
 import { loadInstructorSchedules, searchSwappableSchedules, createSwapRequest, validateSwapRequest } from '../../services/api'
+import SchoolYearSelector, { computeDefaultSY } from '../../components/SchoolYearSelector'
 
 export default function Schedule() {
     const [courses, setCourses] = useState([])
@@ -12,12 +13,14 @@ export default function Schedule() {
     const [courseId, setCourseId] = useState('')
     const [year, setYear] = useState('')  // Empty = All Years
     const [sem, setSem] = useState('1')
+    const [schoolYear, setSchoolYear] = useState(() => localStorage.getItem('jrmsu.schoolYear') || computeDefaultSY())
     const [rows, setRows] = useState([])
     const [rawScheduleCount, setRawScheduleCount] = useState(0)  // Raw count before merging
     const [allInstructorSchedules, setAllInstructorSchedules] = useState([])
     const [coursesWithScheduleIds, setCoursesWithScheduleIds] = useState([])
     const [hasCheckedSchedule, setHasCheckedSchedule] = useState(false)
     const [loading, setLoading] = useState(true)
+    const [selectedGroups, setSelectedGroups] = useState(new Set()) // for print checkboxes
 
     // Get isDark from layout context
     const { isDark } = useOutletContext() || { isDark: false }
@@ -76,8 +79,8 @@ export default function Schedule() {
             }
             setLoading(true)
             try {
-                // Single API call instead of N×2 calls
-                const resp = await loadInstructorSchedules(currentInstructorId)
+                // Single API call instead of multiple calls
+                const resp = await loadInstructorSchedules(currentInstructorId, null, schoolYear)
                 if (cancelled) return
 
                 if (resp && resp.status === 'success') {
@@ -121,7 +124,7 @@ export default function Schedule() {
         }
         fetchInstructorSchedules()
         return () => { cancelled = true }
-    }, [currentInstructorId])
+    }, [currentInstructorId, schoolYear])
 
     // Filter schedules for the selected course and semester from cached data
     useEffect(() => {
@@ -219,7 +222,7 @@ export default function Schedule() {
 
     // Convert 24-hour time to 12-hour format
     const formatTime12Hour = (timeStr) => {
-        if (!timeStr) return '—'
+        if (!timeStr) return '—'
 
         // Handle time ranges like "16:00:00–19:00:00" or "15:00–17:00"
         const parts = timeStr.split(/[–-]/).map(t => t.trim())
@@ -249,9 +252,197 @@ export default function Schedule() {
     // Get instructor name by ID
     const getInstructorName = (id) => {
         const instructor = instructors.find(i => i.id === id)
-        if (!instructor) return '—'
-        return `${instructor.first_name || instructor.firstName || ''} ${instructor.last_name || instructor.lastName || ''}`.trim() || '—'
+        if (!instructor) return '—'
+        return `${instructor.first_name || instructor.firstName || ''} ${instructor.last_name || instructor.lastName || ''}`.trim() || '—'
     }
+
+    // --- Build groups (memoized for use by both UI and print) ---
+    const scheduleGroups = useMemo(() => {
+        const groups = []
+        const groupMap = new Map()
+        rows.forEach(r => {
+            const subId = r.subjectId || r.subject_id
+            const block = r.block || '\u2014'
+            const key = `${subId}_${block}`
+            if (!groupMap.has(key)) {
+                const group = { subjectId: subId, block, key, entries: [] }
+                groupMap.set(key, group)
+                groups.push(group)
+            }
+            groupMap.get(key).entries.push(r)
+        })
+        return groups
+    }, [rows])
+
+    const toggleGroup = (key) => {
+        setSelectedGroups(prev => {
+            const next = new Set(prev)
+            if (next.has(key)) next.delete(key)
+            else next.add(key)
+            return next
+        })
+    }
+
+    const toggleAllGroups = () => {
+        if (selectedGroups.size === scheduleGroups.length) {
+            setSelectedGroups(new Set())
+        } else {
+            setSelectedGroups(new Set(scheduleGroups.map(g => g.key)))
+        }
+    }
+
+    const allGroupsSelected = scheduleGroups.length > 0 && selectedGroups.size === scheduleGroups.length
+
+    // --- Print Logic ---
+    const handlePrint = (printAll = false) => {
+        if (!rows.length) return;
+
+        const groupsToPrint = printAll
+            ? scheduleGroups
+            : scheduleGroups.filter(g => selectedGroups.has(g.key));
+        if (!groupsToPrint.length) return;
+
+        const selectedCourse = courses.find(c => c.id === Number(courseId));
+        const courseLabel = selectedCourse
+            ? `${selectedCourse.code || ''}${selectedCourse.major ? ' - ' + selectedCourse.major : ''}`
+            : '';
+        const yearLabel = year ? `Year ${year}` : 'All Years';
+        const semLabel = `Semester ${sem}`;
+        const syLabel = localStorage.getItem('jrmsu.schoolYear') || computeDefaultSY() || '';
+        const now = new Date();
+        const datePrinted = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+        let cardsHtml = '';
+        const seenSubjects = new Set();
+        let totalUnits = 0;
+
+        groupsToPrint.forEach((group, idx) => {
+            const s = getSubject(group.subjectId) || {};
+            const unitKey = `${group.subjectId}_${group.block}`;
+            if (!seenSubjects.has(unitKey)) {
+                seenSubjects.add(unitKey);
+                totalUnits += parseInt(s.unit) || 0;
+            }
+            let sessionsHtml = '';
+            group.entries.forEach(r => {
+                sessionsHtml += `<tr><td class="tc">${getDay(r) || '\u2014'}</td><td class="tc">${formatTime12Hour(r.time)}</td><td class="tc">${getRoom(r.roomId || r.room_id) || '\u2014'}</td></tr>`;
+            });
+            cardsHtml += `
+            <div class="group-card">
+                <div class="group-header">
+                    <div class="group-num">${idx + 1}</div>
+                    <div class="group-info">
+                        <div class="group-title">${s.code || '\u2014'} <span class="type-badge">${s.type || ''}</span></div>
+                        <div class="group-desc">${s.description || '\u2014'}</div>
+                    </div>
+                    <div class="group-meta">
+                        <span class="meta-pill">Block ${group.block}</span>
+                        <span class="meta-pill">${s.unit || 0} Units</span>
+                        <span class="meta-pill">${group.entries.length} ${group.entries.length === 1 ? 'session' : 'sessions'}</span>
+                    </div>
+                </div>
+                <table class="session-table"><thead><tr><th>Day</th><th>Time</th><th>Room</th></tr></thead><tbody>${sessionsHtml}</tbody></table>
+            </div>`;
+        });
+
+        cardsHtml += `
+        <div class="totals-summary">
+            <span>Total Classes: <strong>${groupsToPrint.length}</strong></span>
+            <span>Total Units: <strong>${totalUnits}</strong></span>
+            <span>Total Sessions: <strong>${groupsToPrint.reduce((a, g) => a + g.entries.length, 0)}</strong></span>
+        </div>`;
+
+        const printContent = `<!DOCTYPE html><html><head>
+    <title>Instructional Schedule - ${instructorName}</title>
+    <style>
+        @page { size: landscape; margin: 10mm 12mm; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Times New Roman', 'Segoe UI', serif; color: #000; font-size: 11pt; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        .page { position: relative; padding: 8px 0; }
+        .watermark { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 0; opacity: 0.06; pointer-events: none; }
+        .watermark img { width: 420px; height: 420px; }
+        .doc-header { position: relative; margin-bottom: 10px; }
+        .doc-code { position: absolute; top: 0; left: 0; font-size: 9pt; font-weight: 700; font-style: italic; }
+        .header-center { display: flex; align-items: center; justify-content: center; gap: 12px; }
+        .header-logo { width: 50px; height: 50px; }
+        .header-text { text-align: center; }
+        .univ-name { font-size: 13pt; font-weight: 700; letter-spacing: 0.5px; }
+        .univ-tagline { font-size: 10pt; font-style: italic; color: #c00; }
+        .univ-campus { font-size: 10pt; }
+        .doc-title { text-align: center; font-size: 12pt; font-weight: 700; margin: 10px 0 6px 0; letter-spacing: 1px; }
+        .info-section { margin: 6px 0 12px 0; position: relative; z-index: 1; }
+        .info-row { display: flex; gap: 30px; margin-bottom: 4px; align-items: baseline; }
+        .info-label { font-weight: 700; font-size: 10pt; white-space: nowrap; }
+        .info-value { font-size: 10pt; font-weight: 600; }
+        .underlined { border-bottom: 1px solid #000; padding-bottom: 1px; min-width: 200px; display: inline-block; }
+        .info-line { display: flex; gap: 6px; align-items: baseline; }
+        .groups-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; position: relative; z-index: 1; }
+        .group-card { border: 1.5px solid #000; border-radius: 4px; overflow: hidden; break-inside: avoid; }
+        .group-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #f5f5f5; border-bottom: 1px solid #000; }
+        .group-num { width: 24px; height: 24px; border-radius: 4px; background: #e0e7ff; color: #3730a3; display: flex; align-items: center; justify-content: center; font-size: 9pt; font-weight: 700; flex-shrink: 0; }
+        .group-info { flex: 1; min-width: 0; }
+        .group-title { font-weight: 700; font-size: 10pt; }
+        .type-badge { display: inline-block; font-size: 7.5pt; padding: 1px 5px; border: 1px solid #888; border-radius: 3px; font-weight: 600; vertical-align: middle; margin-left: 4px; }
+        .group-desc { font-size: 8.5pt; color: #555; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .group-meta { display: flex; gap: 4px; flex-shrink: 0; }
+        .meta-pill { font-size: 7.5pt; padding: 2px 6px; background: #e8e8e8; border-radius: 3px; font-weight: 600; white-space: nowrap; }
+        .session-table { width: 100%; border-collapse: collapse; }
+        .session-table th { border-bottom: 1px solid #000; padding: 3px 6px; text-align: center; font-size: 8pt; font-weight: 700; text-transform: uppercase; background: #fafafa; }
+        .session-table td { padding: 3px 6px; font-size: 9pt; border-bottom: 1px solid #ddd; }
+        .session-table .tc { text-align: center; }
+        .session-table tr:last-child td { border-bottom: none; }
+        .totals-summary { grid-column: 1 / -1; margin-top: 4px; padding: 8px 16px; border: 1.5px solid #000; border-radius: 4px; display: flex; gap: 40px; font-size: 10pt; justify-content: center; background: #f9f9f9; }
+        .signatures { display: flex; justify-content: space-between; margin: 30px 40px 0 40px; position: relative; z-index: 1; }
+        .sig-block { text-align: center; min-width: 200px; }
+        .sig-label { font-size: 10pt; font-weight: 700; margin-bottom: 30px; }
+        .sig-line { border-top: 1px solid #000; width: 220px; margin: 0 auto; }
+        .print-footer { margin-top: 25px; border-top: 2px solid #000; padding-top: 4px; position: relative; z-index: 1; }
+        .print-footer-inner { display: flex; justify-content: center; gap: 60px; font-size: 9pt; border: 1px solid #000; padding: 5px 20px; }
+        @media print { .no-print { display: none !important; } body { padding: 0; } }
+    </style>
+</head><body>
+    <div class="page">
+        <div class="watermark"><img src="/assets/jrmsu-logo.png" alt="" /></div>
+        <div class="doc-header">
+            <div class="doc-code">JRMSU &ndash; REC 001</div>
+            <div class="header-center">
+                <img src="/assets/jrmsu-logo.png" alt="JRMSU" class="header-logo" />
+                <div class="header-text">
+                    <div class="univ-name">JOSE RIZAL MEMORIAL STATE UNIVERSITY</div>
+                    <div class="univ-tagline">The Premier University in Zamboanga del Norte</div>
+                    <div class="univ-campus">Main Campus, Dapitan City</div>
+                </div>
+            </div>
+        </div>
+        <div class="doc-title">INSTRUCTIONAL SCHEDULE</div>
+        <div class="info-section">
+            <div class="info-row">
+                <div class="info-line"><span class="info-label">Instructor:</span><span class="info-value underlined">${instructorName}</span></div>
+                <div class="info-line"><span class="info-label">${semLabel} &bull; S.Y. ${syLabel}</span></div>
+            </div>
+            <div class="info-row">
+                <div class="info-line"><span class="info-label">Course:</span><span class="info-value underlined">${courseLabel}</span></div>
+                <div class="info-line"><span class="info-label">${yearLabel}</span></div>
+            </div>
+        </div>
+        <div class="groups-grid">${cardsHtml}</div>
+        <div class="signatures">
+            <div class="sig-block"><div class="sig-label">Prepared By:</div><div class="sig-line"></div></div>
+            <div class="sig-block"><div class="sig-label">Approved By:</div><div class="sig-line"></div></div>
+        </div>
+        <div class="print-footer"><div class="print-footer-inner">
+            <span>Printed by: __________________</span><span>Date Printed: ${datePrinted}</span>
+        </div></div>
+    </div>
+    <script>window.onload = function() { window.print(); }</script>
+</body></html>`;
+
+        const printWindow = window.open('', '_blank', 'width=1100,height=700');
+        if (printWindow) {
+            printWindow.document.write(printContent);
+            printWindow.document.close();
+        }
+    };
 
     // Open swap modal - just opens modal without auto-searching
     const openSwapModal = (schedule) => {
@@ -470,13 +661,16 @@ export default function Schedule() {
                     ) : noScheduleForInstructor ? (
                         <div className="flex items-center justify-center py-24">
                             <div className="text-center">
+                                <div className="flex justify-center mb-4">
+                                    <SchoolYearSelector onChange={setSchoolYear} />
+                                </div>
                                 <div className={`w-20 h-20 mx-auto mb-4 rounded-full flex items-center justify-center ${isDark ? 'bg-slate-700/50' : 'bg-slate-100'}`}>
                                     <svg className={`w-10 h-10 ${theme.textMuted}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
                                     </svg>
                                 </div>
                                 <p className={`text-xl ${theme.text} font-medium`}>No schedule assigned yet</p>
-                                <p className={theme.textMuted + ' mt-2'}>Please contact the registrar for more information.</p>
+                                <p className={theme.textMuted + ' mt-2'}>Try selecting a different school year, or contact the registrar.</p>
                             </div>
                         </div>
                     ) : (
@@ -486,7 +680,7 @@ export default function Schedule() {
                                     <label className={theme.textMuted + ' block text-sm mb-2'}>Course</label>
                                     <select className={`w-full px-4 py-3 rounded-xl ${theme.input} border focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all`} value={courseId} onChange={e => setCourseId(e.target.value)}>
                                         <option value="">Select Course</option>
-                                        {visibleCourses.map(c => <option key={c.id} value={c.id}>{c.code} — {c.description}</option>)}
+                                        {visibleCourses.map(c => <option key={c.id} value={c.id}>{c.code} — {c.description}</option>)}
                                     </select>
                                 </div>
                                 <div>
@@ -506,7 +700,51 @@ export default function Schedule() {
                                         <option value="2">2nd Semester</option>
                                     </select>
                                 </div>
+                                <div className="flex items-end">
+                                    <SchoolYearSelector onChange={setSchoolYear} />
+                                </div>
                             </div>
+
+                            {/* Print controls */}
+                            {rows.length > 0 && (
+                                <div className={`flex flex-wrap items-center gap-3 mb-4 p-3 rounded-xl border ${isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+                                    <label className={`flex items-center gap-2 cursor-pointer select-none ${theme.text}`}>
+                                        <input
+                                            type="checkbox"
+                                            checked={allGroupsSelected}
+                                            onChange={toggleAllGroups}
+                                            className="w-4 h-4 rounded border-slate-400 text-blue-600 focus:ring-blue-500"
+                                        />
+                                        <span className="text-sm font-medium">Select All</span>
+                                    </label>
+                                    <span className={`text-sm ${theme.textMuted}`}>
+                                        {selectedGroups.size} of {scheduleGroups.length} selected
+                                    </span>
+                                    <div className="flex-1" />
+                                    <button
+                                        type="button"
+                                        onClick={() => handlePrint(false)}
+                                        disabled={selectedGroups.size === 0}
+                                        className={`px-4 py-2 rounded-lg border flex items-center gap-2 text-sm font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed ${isDark ? 'bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-600/50' : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'}`}
+                                        title="Print selected"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                            <path fillRule="evenodd" d="M5 4v3H4a2 2 0 00-2 2v3a2 2 0 002 2h1v2a2 2 0 002 2h6a2 2 0 002-2v-2h1a2 2 0 002-2V9a2 2 0 00-2-2h-1V4a2 2 0 00-2-2H7a2 2 0 00-2 2zm8 0H7v3h6V4zm0 8H7v4h6v-4z" clipRule="evenodd" />
+                                        </svg>
+                                        Print Selected
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => handlePrint(true)}
+                                        className="px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-all"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                            <path fillRule="evenodd" d="M5 4v3H4a2 2 0 00-2 2v3a2 2 0 002 2h1v2a2 2 0 002 2h6a2 2 0 002-2v-2h1a2 2 0 002-2V9a2 2 0 00-2-2h-1V4a2 2 0 00-2-2H7a2 2 0 00-2 2zm8 0H7v3h6V4zm0 8H7v4h6v-4z" clipRule="evenodd" />
+                                        </svg>
+                                        Print All
+                                    </button>
+                                </div>
+                            )}
 
                             {rows.length > 0 && (
                                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
@@ -544,95 +782,85 @@ export default function Schedule() {
 
                             {rows.length > 0 ? (
                                 <div className="space-y-4">
-                                    {(() => {
-                                        // Group rows by subject + block
-                                        const groups = []
-                                        const groupMap = new Map()
-                                        rows.forEach(r => {
-                                            const subId = r.subjectId || r.subject_id
-                                            const block = r.block || '—'
-                                            const key = `${subId}_${block}`
-                                            if (!groupMap.has(key)) {
-                                                const group = { subjectId: subId, block, entries: [] }
-                                                groupMap.set(key, group)
-                                                groups.push(group)
-                                            }
-                                            groupMap.get(key).entries.push(r)
-                                        })
-
-                                        return groups.map((group, gIdx) => {
-                                            const s = getSubject(group.subjectId) || {}
-                                            return (
-                                                <div key={gIdx} className={`backdrop-blur-xl rounded-2xl border overflow-hidden ${theme.table}`}>
-                                                    {/* Group Header */}
-                                                    <div className={`px-5 py-4 flex flex-wrap items-center gap-3 ${isDark ? 'bg-gradient-to-r from-slate-800 to-slate-800/80 border-b border-slate-700/50' : 'bg-gradient-to-r from-slate-50 to-white border-b border-slate-200'}`}>
-                                                        <div className={`w-9 h-9 rounded-lg flex items-center justify-center text-sm font-bold ${isDark ? 'bg-blue-500/20 text-blue-400' : 'bg-blue-100 text-blue-600'}`}>
-                                                            {gIdx + 1}
-                                                        </div>
-                                                        <div className="flex-1 min-w-0">
-                                                            <div className="flex items-center gap-2 flex-wrap">
-                                                                <span className={`font-semibold text-base ${theme.text}`}>{s.code || '—'}</span>
-                                                                <span className={`px-2 py-0.5 rounded-md text-xs font-medium border ${getTypeBadge(s.type)}`}>{s.type || '—'}</span>
-                                                            </div>
-                                                            <p className={`text-sm mt-0.5 ${isDark ? 'text-slate-400' : 'text-slate-500'} truncate`}>{s.description || '—'}</p>
-                                                        </div>
-                                                        <div className="flex items-center gap-3">
-                                                            <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-slate-600/50 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>
-                                                                Block {group.block}
-                                                            </span>
-                                                            <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-emerald-500/15 text-emerald-400' : 'bg-emerald-50 text-emerald-600'}`}>
-                                                                {s.unit || '—'} Units
-                                                            </span>
-                                                            <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-cyan-500/15 text-cyan-400' : 'bg-cyan-50 text-cyan-600'}`}>
-                                                                {group.entries.length} {group.entries.length === 1 ? 'session' : 'sessions'}
-                                                            </span>
-                                                        </div>
+                                    {scheduleGroups.map((group, gIdx) => {
+                                        const s = getSubject(group.subjectId) || {}
+                                        return (
+                                            <div key={group.key} className={`backdrop-blur-xl rounded-2xl border overflow-hidden ${theme.table} ${selectedGroups.has(group.key) ? (isDark ? 'ring-2 ring-blue-500/50' : 'ring-2 ring-blue-400/50') : ''}`}>
+                                                {/* Group Header */}
+                                                <div className={`px-5 py-4 flex flex-wrap items-center gap-3 ${isDark ? 'bg-gradient-to-r from-slate-800 to-slate-800/80 border-b border-slate-700/50' : 'bg-gradient-to-r from-slate-50 to-white border-b border-slate-200'}`}>
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedGroups.has(group.key)}
+                                                        onChange={() => toggleGroup(group.key)}
+                                                        className="w-4 h-4 rounded border-slate-400 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                                                        title="Select for printing"
+                                                    />
+                                                    <div className={`w-9 h-9 rounded-lg flex items-center justify-center text-sm font-bold ${isDark ? 'bg-blue-500/20 text-blue-400' : 'bg-blue-100 text-blue-600'}`}>
+                                                        {gIdx + 1}
                                                     </div>
-                                                    {/* Sessions Table */}
-                                                    <div className="overflow-x-auto">
-                                                        <table className="w-full">
-                                                            <thead>
-                                                                <tr className={theme.tableHeader}>
-                                                                    <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Day</th>
-                                                                    <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Time</th>
-                                                                    <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Room</th>
-                                                                    <th className={`text-right px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Action</th>
-                                                                </tr>
-                                                            </thead>
-                                                            <tbody className={`divide-y ${theme.tableDivide}`}>
-                                                                {group.entries.map((r, eIdx) => {
-                                                                    const dayLabel = getDay(r)
-                                                                    return (
-                                                                        <tr key={eIdx} className={`${theme.tableRow} transition-colors`}>
-                                                                            <td className="px-5 py-3.5">
-                                                                                <span className={`inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold ${getDayBadge(dayLabel)}`}>
-                                                                                    {dayLabel || '—'}
-                                                                                </span>
-                                                                            </td>
-                                                                            <td className={`px-5 py-3.5 ${isDark ? 'text-slate-300' : 'text-slate-600'} font-mono text-sm`}>
-                                                                                {formatTime12Hour(r.time)}
-                                                                            </td>
-                                                                            <td className="px-5 py-3.5">
-                                                                                <span className="text-cyan-500 font-medium">{getRoom(r.roomId || r.room_id) || '—'}</span>
-                                                                            </td>
-                                                                            <td className="px-5 py-3.5 text-right">
-                                                                                <button
-                                                                                    onClick={() => openSwapModal(r)}
-                                                                                    className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-500/90 text-white hover:bg-indigo-600 transition-all hover:shadow-md hover:shadow-indigo-500/20"
-                                                                                >
-                                                                                    Request Swap
-                                                                                </button>
-                                                                            </td>
-                                                                        </tr>
-                                                                    )
-                                                                })}
-                                                            </tbody>
-                                                        </table>
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="flex items-center gap-2 flex-wrap">
+                                                            <span className={`font-semibold text-base ${theme.text}`}>{s.code || '\u2014'}</span>
+                                                            <span className={`px-2 py-0.5 rounded-md text-xs font-medium border ${getTypeBadge(s.type)}`}>{s.type || '\u2014'}</span>
+                                                        </div>
+                                                        <p className={`text-sm mt-0.5 ${isDark ? 'text-slate-400' : 'text-slate-500'} truncate`}>{s.description || '\u2014'}</p>
+                                                    </div>
+                                                    <div className="flex items-center gap-3">
+                                                        <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-slate-600/50 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>
+                                                            Block {group.block}
+                                                        </span>
+                                                        <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-emerald-500/15 text-emerald-400' : 'bg-emerald-50 text-emerald-600'}`}>
+                                                            {s.unit || '\u2014'} Units
+                                                        </span>
+                                                        <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${isDark ? 'bg-cyan-500/15 text-cyan-400' : 'bg-cyan-50 text-cyan-600'}`}>
+                                                            {group.entries.length} {group.entries.length === 1 ? 'session' : 'sessions'}
+                                                        </span>
                                                     </div>
                                                 </div>
-                                            )
-                                        })
-                                    })()}
+                                                {/* Sessions Table */}
+                                                <div className="overflow-x-auto">
+                                                    <table className="w-full">
+                                                        <thead>
+                                                            <tr className={theme.tableHeader}>
+                                                                <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Day</th>
+                                                                <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Time</th>
+                                                                <th className={`text-left px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Room</th>
+                                                                <th className={`text-right px-5 py-3 ${theme.textMuted} font-medium text-xs uppercase tracking-wider`}>Action</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody className={`divide-y ${theme.tableDivide}`}>
+                                                            {group.entries.map((r, eIdx) => {
+                                                                const dayLabel = getDay(r)
+                                                                return (
+                                                                    <tr key={eIdx} className={`${theme.tableRow} transition-colors`}>
+                                                                        <td className="px-5 py-3.5">
+                                                                            <span className={`inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold ${getDayBadge(dayLabel)}`}>
+                                                                                {dayLabel || '\u2014'}
+                                                                            </span>
+                                                                        </td>
+                                                                        <td className={`px-5 py-3.5 ${isDark ? 'text-slate-300' : 'text-slate-600'} font-mono text-sm`}>
+                                                                            {formatTime12Hour(r.time)}
+                                                                        </td>
+                                                                        <td className="px-5 py-3.5">
+                                                                            <span className="text-cyan-500 font-medium">{getRoom(r.roomId || r.room_id) || '\u2014'}</span>
+                                                                        </td>
+                                                                        <td className="px-5 py-3.5 text-right">
+                                                                            <button
+                                                                                onClick={() => openSwapModal(r)}
+                                                                                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-500/90 text-white hover:bg-indigo-600 transition-all hover:shadow-md hover:shadow-indigo-500/20"
+                                                                            >
+                                                                                Request Swap
+                                                                            </button>
+                                                                        </td>
+                                                                    </tr>
+                                                                )
+                                                            })}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        )
+                                    })}
                                 </div>
                             ) : courseId ? (
                                 <div className="flex items-center justify-center py-24">
@@ -818,14 +1046,14 @@ export default function Schedule() {
                                                             </div>
 
                                                             <div className={`p-2 text-sm ${theme.text} border-r ${isDark ? 'border-slate-600' : 'border-slate-200'} font-mono`}>
-                                                                {formatTime12Hour(schedule.time) || '—'}
+                                                                {formatTime12Hour(schedule.time) || '—'}
                                                             </div>
                                                             <div className={`p-2 text-sm border-r ${isDark ? 'border-slate-600' : 'border-slate-200'}`}>
                                                                 <span className={`font-medium ${theme.text}`}>{schedule.subject_code}</span>
                                                                 <span className={`block text-xs ${theme.textMuted} truncate`}>{schedule.subject_description}</span>
                                                             </div>
                                                             <div className={`p-2 text-sm ${theme.text} border-r ${isDark ? 'border-slate-600' : 'border-slate-200'}`}>
-                                                                {schedule.instructor_name || '—'}
+                                                                {schedule.instructor_name || '—'}
                                                             </div>
                                                             <div className={`p-2 text-sm ${theme.textMuted} border-r ${isDark ? 'border-slate-600' : 'border-slate-200'}`}>
                                                                 <span className="text-emerald-500 font-medium">{schedule.day_label}</span>
@@ -840,7 +1068,7 @@ export default function Schedule() {
                                                                         : 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200'
                                                                         }`}
                                                                 >
-                                                                    {selectedSwapTarget?.id === schedule.id ? '✓ Selected' : 'Select'}
+                                                                    {selectedSwapTarget?.id === schedule.id ? 'Ã¢Å“â€œ Selected' : 'Select'}
                                                                 </button>
                                                             </div>
                                                         </div>

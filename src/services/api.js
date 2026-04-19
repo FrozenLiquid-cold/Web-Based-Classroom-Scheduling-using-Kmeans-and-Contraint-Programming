@@ -280,9 +280,10 @@ export async function loadInstructorSchedules(instructorId, semester = null, sch
   return apiCall(`/schedule/load-instructor?${params.toString()}`)
 }
 
-export async function getInstructorWorkload(instructorId, semester) {
+export async function getInstructorWorkload(instructorId, semester, schoolYear = null) {
   if (!instructorId) throw new Error('Missing instructorId')
   const params = new URLSearchParams({ semester })
+  if (schoolYear) params.append('school_year', schoolYear)
   return apiCall(`/instructors/${encodeURIComponent(instructorId)}/workload?${params.toString()}`)
 }
 
@@ -294,6 +295,12 @@ export async function deleteSchedule(courseId, year, semester, schoolYear = null
 
 export async function deleteScheduleItem(id) {
   return apiCall(`/schedule/item/${id}`, { method: 'DELETE' })
+}
+
+export async function getInstructorHoursSummary(semester, schoolYear = null) {
+  const params = new URLSearchParams({ semester })
+  if (schoolYear) params.append('school_year', schoolYear)
+  return apiCall(`/schedule/instructor-hours-summary?${params.toString()}`)
 }
 
 export async function getScheduleStatus(jobId) {

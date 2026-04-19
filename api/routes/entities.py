@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from .. import models
 from .. import schemas
 from ..db import SessionLocal
+from ..system_logger import log_event
 
 entities_bp = Blueprint("entities", __name__)
 logger = logging.getLogger(__name__)
@@ -413,22 +414,26 @@ def get_instructor_workload(instructor_id: int):
     if semester not in {1, 2}:
         return jsonify({"detail": "semester query parameter must be 1 or 2"}), 400
 
+    school_year = request.args.get("school_year", type=str, default=None)
+
     with _get_session() as db:
         instructor = db.query(models.Instructor).get(instructor_id)
         if not instructor:
             return jsonify({"detail": "Instructor not found"}), 404
 
-        schedules = (
+        query = (
             db.query(models.Schedule)
             .filter(
                 models.Schedule.instructor_id == instructor_id,
                 models.Schedule.semester == semester,
             )
-            .all()
         )
+        if school_year:
+            query = query.filter(models.Schedule.school_year == school_year)
+        schedules = query.all()
         
         # Debug logging
-        logger.info(f"Workload query: instructor_id={instructor_id}, semester={semester}, found {len(schedules)} schedules")
+        logger.info(f"Workload query: instructor_id={instructor_id}, semester={semester}, school_year={school_year}, found {len(schedules)} schedules")
 
         total_minutes = 0
         subject_ids = set()
@@ -642,6 +647,20 @@ def create_user():
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
+
+        # Log the user creation
+        linked = ""
+        if user_data.role == "instructor" and user_data.instructor_id:
+            instr = db.query(models.Instructor).get(user_data.instructor_id)
+            if instr:
+                linked = f" (linked to {instr.first_name} {instr.last_name})"
+        log_event(
+            'entity', 'create',
+            f'Created user "{user_data.username}" with role "{user_data.role}"{linked}',
+            level='SUCCESS',
+            metadata={'entity': 'user', 'user_id': db_user.id, 'username': user_data.username, 'role': user_data.role}
+        )
+
         return jsonify(_serialize(db_user, schemas.UserResponse)), 201
 
 
@@ -683,6 +702,22 @@ def update_user(user_id: int):
 
         db.commit()
         db.refresh(user)
+
+        # Log the user update
+        changes = []
+        if "username" in data and data["username"]:
+            changes.append(f'username→"{data["username"]}"')
+        if "password" in data and data["password"]:
+            changes.append('password changed')
+        if "role" in data and data["role"]:
+            changes.append(f'role→"{data["role"]}"')
+        log_event(
+            'entity', 'update',
+            f'Updated user "{user.username}" (ID:{user_id}): {", ".join(changes) if changes else "no field changes"}',
+            level='INFO',
+            metadata={'entity': 'user', 'user_id': user_id, 'changes': changes}
+        )
+
         return jsonify(_serialize(user, schemas.UserResponse))
 
 
@@ -693,8 +728,19 @@ def delete_user(user_id: int):
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user:
             return jsonify({"detail": "User not found"}), 404
+        deleted_username = user.username
+        deleted_role = user.role
         db.delete(user)
         db.commit()
+
+        # Log the user deletion
+        log_event(
+            'entity', 'delete',
+            f'Deleted user "{deleted_username}" (role: {deleted_role}, ID:{user_id})',
+            level='WARNING',
+            metadata={'entity': 'user', 'user_id': user_id, 'username': deleted_username, 'role': deleted_role}
+        )
+
         return "", 204
 
 

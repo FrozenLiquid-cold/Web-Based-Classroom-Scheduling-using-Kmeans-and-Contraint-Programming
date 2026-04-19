@@ -187,15 +187,28 @@ export default function ScheduleTimetable({
       </div>
 
       {/* Progress bar */}
-      <div style={{ height: 3, background: '#f3f4f6', borderRadius: 2, marginBottom: 16 }}>
-        <div style={{
-          height: '100%',
-          width: (effectiveTotal * blocksCount) > 0 ? `${(totalUniqueScheduled / (effectiveTotal * blocksCount)) * 100}%` : '0%',
-          background: 'linear-gradient(90deg, #3b82f6, #8b5cf6)',
-          transition: 'width 0.6s ease',
-          borderRadius: 2,
-        }} />
-      </div>
+      {(() => {
+        const pct = (effectiveTotal * blocksCount) > 0
+          ? Math.round((totalUniqueScheduled / (effectiveTotal * blocksCount)) * 100)
+          : 0;
+        return (
+          <div style={{ position: 'relative', height: 18, background: '#f3f4f6', borderRadius: 9, marginBottom: 16, overflow: 'hidden' }}>
+            <div style={{
+              height: '100%',
+              width: `${pct}%`,
+              background: 'linear-gradient(90deg, #3b82f6, #8b5cf6)',
+              transition: 'width 0.6s ease',
+              borderRadius: 9,
+            }} />
+            <span style={{
+              position: 'absolute', inset: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 10, fontWeight: 700, letterSpacing: 0.5,
+              color: pct > 45 ? '#fff' : '#6b7280',
+            }}>{pct}%</span>
+          </div>
+        );
+      })()}
 
       {/* Stacked block sections */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
