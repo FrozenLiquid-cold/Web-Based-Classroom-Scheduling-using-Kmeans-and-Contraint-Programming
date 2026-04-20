@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_file
 from sqlalchemy.exc import SQLAlchemyError
 import pdfplumber
 import logging
@@ -6,6 +6,13 @@ import re
 import os
 import tempfile
 from typing import List, Dict, Any
+
+# Directory for persistent PDF storage
+UPLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'uploads', 'curriculum')
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+def _pdf_path(course_id: int) -> str:
+    return os.path.join(UPLOADS_DIR, f'curriculum_{course_id}.pdf')
 
 from .. import models
 from ..db import SessionLocal
@@ -358,9 +365,47 @@ def delete_curriculum(course_id: int):
             models.CurriculumSubject.course_id == course_id
         ).delete()
         session.commit()
+        # Also remove the stored PDF if present
+        pdf_file = _pdf_path(course_id)
+        if os.path.exists(pdf_file):
+            try:
+                os.remove(pdf_file)
+            except Exception:
+                pass
         return jsonify({"detail": "Deleted successfully"})
     except Exception as e:
         session.rollback()
         return jsonify({"detail": str(e)}), 500
     finally:
         session.close()
+
+
+@curriculum_bp.route("/curriculum/<int:course_id>/pdf", methods=["POST"])
+def upload_curriculum_pdf(course_id: int):
+    """Persist the PDF file for a curriculum so it can be served back on demand."""
+    if 'file' not in request.files:
+        return jsonify({"detail": "No file part"}), 400
+    file = request.files['file']
+    if not file or file.filename == '':
+        return jsonify({"detail": "No selected file"}), 400
+    try:
+        dest = _pdf_path(course_id)
+        file.save(dest)
+        return jsonify({"detail": "PDF stored", "path": dest}), 200
+    except Exception as e:
+        logger.error(f"Error saving PDF: {e}", exc_info=True)
+        return jsonify({"detail": str(e)}), 500
+
+
+@curriculum_bp.route("/curriculum/<int:course_id>/pdf", methods=["GET"])
+def get_curriculum_pdf(course_id: int):
+    """Return the stored PDF file for a curriculum."""
+    pdf_file = _pdf_path(course_id)
+    if not os.path.exists(pdf_file):
+        return jsonify({"detail": "No PDF stored for this curriculum"}), 404
+    return send_file(
+        pdf_file,
+        mimetype='application/pdf',
+        as_attachment=False,
+        download_name=f'curriculum_{course_id}.pdf'
+    )
