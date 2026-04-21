@@ -67,8 +67,12 @@ class Instructor(Base):
     preferred_end_time = Column(String(10), nullable=True)  # e.g., "17:00"
     max_units = Column(Integer, nullable=True)  # Maximum units per semester
     is_active = Column(Boolean, default=True, nullable=False, server_default="1")  # Active/Inactive flag
+    # Program assignment (for core-faculty prioritisation)
+    home_course_id = Column(Integer, ForeignKey("courses.id"), nullable=True)   # Primary program
+    linked_course_ids = Column(Text, nullable=True)  # Extra programs: comma-sep course IDs e.g. "2,5"
     
     college = relationship("College")
+    home_course = relationship("Course", foreign_keys=[home_course_id])
     user = relationship("User", back_populates="instructor", uselist=False)
     schedules = relationship("Schedule", back_populates="instructor")
 

@@ -159,7 +159,10 @@ export default function DashboardPanel() {
     // --- Filtered data for modals ---
     const filteredInstructors = (stats.instructors.details || []).filter(i => {
         const matchStatus = instrFilter === "all" || i.status === instrFilter
-        const matchSearch = !instrSearch || i.name.toLowerCase().includes(instrSearch.toLowerCase()) || (i.college || '').toLowerCase().includes(instrSearch.toLowerCase())
+        const matchSearch = !instrSearch ||
+            i.name.toLowerCase().includes(instrSearch.toLowerCase()) ||
+            (i.college || '').toLowerCase().includes(instrSearch.toLowerCase()) ||
+            (i.home_program || '').toLowerCase().includes(instrSearch.toLowerCase())
         return matchStatus && matchSearch
     })
 
@@ -413,7 +416,7 @@ export default function DashboardPanel() {
                                     const sc = statusConfig[instr.status] || statusConfig.available
                                     return (
                                         <div key={instr.id} className={`grid grid-cols-12 gap-3 items-center p-4 rounded-xl border transition-all hover:shadow-sm ${instr.status === 'overloaded' ? 'bg-rose-50 border-rose-200' : instr.status === 'near_capacity' ? 'bg-amber-50 border-amber-200' : 'bg-white border-slate-100'}`}>
-                                            <div className="col-span-3"><div className="font-bold text-slate-800">{instr.name}</div></div>
+                                            <div className="col-span-3"><div className="font-bold text-slate-800">{instr.name}</div>{instr.home_program && <div className="text-[10px] text-blue-600 font-medium mt-0.5">{instr.home_program}</div>}</div>
                                             <div className="col-span-1 text-center text-xs font-medium text-slate-500">{instr.college || '—'}</div>
                                             <div className="col-span-1 text-center"><span className="text-[10px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded">{instr.employment_type}</span></div>
                                             <div className="col-span-1 text-center text-sm font-bold text-slate-700">{instr.subject_count}</div>

@@ -9,6 +9,17 @@ from datetime import datetime
 stats_bp = Blueprint("stats", __name__)
 logger = logging.getLogger(__name__)
 
+def _fmt_course(course):
+    """Return a display label for a course, including major when set.
+    e.g. BSCS (Network Technology) → 'BSCS (Network Technology)'
+         BSIT with no major        → 'BSIT'
+    """
+    if not course:
+        return "—"
+    if course.major:
+        return f"{course.code} ({course.major})"
+    return course.code
+
 def _parse_duration_mins(time_str):
     """Parse a time range string like '7:00 AM - 8:30 AM' and return duration in minutes."""
     if not time_str:
@@ -230,7 +241,7 @@ def get_admin_stats():
                     "instructor": f"{item.instructor.first_name} {item.instructor.last_name}" if item.instructor else "TBA",
                     "is_shared_subject": _is_shared_venue_subject(item),
                     "time": item.time,
-                    "course": item.course.code if item.course else "—",
+                    "course": _fmt_course(item.course),
                 })
             
             conflict_details.append(conflict_group)
@@ -344,10 +355,12 @@ def get_admin_stats():
             unique_subjects = set(sid for sid, _ in assigned_pairs)
 
             college_name = instr.college.code if instr.college else None
+            home_course = instr.home_course
             instructor_details.append({
                 "id": instr.id,
                 "name": f"{instr.last_name}, {instr.first_name}",
                 "college": college_name,
+                "home_program": _fmt_course(home_course) if home_course else None,
                 "employment_type": instr.employment_type or "N/A",
                 "loaded_units": loaded_units,
                 "max_units": max_u,
@@ -381,7 +394,7 @@ def get_admin_stats():
              unscheduled_sample = [{
                  "code": s.code,
                  "description": s.description,
-                 "course": s.course.code if s.course else "—",
+                 "course": _fmt_course(s.course),
                  "year_level": s.year_level or "—",
                  "semester": s.semester or "—",
                  "type": s.type or "—",
@@ -717,7 +730,7 @@ def get_staffing_analysis():
                 }
             sg = subj_groups[key]
             if s.course:
-                sg["courses"].add(s.course.code)
+                sg["courses"].add(_fmt_course(s.course))
             sg["subj_ids"].add(s.id)
             if s.year_level:
                 sg["year_levels"].add(s.year_level)

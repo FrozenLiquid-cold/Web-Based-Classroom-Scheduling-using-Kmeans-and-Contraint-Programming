@@ -57,6 +57,7 @@ export default function RegistrarSchedule() {
   const [courses, setCourses] = useState([]);
   const [instructors, setInstructors] = useState([]);
   const [days, setDays] = useState([]);
+  const [dayPatterns, setDayPatterns] = useState([]);
   const [subjects, setSubjects] = useState([]);
   const [rooms, setRooms] = useState([]);
   const [buildings, setBuildings] = useState([]);
@@ -280,12 +281,19 @@ export default function RegistrarSchedule() {
           const bRes = await fetch('http://localhost:8000/api/buildings');
           if (bRes.ok) buildingList = await bRes.json();
         } catch (e) { console.error('Failed to load buildings', e); }
+        // Load day patterns
+        let dayPatternList = [];
+        try {
+          const dpRes = await fetch('http://localhost:8000/api/day-patterns');
+          if (dpRes.ok) dayPatternList = await dpRes.json();
+        } catch (e) { console.error('Failed to load day patterns', e); }
         setCourses(courseList || []);
         setInstructors(instructorList || []);
         setDays(dayList || []);
         setSubjects(subjectList || []);
         setRooms(roomList || []);
         setBuildings(buildingList);
+        setDayPatterns(dayPatternList);
       } catch (err) {
         console.error("Failed to load data", err);
       }
@@ -1111,25 +1119,23 @@ export default function RegistrarSchedule() {
   // --- Manual Override Logic ---
 
   function openEditModal(slot) {
-    // Detect MW/TTH pattern from combined label
+    // Detect which day pattern the slot belongs to by matching its day IDs
+    let dayIds = slot._dayIds && slot._dayIds.length > 0 ? slot._dayIds : [slot.day_id].filter(Boolean);
     let dayMode = "SINGLE";
-    let dayIds = slot._dayIds || [slot.day_id];
 
-    if (slot._combinedDaysLabel === "M-W") {
-      dayMode = "MW";
-      // Get the day IDs for M and W
-      const m = days.find(d => d.label === 'M');
-      const w = days.find(d => d.label === 'W');
-      if (m && w) {
-        dayIds = [m.id, w.id];
-      }
-    } else if (slot._combinedDaysLabel === "T-TH") {
-      dayMode = "TTH";
-      const t = days.find(d => d.label === 'T');
-      const th = days.find(d => d.label === 'TH');
-      if (t && th) {
-        dayIds = [t.id, th.id];
-      }
+    // Try to match against loaded day patterns
+    const sortedSlotIds = [...dayIds].map(Number).sort((a, b) => a - b);
+    const matchedPattern = dayPatterns.find(p => {
+      const patIds = p.day_ids.split(',').map(Number).filter(Boolean).sort((a, b) => a - b);
+      return patIds.length === sortedSlotIds.length && patIds.every((id, i) => id === sortedSlotIds[i]);
+    });
+
+    if (matchedPattern) {
+      dayMode = `PATTERN_${matchedPattern.id}`;
+      dayIds = matchedPattern.day_ids.split(',').map(Number).filter(Boolean);
+    } else {
+      dayMode = "SINGLE";
+      dayIds = dayIds.slice(0, 1); // single day fallback
     }
 
     // Parse time from the slot
@@ -1152,7 +1158,7 @@ export default function RegistrarSchedule() {
       ...slot,
       _roomId: slot.room_id || "",
       _instructorId: slot.instructor_id || "",
-      _dayId: slot.day_id || dayIds[0] || "",
+      _dayId: dayIds[0] || "",
       _dayIds: dayIds,
       _originalDayIds: dayIds,
       _dayMode: dayMode,
@@ -1423,21 +1429,14 @@ export default function RegistrarSchedule() {
       const next = { ...prev, [name]: value };
 
       if (name === "_dayId") {
-        if (value === "MW") {
-          const m = days.find(d => d.label === 'M');
-          const w = days.find(d => d.label === 'W');
-          if (m && w) {
-            next._dayIds = [m.id, w.id];
-            next._dayMode = "MW";
-            next._dayId = m.id;
-          }
-        } else if (value === "TTH") {
-          const t = days.find(d => d.label === 'T');
-          const th = days.find(d => d.label === 'TH');
-          if (t && th) {
-            next._dayIds = [t.id, th.id];
-            next._dayMode = "TTH";
-            next._dayId = t.id;
+        if (typeof value === 'string' && value.startsWith("PATTERN_")) {
+          const patternId = Number(value.replace("PATTERN_", ""));
+          const pat = dayPatterns.find(p => p.id === patternId);
+          if (pat) {
+            const patDayIds = pat.day_ids.split(',').map(Number).filter(Boolean);
+            next._dayIds = patDayIds;
+            next._dayMode = value;
+            next._dayId = patDayIds[0];
           }
         } else {
           const dayIdNum = Number(value);
@@ -1722,18 +1721,14 @@ export default function RegistrarSchedule() {
         });
 
       let combinedDays = "";
-      if (labels.length === 2) {
-        const [d1, d2] = labels;
-        if ((d1 === "M" && d2 === "W") || (d1 === "W" && d2 === "M")) {
-          combinedDays = "M-W";
-        } else if (
-          (d1 === "T" && d2 === "TH") ||
-          (d1 === "TH" && d2 === "T")
-        ) {
-          combinedDays = "T-TH";
-        } else {
-          combinedDays = labels.join("-");
-        }
+      // Match day IDs against loaded day patterns to get the pattern name
+      if (dayIds.length > 1) {
+        const sortedIds = [...dayIds].map(Number).sort((a, b) => a - b);
+        const matchedPat = dayPatterns.find(p => {
+          const patIds = p.day_ids.split(',').map(Number).filter(Boolean).sort((a, b) => a - b);
+          return patIds.length === sortedIds.length && patIds.every((id, i) => id === sortedIds[i]);
+        });
+        combinedDays = matchedPat ? matchedPat.name : labels.join("-");
       } else {
         combinedDays = labels.join("-");
       }
@@ -2178,18 +2173,18 @@ export default function RegistrarSchedule() {
         }).length;
 
         if (eligibleCount <= 1 && instrName) {
-          details.push(`${code} — only instructor is ${instrName} (overloaded)`);
+          details.push(`Instructor overloaded (${instrName}). Assign another instructor or add more instructors.`);
         } else if (eligibleCount <= 1) {
-          details.push(`${code} — ${eligibleCount === 0 ? 'no' : 'only 1'} eligible instructor`);
+          details.push(`${code} — ${eligibleCount === 0 ? 'no' : 'only 1'} eligible instructor. Add more instructors.`);
         } else {
-          details.push(`${code} — all ${eligibleCount} instructors busy`);
+          details.push(`${code} — all ${eligibleCount} instructors busy. Consider redistributing load.`);
         }
       }
-      const reason = details.length > 0 ? ` — ${details.join(', ')}.` : ' — instructor overloaded or unavailable.';
+      const reason = details.length > 0 ? ` — ${details.join(' ')}` : ' — instructor overloaded or unavailable.';
       recommendations.push({
         type: 'instructor_constrained',
         severity: 'warning',
-        message: `${suggestedCount} slot${suggestedCount > 1 ? 's' : ''} auto-suggested${reason}`,
+        message: `${suggestedCount} slot${suggestedCount > 1 ? 's' : ''} auto-suggested.${reason}`,
       });
     }
 
@@ -3681,34 +3676,23 @@ export default function RegistrarSchedule() {
                         <select
                           name="_dayId"
                           value={
-                            editingItem._dayMode === "MW" ? "MW"
-                              : editingItem._dayMode === "TTH" ? "TTH"
-                                : String(editingItem._dayId || "")
+                            editingItem._dayMode && editingItem._dayMode.startsWith("PATTERN_")
+                              ? editingItem._dayMode
+                              : String(editingItem._dayId || "")
                           }
                           onChange={(e) => {
                             const value = e.target.value;
-                            console.log("Day dropdown changed to:", value);
-
                             setEditingItem(prev => {
                               const next = { ...prev };
-
-                              if (value === "MW") {
-                                const m = days.find(d => d.label === 'M');
-                                const w = days.find(d => d.label === 'W');
-                                if (m && w) {
-                                  next._dayIds = [m.id, w.id];
-                                  next._dayMode = "MW";
-                                  next._dayId = m.id;
-                                  next._originalDayIds = prev._originalDayIds || [m.id, w.id];
-                                }
-                              } else if (value === "TTH") {
-                                const t = days.find(d => d.label === 'T');
-                                const th = days.find(d => d.label === 'TH');
-                                if (t && th) {
-                                  next._dayIds = [t.id, th.id];
-                                  next._dayMode = "TTH";
-                                  next._dayId = t.id;
-                                  next._originalDayIds = prev._originalDayIds || [t.id, th.id];
+                              if (value.startsWith("PATTERN_")) {
+                                const patternId = Number(value.replace("PATTERN_", ""));
+                                const pat = dayPatterns.find(p => p.id === patternId);
+                                if (pat) {
+                                  const patDayIds = pat.day_ids.split(',').map(Number).filter(Boolean);
+                                  next._dayIds = patDayIds;
+                                  next._dayMode = value;
+                                  next._dayId = patDayIds[0];
+                                  next._originalDayIds = prev._originalDayIds || patDayIds;
                                 }
                               } else if (value) {
                                 // Single day
@@ -3717,7 +3701,6 @@ export default function RegistrarSchedule() {
                                 next._dayMode = "SINGLE";
                                 next._dayId = dayIdNum;
                               }
-
                               return next;
                             });
                             setValidationResult({ valid: true, messages: [] });
@@ -3726,10 +3709,13 @@ export default function RegistrarSchedule() {
                             }`}
                         >
                           <option value="">-- Select Day --</option>
-                          <optgroup label="Patterns">
-                            <option value="MW">Monday - Wednesday</option>
-                            <option value="TTH">Tuesday - Thursday</option>
-                          </optgroup>
+                          {dayPatterns.filter(p => p.is_active).length > 0 && (
+                            <optgroup label="Patterns">
+                              {dayPatterns.filter(p => p.is_active).map(p => (
+                                <option key={p.id} value={`PATTERN_${p.id}`}>{p.name}</option>
+                              ))}
+                            </optgroup>
+                          )}
                           <optgroup label="Single Day">
                             {days.map(d => <option key={d.id} value={String(d.id)}>{d.label}</option>)}
                           </optgroup>

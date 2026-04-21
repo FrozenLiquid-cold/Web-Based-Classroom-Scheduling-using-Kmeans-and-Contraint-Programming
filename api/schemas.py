@@ -114,6 +114,8 @@ class InstructorCreate(BaseModel):
     designation: Optional[str] = None
     password: Optional[str] = None
     is_active: Optional[bool] = True
+    home_course_id: Optional[int] = None      # Primary program this instructor belongs to
+    linked_course_ids: Optional[str] = None   # Extra linked programs (comma-sep course IDs)
 
 
 class InstructorUpdate(BaseModel):
@@ -126,6 +128,8 @@ class InstructorUpdate(BaseModel):
     employment_type: Optional[str] = None
     designation: Optional[str] = None
     is_active: Optional[bool] = None
+    home_course_id: Optional[int] = None      # Primary program this instructor belongs to
+    linked_course_ids: Optional[str] = None   # Extra linked programs (comma-sep course IDs)
 
 
 class InstructorResponse(BaseModel):
@@ -142,6 +146,8 @@ class InstructorResponse(BaseModel):
     preferred_end_time: Optional[str] = None
     max_units: Optional[int] = None
     is_active: Optional[bool] = True
+    home_course_id: Optional[int] = None      # Primary program this instructor belongs to
+    linked_course_ids: Optional[str] = None   # Extra linked programs (comma-sep course IDs)
 
     class Config:
         from_attributes = True

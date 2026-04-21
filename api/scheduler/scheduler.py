@@ -1192,11 +1192,20 @@ def get_suggestions(
     
     # Just fetch for this subject
     from api import db_procedures
+    from api.scheduler.cp_scheduler import _apply_program_filter
     try:
         db_instrs = db_procedures.get_instructor_eligibility(db, subject_id)
         if db_instrs:
-            course_to_instructors[subject_id] = [i.id for i in db_instrs]
-            
+            _raw_instr_ids = [i.id for i in db_instrs]
+            # Apply program-link filter so suggestions respect home_course_id
+            _suggestion_subj = db.query(models.Subject).get(subject_id)
+            _suggestion_course_id = getattr(_suggestion_subj, 'course_id', None) if _suggestion_subj else None
+            if _suggestion_course_id:
+                _raw_instr_ids = _apply_program_filter(
+                    _raw_instr_ids, db_instrs, _suggestion_course_id
+                )
+            course_to_instructors[subject_id] = _raw_instr_ids
+
         db_rooms = db_procedures.get_room_eligibility(db, subject_id)
         if db_rooms:
             course_to_rooms[subject_id] = [r.id for r in db_rooms]
@@ -1399,21 +1408,21 @@ def check_resource_availability(
 
              # Filter Instructors: Only show instructors who are BOTH available (time) AND eligible (specialization)
              eligible_instrs = db_procedures.get_instructor_eligibility(db, subject_id)
-             
+
              # Smart Specialization Enforcement:
-             # If ANY instructor explicitly lists this subject code in assignable_courses, 
+             # If ANY instructor explicitly lists this subject code in assignable_courses,
              # restrict the pool to ONLY those specialized instructors.
              # Otherwise, fall back to the broader usage (e.g. College match).
              if subject and eligible_instrs:
                  strict_matches = []
                  subject_code = subject.code.strip().upper()
                  is_shared_subj = getattr(subject, 'is_block_shared', False) or subject_code.startswith("NSTP") or subject_code.startswith("PE")
-                 
+
                  for i in eligible_instrs:
                      if i.assignable_courses:
                          # Split by comma and normalize
                          courses = [c.strip().upper() for c in i.assignable_courses.split(',')]
-                         
+
                          match = False
                          if is_shared_subj:
                              # NSTP/PE special case: match prefix
@@ -1423,14 +1432,25 @@ def check_resource_availability(
                              # Exact match for standard subjects
                              if subject_code in courses:
                                  match = True
-                                 
+
                          if match:
                              strict_matches.append(i)
-                 
+
                  # Logic: If we found ANYONE with strict specialization, enforce it.
                  # This prevents "General" instructors from cluttering the list when specialists exist.
                  if strict_matches:
                      eligible_instrs = strict_matches
+
+             # Program-link filter: enforce home_course_id / linked_course_ids.
+             # Applied AFTER specialization so we narrow from the already-filtered pool.
+             if eligible_instrs and subject and subject.course_id:
+                 from api.scheduler.cp_scheduler import _apply_program_filter
+                 _ca_instr_ids = _apply_program_filter(
+                     [i.id for i in eligible_instrs],
+                     eligible_instrs,
+                     subject.course_id,
+                 )
+                 eligible_instrs = [i for i in eligible_instrs if i.id in set(_ca_instr_ids)]
 
              if eligible_instrs: # If we have specialized logic, filter.
                   eligible_ids = {i.id for i in eligible_instrs}

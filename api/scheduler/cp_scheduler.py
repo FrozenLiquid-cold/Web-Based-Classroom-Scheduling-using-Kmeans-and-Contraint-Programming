@@ -58,6 +58,55 @@ NSTP_TIME_LABEL = "SUN 8:00–11:00"  # Display label for NSTP time slot
 MAX_END_TIME_MIN = 1260  # 21:00 (9PM) in minutes
 
 
+def _apply_program_filter(
+    eligible_instr_ids: List[int],
+    instructors,           # list/iterable of Instructor ORM objects
+    subj_course_id: Optional[int],
+) -> List[int]:
+    """Filter instructor IDs by program-link rules.
+
+    An instructor with ``home_course_id`` set is only eligible for
+    subjects that belong to their home program OR a program in their
+    ``linked_course_ids`` list.  Instructors with no home program are
+    unrestricted (backward-compatible legacy behaviour).
+
+    Applied in EVERY scheduling path:
+      - build_eligibility_maps  (main + proximity + proximity fallback)
+      - _cp_retry_mini_model    (CP retry pass)
+      - find_alternative_slots  (Resolve / suggestion modal)
+      - get_suggestions         (scheduler.py suggestion API)
+    """
+    if not eligible_instr_ids or subj_course_id is None:
+        return eligible_instr_ids
+
+    inst_by_id = {i.id: i for i in instructors}
+    filtered = []
+    for iid in eligible_instr_ids:
+        inst = inst_by_id.get(iid)
+        if inst is None:
+            continue
+        home = getattr(inst, 'home_course_id', None)
+        if home is None:
+            # No home program → unrestricted (legacy)
+            filtered.append(iid)
+            continue
+        allowed = {home}
+        linked_raw = (getattr(inst, 'linked_course_ids', '') or '').strip()
+        for cid_str in linked_raw.split(','):
+            cid_str = cid_str.strip()
+            if cid_str.isdigit():
+                allowed.add(int(cid_str))
+        if subj_course_id in allowed:
+            filtered.append(iid)
+        else:
+            logger.debug(
+                "[PROGRAM FILTER] Instructor %d excluded: home=%d linked=%s "
+                "subject_course=%d",
+                iid, home, linked_raw or "none", subj_course_id,
+            )
+    return filtered
+
+
 def _range_conflicts(ranges_dict, key, day_id, start, end):
     """Check if time range overlaps with any range in the dictionary list.
     
@@ -1576,6 +1625,10 @@ def build_eligibility_maps(
                 if norm_subj_code and assignable_set and norm_subj_code in assignable_set:
                     eligible_instrs.append(inst_id)
 
+        # 3. Program-link filter — applied via shared helper (covers home_course_id / linked_course_ids).
+        # Instructors with no home_course_id are unrestricted (backward-compatible).
+        eligible_instrs = _apply_program_filter(eligible_instrs, instructors, subj_course_id)
+
         if not is_shared_room_subject:
             preferred_rooms = [rid for rid in preferred_rooms if rid not in _shared_room_ids]
 
@@ -2499,6 +2552,23 @@ def _cp_retry_mini_model(
             eligible_instrs = course_to_instructors.get(subject.id, []) or []
         if not eligible_rooms:
             eligible_rooms = course_to_rooms.get(subject.id, []) or []
+
+        # Program-link filter — enforce home_course_id in the retry path too.
+        # The main pass already filtered course_to_instructors, but the SP
+        # re-fetch above can return broader results, so we reapply.
+        # NOTE: _cp_retry_mini_model has no 'instructors' param, so we load
+        #       only the relevant ones from DB (cheap — just the eligible IDs).
+        _retry_subj_course_id = getattr(subject, 'course_id', None)
+        if _retry_subj_course_id and eligible_instrs:
+            try:
+                _retry_instrs = db.query(models.Instructor).filter(
+                    models.Instructor.id.in_(eligible_instrs)
+                ).all()
+                eligible_instrs = _apply_program_filter(
+                    eligible_instrs, _retry_instrs, _retry_subj_course_id
+                )
+            except Exception as _pf_err:
+                logger.warning("[retry program filter] error: %s", _pf_err)
 
         # ------------------------------------------------------------------
         # College-based room filtering (mirrors build_eligibility_maps logic)
@@ -9814,12 +9884,21 @@ def find_alternative_slots(
         
     eligible_instrs = course_to_instructors.get(subject.id, [])
     eligible_rooms = course_to_rooms.get(subject.id, [])
-    
-    # Fallback if map empty (maybe map key mismatch, try course-wide?)
-    if not eligible_instrs:
-         # Try direct DB query or loose fallback? For now just use empty
-         pass
-         
+
+    # Program-link filter — enforce home_course_id for suggestions / resolve modal.
+    # Load all instructors referenced by the map to run the filter.
+    if eligible_instrs and subject.course_id:
+        try:
+            _all_instrs = db.query(models.Instructor).filter(
+                models.Instructor.id.in_(eligible_instrs)
+            ).all()
+            eligible_instrs = _apply_program_filter(
+                eligible_instrs, _all_instrs, subject.course_id
+            )
+        except Exception as _pf_err:
+            logger.warning("[find_alternative_slots] program filter error: %s", _pf_err)
+
+
     # 2. Iterate ALL possible slots (Day * Time * Room)
     # To avoid explosion, we limit to eligible rooms
     
