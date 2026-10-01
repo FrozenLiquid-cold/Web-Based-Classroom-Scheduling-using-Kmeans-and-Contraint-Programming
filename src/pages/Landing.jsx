@@ -50,7 +50,7 @@ export default function Landing() {
 							</div>
 						</button>
 					</div>
-					<div className="absolute left-0 right-0 bottom-10 mx-auto text-[21px] text-black/70 font-arialMtPro">Develop by : Allan Patrick Aniñon, Arabela Patayan, Claire Dela Peña © 2025</div>
+					<div className="absolute left-0 right-0 bottom-10 mx-auto text-[21px] text-black/70 font-arialMtPro">Develop by : Allan Patrick Aniñon, Arabela B. Patayan, Claire Y. Dela Peña © 2025</div>
 				</div>
 			</div>
 		</div>
